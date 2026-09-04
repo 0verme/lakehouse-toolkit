@@ -1,0 +1,19 @@
+defaults:
+  svn_bin: svn
+  username_env: PYTOOLS_SVN_USERNAME
+  password_env: PYTOOLS_SVN_PASSWORD
+  non_interactive: true
+  trust_server_cert: false
+  timeout: 120
+
+# 公开示例只使用保留域名；真实仓库地址和凭据请放入 configs/svn.local.yaml。
+projects:
+  lakehouse:
+    trunk_url: svn://svn.example.invalid/lakehouse/trunk
+    marker: lakehouse/
+  reporting:
+    trunk_url: svn://svn.example.invalid/reporting/trunk
+    marker: reporting/
+  operations:
+    trunk_url: svn://svn.example.invalid/operations/trunk
+    marker: operations/

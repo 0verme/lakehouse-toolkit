@@ -1,0 +1,28 @@
+{
+  "resolver": {
+    "env_var": "AUDIT_DB_PROFILE",
+    "app_env_var": "APP_ENV",
+    "default_by_env": {
+      "local": "demo_local",
+      "dev": "demo_local",
+      "test": "demo_local"
+    },
+    "fallback": "demo_local"
+  },
+  "profiles": {
+    "demo_local": {
+      "backend": "postgres_native",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "database": "pytools_demo",
+      "user": "demo_user",
+      "password_env": "PYTOOLS_DEMO_DB_PASSWORD",
+      "search_path": "demo_meta",
+      "dialect": "postgres",
+      "capabilities": {
+        "partition_catalog": false,
+        "live_catalog_truth": false
+      }
+    }
+  }
+}

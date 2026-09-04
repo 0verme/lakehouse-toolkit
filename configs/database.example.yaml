@@ -1,0 +1,10 @@
+defaults:
+  driver: org.postgresql.Driver
+  # JDBC 驱动需由使用者依据其许可从官方渠道获取。
+  jar_path: /path/to/your/jdbc-driver.jar
+
+profiles:
+  demo:
+    jdbc_url: jdbc:postgresql://127.0.0.1:5432/pytools_demo?currentSchema=demo_meta
+    user: demo_user
+    password_env: PYTOOLS_DEMO_DB_PASSWORD

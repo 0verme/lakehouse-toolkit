@@ -1,0 +1,161 @@
+# 公开版通用工具注册表。
+# 本文件不包含本机解释器路径、内部地址或凭据；本机覆盖项放在 tools.local.yaml。
+default_python: python
+public_base_url: http://localhost
+
+tools:
+  - name: webadmin
+    title: 工具管理台
+    group: apps
+    type: streamlit
+    workdir: apps/webadmin
+    script: app.py
+    host: 127.0.0.1
+    port: 8500
+    log: logs/webadmin.log
+    python: python
+    enable: true
+    auto_restart: true
+
+  - name: svn_check
+    title: 数据开发代码审查
+    group: apps
+    type: streamlit
+    workdir: apps/svn_check
+    script: app.py
+    host: 127.0.0.1
+    port: 8501
+    log: logs/svn_check.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: metric_portal
+    title: 指标搜索门户
+    group: apps
+    type: streamlit
+    workdir: apps/metric_portal
+    script: metric_portal_streamlit_mvp.py
+    host: 127.0.0.1
+    port: 8502
+    log: logs/metric_portal.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: cigen
+    title: 数据命名治理助手
+    group: apps
+    type: streamlit
+    workdir: apps/cigen
+    script: app.py
+    host: 127.0.0.1
+    port: 8503
+    log: logs/cigen.log
+    python: python
+    enable: false
+    auto_restart: false
+
+  - name: interface_manager
+    title: 接口资产管理
+    group: apps
+    type: streamlit
+    workdir: apps/interface_manager
+    script: app.py
+    host: 127.0.0.1
+    port: 8504
+    log: logs/interface_manager.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: encode_demo
+    title: 双重 Base64 编码演示
+    group: crypto
+    type: python
+    workdir: tools/crypto
+    script: jiami.py
+    host: 127.0.0.1
+    port: 8601
+    log: logs/encode_demo.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: decode_demo
+    title: 双重 Base64 解码演示
+    group: crypto
+    type: python
+    workdir: tools/crypto
+    script: jiemi.py
+    host: 127.0.0.1
+    port: 8602
+    log: logs/decode_demo.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: xlsx_sql_tables
+    title: Excel SQL 表名解析
+    group: tools
+    type: python
+    workdir: tools/misc
+    script: xlsx_sql_tables.py
+    host: 127.0.0.1
+    port: 0
+    log: logs/xlsx_sql_tables.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: workspace_search
+    title: Workspace 依赖搜索
+    group: search
+    type: python
+    workdir: tools/search
+    script: workspace_search_total.py
+    host: 127.0.0.1
+    port: 8610
+    log: logs/workspace_search.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: workspace_lineage
+    title: Workspace 字段血缘搜索
+    group: search
+    type: python
+    workdir: tools/search
+    script: workspace_lineage_search.py
+    host: 127.0.0.1
+    port: 8611
+    log: logs/workspace_lineage.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: table_lineage
+    title: 表血缘漫游
+    group: search
+    type: python
+    workdir: tools/search
+    script: table_lineage_roamer.py
+    host: 127.0.0.1
+    port: 8612
+    log: logs/table_lineage.log
+    python: python
+    enable: true
+    auto_restart: false
+
+  - name: job_dependency_cycle
+    title: 作业依赖成环检查
+    group: analysis
+    type: python
+    workdir: tools/jobgraph
+    script: job_dependency_cycle_check.py
+    host: 127.0.0.1
+    port: 8613
+    log: logs/job_dependency_cycle.log
+    python: python
+    enable: false
+    auto_restart: false

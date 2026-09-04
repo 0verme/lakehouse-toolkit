@@ -1,0 +1,100 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage/
+
+# Runtime output and generated exports
+logs/
+runtime/
+tmp/
+temp/
+cache/
+output/
+exports/
+dist/
+build/
+*.log
+*.tmp
+*.bak
+*.html
+*.csv
+*.dump
+*.sql.gz
+*.zip
+*.tar
+*.7z
+
+# Local application data
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db-*
+*.db-journal
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.duckdb
+*.mdb
+*.parquet
+*.feather
+
+# Credentials and private key material
+.env
+.env.*
+credentials.json
+credentials.yaml
+credentials.yml
+credentials.local.*
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.local.*
+*.pem
+*.key
+*.ppk
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+
+# Local configuration overrides
+*.local.yaml
+*.local.yml
+*.local.json
+configs/database.yaml
+configs/migrate/clusters.json
+
+# Optional third-party binaries; obtain them separately under the documented path
+*.jar
+*.class
+*.war
+resources/jars/*.jar
+
+# IDE, agent and OS files
+.idea/
+.claude/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Recovery/debug artifacts and local scan reports
+*.py_failed
+*.report
+*.coverage.*
+*开源前安全扫描报告.md

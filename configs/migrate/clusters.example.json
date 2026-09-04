@@ -1,0 +1,20 @@
+{
+  "clusters": {
+    "source_demo": {
+      "jdbc_url": "jdbc:postgresql://127.0.0.1:5432/source_demo",
+      "driver": "org.postgresql.Driver",
+      "user": "demo_source_user",
+      "password_env": "PYTOOLS_SOURCE_DEMO_PASSWORD",
+      "jar_path": "/path/to/your/jdbc-driver.jar",
+      "server_remote": "source_demo_server"
+    },
+    "target_demo": {
+      "jdbc_url": "jdbc:postgresql://127.0.0.1:5432/target_demo",
+      "driver": "org.postgresql.Driver",
+      "user": "demo_target_user",
+      "password_env": "PYTOOLS_TARGET_DEMO_PASSWORD",
+      "jar_path": "/path/to/your/jdbc-driver.jar",
+      "server_remote": "target_demo_server"
+    }
+  }
+}

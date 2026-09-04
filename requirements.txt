@@ -1,0 +1,20 @@
+# ── Web UI ────────────────────────────────────────────────────────────────────
+streamlit>=1.30.0
+pywebio>=1.8.3
+
+# ── Database ──────────────────────────────────────────────────────────────────
+JayDeBeApi>=1.2.3       # JDBC bridge; obtain any vendor driver separately
+JPype1>=1.4.0           # JVM runtime required by JayDeBeApi
+psycopg[binary]>=3.1.18 # PostgreSQL native client
+PyMySQL>=1.1.0          # MySQL connections (tools/integrations)
+
+# ── Data processing ───────────────────────────────────────────────────────────
+pandas>=1.5.0
+openpyxl>=3.1.0         # xlsx read/write
+xlrd>=2.0.1             # legacy .xls read
+
+# ── Config & system utilities ─────────────────────────────────────────────────
+PyYAML>=6.0
+psutil>=5.9.0           # process management (apps/webadmin)
+chardet>=5.0.0         # legacy encoding detection
+requests>=2.28.0        # external service examples
