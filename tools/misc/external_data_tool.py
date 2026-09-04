@@ -52,4 +52,4 @@ def app():
 
 
 if __name__ == "__main__":
-    start_pywebio_app("PyTool", app)
+    start_pywebio_app("Lakehouse Toolkit", app)
