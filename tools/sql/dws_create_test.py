@@ -13,4 +13,4 @@ from shared.ui.pywebio_helper import start_pywebio_app  # noqa: E402
 from tools.sql.dws_create_sc import dws_create  # noqa: E402
 
 if __name__ == "__main__":
-    start_pywebio_app("PyTool", dws_create)
+    start_pywebio_app("Lakehouse Toolkit", dws_create)

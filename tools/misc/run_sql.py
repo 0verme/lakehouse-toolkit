@@ -27,4 +27,4 @@ SHA-256: {sha256_value}
 
 
 if __name__ == "__main__":
-    start_pywebio_app("PyTool", build_sha256)
+    start_pywebio_app("Lakehouse Toolkit", build_sha256)

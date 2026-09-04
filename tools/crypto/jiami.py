@@ -17,4 +17,4 @@ def encode_secret():
 
 
 if __name__ == "__main__":
-    start_pywebio_app("PyTool", encode_secret)
+    start_pywebio_app("Lakehouse Toolkit", encode_secret)

@@ -48,4 +48,4 @@ def dws_create():
 
 
 if __name__ == "__main__":
-    start_pywebio_app("PyTool", dws_create)
+    start_pywebio_app("Lakehouse Toolkit", dws_create)

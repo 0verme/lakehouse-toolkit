@@ -1,6 +1,8 @@
-# pytools
+# Lakehouse Toolkit
 
-`pytools` 是一个面向数据开发团队的 Python 工具平台，提供 Streamlit 应用、PyWebIO 小工具以及可选的批处理入口。项目聚焦通用的数据资产治理和开发效率场景，不附带任何生产环境数据或连接凭据。
+Practical tools for lakehouse development, SQL auditing, lineage analysis and data engineering operations.
+
+Lakehouse Toolkit 是一个面向数据开发与湖仓工程场景的实用工具集，覆盖 SQL 审计、DDL 规范、血缘分析、作业依赖、数据资产与开发辅助等能力。项目不附带任何生产环境数据或连接凭据。
 
 ## 核心功能
 
@@ -17,7 +19,7 @@
 ## 项目结构
 
 ```text
-pytools/
+lakehouse-toolkit/
 ├─ apps/          # Streamlit 应用
 ├─ tools/         # PyWebIO / Python 工具
 ├─ jobs/          # 可选导入、同步和迁移入口
