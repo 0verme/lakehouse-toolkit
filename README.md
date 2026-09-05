@@ -4,10 +4,12 @@ Practical tools for lakehouse development, SQL auditing, lineage analysis and da
 
 Lakehouse Toolkit 是一个面向数据开发与湖仓工程场景的实用工具集，覆盖 SQL 审计、DDL 规范、血缘分析、作业依赖、数据资产与开发辅助等能力。项目不附带任何生产环境数据或连接凭据。
 
+数据资产门户、指标门户、接口管理等统一 Web 产品能力已迁移至 [data-asset-portal-community](https://github.com/0verme/data-asset-portal-community)；本仓库继续维护湖仓工具、任务、审计、血缘等底层能力。
+
 ## 核心功能
 
 - SQL 表名解析、SQL 审计和 DDL 命名检查
-- 数据资产、字段词根和指标目录管理
+- 湖仓任务、数据资产审计和开发辅助
 - 表级/字段级血缘分析与可视化导出
 - 作业依赖、调度清单和循环依赖检查
 - 本地 workspace 与报表文件搜索
@@ -57,8 +59,6 @@ streamlit run apps/webadmin/app.py --server.address 127.0.0.1 --server.port 8500
 
 ```bash
 streamlit run apps/svn_check/app.py --server.address 127.0.0.1 --server.port 8501
-streamlit run apps/metric_portal/metric_portal_streamlit_mvp.py --server.address 127.0.0.1 --server.port 8502
-streamlit run apps/interface_manager/app.py --server.address 127.0.0.1 --server.port 8504
 ```
 
 `svn_check` 可在“本地目录审计”模式下直接分析 `tests/fixtures/demo_workspace`，无需 SVN 或数据库。
@@ -92,27 +92,10 @@ psql -h 127.0.0.1 -U demo_user -d pytools_demo -f docs/dev/local_pg_audit_meta.s
 
 完整说明见 [`docs/dev/local_workspace_demo.md`](docs/dev/local_workspace_demo.md) 和 [`docs/dev/local_pg_wide_table_lineage.md`](docs/dev/local_pg_wide_table_lineage.md)。
 
-### 指标门户管理员初始化
-
-指标门户不会创建 `admin` 或任何固定密码账号。首次启动且本地数据库没有用户时，必须显式设置：
-
-```bash
-# Linux/macOS
-export ADMIN_USERNAME="choose-a-local-admin"
-export ADMIN_PASSWORD="choose-a-strong-local-password"
-# Windows PowerShell
-$env:ADMIN_USERNAME="choose-a-local-admin"
-$env:ADMIN_PASSWORD="choose-a-strong-local-password"
-```
-
-初始化完成后可以移除这两个变量；系统只读取已有用户记录。若变量缺失，应用会提示配置，不会使用弱默认值。
-
 ## 环境变量清单
 
 | 环境变量 | 用途 | 必填 | 默认值 |
 | --- | --- | --- | --- |
-| `ADMIN_USERNAME` | 首次初始化指标门户管理员用户名 | 仅首次初始化时 | 无 |
-| `ADMIN_PASSWORD` | 首次初始化指标门户管理员密码 | 仅首次初始化时 | 无 |
 | `AUDIT_DB_PROFILE` | 审计 metadata profile | 否 | `demo_local` |
 | `APP_ENV` | 选择审计环境映射 | 否 | 无 |
 | `PYTOOLS_DEMO_DB_PASSWORD` | 本地 PostgreSQL/JDBC demo 密码 | 使用对应数据库时 | 无 |
@@ -178,8 +161,6 @@ python -B -m unittest discover -s tests -t . -v
 主要入口：
 
 - `apps/webadmin/app.py`：工具管理台
-- `apps/metric_portal/metric_portal_streamlit_mvp.py`：指标目录 demo
-- `apps/interface_manager/app.py`：接口资产 demo
 - `apps/svn_check/app.py`：本地 workspace 代码审查
 - `shared/lineage/`：通用血缘和映射逻辑
 - `tools/misc/xlsx_sql_tables.py`：Excel SQL 表名解析

@@ -30,45 +30,6 @@ tools:
     enable: true
     auto_restart: false
 
-  - name: metric_portal
-    title: 指标搜索门户
-    group: apps
-    type: streamlit
-    workdir: apps/metric_portal
-    script: metric_portal_streamlit_mvp.py
-    host: 127.0.0.1
-    port: 8502
-    log: logs/metric_portal.log
-    python: python
-    enable: true
-    auto_restart: false
-
-  - name: cigen
-    title: 数据命名治理助手
-    group: apps
-    type: streamlit
-    workdir: apps/cigen
-    script: app.py
-    host: 127.0.0.1
-    port: 8503
-    log: logs/cigen.log
-    python: python
-    enable: false
-    auto_restart: false
-
-  - name: interface_manager
-    title: 接口资产管理
-    group: apps
-    type: streamlit
-    workdir: apps/interface_manager
-    script: app.py
-    host: 127.0.0.1
-    port: 8504
-    log: logs/interface_manager.log
-    python: python
-    enable: true
-    auto_restart: false
-
   - name: encode_demo
     title: 双重 Base64 编码演示
     group: crypto
