@@ -1,5 +1,14 @@
 """共享血缘能力与 Phase 1 领域对象。"""
 
+from .audit import (  # pyright: ignore[reportMissingImports]
+    AuditResult,
+    ISSUE_SEVERITY_POLICY,
+    LineageAuditResult,
+    ProgramLineageAuditor,
+    audit_program_physical_dag,
+    compute_lineage_issue_stable_key,
+    issue_severity,
+)
 from .domain import (
     DEFAULT_TEMPORARY_ASSET_RULES,
     IssueType,
@@ -25,14 +34,19 @@ from .physical_dag import (  # pyright: ignore[reportMissingImports]
     extract_sql_steps,
 )
 
+
 __all__ = [
+    "AuditResult",
     "DEFAULT_TEMPORARY_ASSET_RULES",
+    "ISSUE_SEVERITY_POLICY",
     "IssueType",
+    "LineageAuditResult",
     "LineageEdge",
     "LineageIssue",
     "PhysicalEdge",
     "PhysicalNode",
     "PhysicalNodeKind",
+    "ProgramLineageAuditor",
     "ProgramPhysicalDAG",
     "ProgramPhysicalDAGBuilder",
     "ProgramSQLStep",
@@ -41,9 +55,12 @@ __all__ = [
     "TemporaryAssetRule",
     "is_formal_asset",
     "is_temporary_asset",
+    "issue_severity",
     "normalize_asset_name",
+    "audit_program_physical_dag",
     "build_physical_dag",
     "build_program_physical_dag",
+    "compute_lineage_issue_stable_key",
     "extract_program_sql_steps",
     "extract_sql_steps",
 ]
