@@ -16,8 +16,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from shared.lineage.domain import IssueType, LineageEdge, LineageIssue
+from shared.lineage.domain import (
+    IssueType,
+    LineageEdge,
+    LineageIssue,
+    ProgramState,
+)
 
+from .evolution import (  # pyright: ignore[reportMissingImports]
+    BatchMetadata,
+    diff_environments,
+    diff_lineage_batches,
+    reconcile_issue_lifecycle,
+)
 from .materialization import (  # pyright: ignore[reportMissingImports]
     MaterializationBatch,
     _canonical_json,
@@ -125,6 +136,37 @@ CREATE INDEX IF NOT EXISTS idx_lineage_issue_scope
         issue_type,
         is_active
     );
+
+CREATE TABLE IF NOT EXISTS lineage_program_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    environment TEXT NOT NULL,
+    source_profile TEXT NOT NULL,
+    program_name TEXT NOT NULL,
+    source_hash TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_changed_at TEXT,
+    batch_id TEXT NOT NULL REFERENCES lineage_batch(batch_id),
+    is_active INTEGER NOT NULL CHECK (is_active IN (0, 1))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_lineage_program_state_batch_identity
+    ON lineage_program_state(
+        batch_id,
+        environment,
+        source_profile,
+        program_name
+    );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_lineage_program_state_active_identity
+    ON lineage_program_state(environment, source_profile, program_name)
+    WHERE is_active = 1;
+
+CREATE INDEX IF NOT EXISTS idx_lineage_program_state_batch_active
+    ON lineage_program_state(batch_id, is_active);
+
+CREATE INDEX IF NOT EXISTS idx_lineage_program_state_scope
+    ON lineage_program_state(environment, source_profile, is_active);
 """
 
 EDGE_SELECT_SQL = (
@@ -145,6 +187,37 @@ ISSUE_ORDER_SQL = (
     " ORDER BY environment, source_profile, program_name, issue_type, "
     "IFNULL(stable_key, ''), IFNULL(node_key, ''), IFNULL(branch_sink, ''), id"
 )
+PROGRAM_STATE_SELECT_SQL = (
+    "SELECT environment, source_profile, program_name, source_hash, "
+    "first_seen_at, last_seen_at, last_changed_at, batch_id, is_active "
+    "FROM lineage_program_state"
+)
+PROGRAM_STATE_ORDER_SQL = " ORDER BY environment, source_profile, program_name, id"
+ACTIVE_ISSUE_SELECT_SQL = """
+    SELECT environment, source_profile, program_name, issue_type, severity,
+           stable_key, node_key, branch_sink, message, evidence, batch_id,
+           first_seen_at, last_seen_at, is_active
+    FROM lineage_issue
+    WHERE is_active = 1
+    ORDER BY environment, source_profile, program_name, issue_type,
+             IFNULL(stable_key, ''), IFNULL(node_key, ''), IFNULL(branch_sink, ''), id
+"""
+BATCH_METADATA_SELECT_SQL = """
+    SELECT
+        batch_id,
+        observed_at,
+        published_at,
+        edge_count,
+        issue_count,
+        is_active,
+        (
+            SELECT COUNT(*)
+            FROM lineage_program_state AS state
+            WHERE state.batch_id = batch.batch_id
+        ) AS program_count
+    FROM lineage_batch AS batch
+    ORDER BY observed_at, batch_id
+"""
 
 EDGE_OUTGOING_NEIGHBOR_SQL = (
     EDGE_SELECT_SQL
@@ -178,6 +251,7 @@ class PublishResult:
     edge_count: int
     issue_count: int
     previous_batch_id: str | None
+    program_count: int = 0
 
 
 def _datetime_text(value: datetime) -> str:
@@ -218,6 +292,54 @@ def _edge_from_row(row: Any) -> LineageEdge:
     )
 
 
+def _program_state_from_row(row: Any) -> ProgramState:
+    return ProgramState(
+        environment=str(row[0]),
+        source_profile=str(row[1]),
+        program_name=str(row[2]),
+        source_hash=row[3],
+        first_seen_at=_parse_datetime(str(row[4])),
+        last_seen_at=_parse_datetime(str(row[5])),
+        last_changed_at=(None if row[6] is None else _parse_datetime(str(row[6]))),
+        batch_id=str(row[7]),
+        is_active=bool(row[8]),
+    )
+
+
+def _batch_metadata_from_row(row: Any) -> BatchMetadata:
+    try:
+        return BatchMetadata(
+            batch_id=str(row[0]),
+            observed_at=_parse_datetime(str(row[1])),
+            published_at=(None if row[2] is None else _parse_datetime(str(row[2]))),
+            edge_count=int(row[3]),
+            issue_count=int(row[4]),
+            program_count=int(row[6]),
+            is_active=bool(row[5]),
+        )
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError("stored batch metadata is invalid") from exc
+
+
+def _issue_from_row(row: Any) -> LineageIssue:
+    return LineageIssue(
+        environment=str(row[0]),
+        source_profile=str(row[1]),
+        program_name=str(row[2]),
+        issue_type=IssueType(str(row[3])),
+        severity=str(row[4]),
+        stable_key=row[5],
+        node_key=row[6],
+        branch_sink=row[7],
+        message=str(row[8]),
+        evidence=_decode_evidence(str(row[9])),
+        batch_id=str(row[10]),
+        first_seen_at=_parse_datetime(str(row[11])),
+        last_seen_at=_parse_datetime(str(row[12])),
+        is_active=bool(row[13]),
+    )
+
+
 def _prepare_batch(batch: MaterializationBatch) -> MaterializationBatch:
     if not isinstance(batch, MaterializationBatch):
         raise TypeError("batch must be a MaterializationBatch")
@@ -250,11 +372,24 @@ def _prepare_batch(batch: MaterializationBatch) -> MaterializationBatch:
             )
         )
 
+    program_states: list[ProgramState] = []
+    for state in batch.program_states:
+        if not isinstance(state, ProgramState):
+            raise TypeError("batch.program_states must contain ProgramState values")
+        program_states.append(
+            replace(
+                state,
+                batch_id=batch.batch_id,
+                is_active=False,
+            )
+        )
+
     return MaterializationBatch(
         batch_id=batch.batch_id,
         observed_at=batch.observed_at,
         edges=tuple(edges),
         issues=tuple(issues),
+        program_states=tuple(program_states),
     )
 
 
@@ -291,6 +426,24 @@ def _issue_row(issue: LineageIssue, batch: MaterializationBatch) -> tuple[object
         batch.batch_id,
         _datetime_text(issue.first_seen_at or batch.observed_at),
         _datetime_text(issue.last_seen_at or batch.observed_at),
+        0,
+    )
+
+
+def _program_state_row(
+    state: ProgramState, batch: MaterializationBatch
+) -> tuple[object, ...]:
+    return (
+        state.environment,
+        state.source_profile,
+        state.program_name,
+        state.source_hash,
+        _datetime_text(state.first_seen_at),
+        _datetime_text(state.last_seen_at),
+        None
+        if state.last_changed_at is None
+        else _datetime_text(state.last_changed_at),
+        batch.batch_id,
         0,
     )
 
@@ -360,7 +513,7 @@ class SQLiteMaterializationStore:
         self,
         connection: sqlite3.Connection,
         batch_id: str,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         edge_row = connection.execute(
             "SELECT COUNT(*) FROM lineage_edge WHERE batch_id = ?",
             (batch_id,),
@@ -369,10 +522,14 @@ class SQLiteMaterializationStore:
             "SELECT COUNT(*) FROM lineage_issue WHERE batch_id = ?",
             (batch_id,),
         ).fetchone()
-        if edge_row is None or issue_row is None:
+        program_row = connection.execute(
+            "SELECT COUNT(*) FROM lineage_program_state WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if edge_row is None or issue_row is None or program_row is None:
             raise ValueError("candidate count query returned no row")
         try:
-            return int(edge_row[0]), int(issue_row[0])
+            return int(edge_row[0]), int(issue_row[0]), int(program_row[0])
         except (IndexError, TypeError, ValueError) as exc:
             raise ValueError("candidate count query returned invalid data") from exc
 
@@ -400,13 +557,30 @@ class SQLiteMaterializationStore:
             issue_identities.add(identity)
             _canonical_json(issue.evidence)
 
-        stored_edge_count, stored_issue_count = self._candidate_counts(
-            connection, batch.batch_id
+        program_identities: set[tuple[str, str, str]] = set()
+        for state in batch.program_states:
+            identity = (
+                state.environment,
+                state.source_profile,
+                state.program_name,
+            )
+            if identity in program_identities:
+                raise ValueError(
+                    "candidate batch contains duplicate ProgramState facts"
+                )
+            program_identities.add(identity)
+
+        stored_edge_count, stored_issue_count, stored_program_count = (
+            self._candidate_counts(connection, batch.batch_id)
         )
         if stored_edge_count != len(batch.edges):
             raise ValueError("candidate lineage_edge count does not match batch")
         if stored_issue_count != len(batch.issues):
             raise ValueError("candidate lineage_issue count does not match batch")
+        if stored_program_count != len(batch.program_states):
+            raise ValueError(
+                "candidate lineage_program_state count does not match batch"
+            )
 
         batch_row = connection.execute(
             "SELECT is_active, edge_count, issue_count FROM lineage_batch WHERE batch_id = ?",
@@ -461,6 +635,15 @@ class SQLiteMaterializationStore:
             """,
             [_issue_row(issue, batch) for issue in batch.issues],
         )
+        connection.executemany(
+            """
+            INSERT INTO lineage_program_state(
+                environment, source_profile, program_name, source_hash,
+                first_seen_at, last_seen_at, last_changed_at, batch_id, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_program_state_row(state, batch) for state in batch.program_states],
+        )
 
     @staticmethod
     def _active_batch_id(connection: sqlite3.Connection) -> str | None:
@@ -489,11 +672,28 @@ class SQLiteMaterializationStore:
         因此旧 active batch 不会被切成空表或半成品。
         """
 
-        prepared = _prepare_batch(batch)
+        if not isinstance(batch, MaterializationBatch):
+            raise TypeError("batch must be a MaterializationBatch")
         with self._connection_scope() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 previous_batch_id = self._active_batch_id(connection)
+                # SQL is selected from a fixed module constant.
+                # pi-lens-ignore: python-sql-injection
+                previous_issue_rows = connection.execute(
+                    ACTIVE_ISSUE_SELECT_SQL
+                ).fetchall()
+                previous_issues = tuple(
+                    _issue_from_row(row) for row in previous_issue_rows
+                )
+                reconciled = reconcile_issue_lifecycle(
+                    previous_issues,
+                    batch.issues,
+                    observed_at=batch.observed_at,
+                )
+                prepared = _prepare_batch(
+                    replace(batch, issues=reconciled.current_issues)
+                )
                 self._insert_candidate(connection, prepared)
                 self._call_stage_hook(stage_hook, "after_candidate_insert")
                 self._validate_candidate_in_transaction(connection, prepared)
@@ -504,6 +704,9 @@ class SQLiteMaterializationStore:
                 )
                 connection.execute(
                     "UPDATE lineage_issue SET is_active = 0 WHERE is_active = 1"
+                )
+                connection.execute(
+                    "UPDATE lineage_program_state SET is_active = 0 WHERE is_active = 1"
                 )
                 connection.execute(
                     "UPDATE lineage_batch SET is_active = 0 WHERE is_active = 1"
@@ -524,6 +727,10 @@ class SQLiteMaterializationStore:
                     "UPDATE lineage_issue SET is_active = 1 WHERE batch_id = ?",
                     (prepared.batch_id,),
                 )
+                connection.execute(
+                    "UPDATE lineage_program_state SET is_active = 1 WHERE batch_id = ?",
+                    (prepared.batch_id,),
+                )
                 self._call_stage_hook(stage_hook, "after_active_switch")
                 connection.commit()
             except Exception:
@@ -535,6 +742,7 @@ class SQLiteMaterializationStore:
             edge_count=len(prepared.edges),
             issue_count=len(prepared.issues),
             previous_batch_id=previous_batch_id,
+            program_count=len(prepared.program_states),
         )
 
     publish_batch = publish
@@ -551,15 +759,20 @@ class SQLiteMaterializationStore:
             ).fetchone()
             if row is None:
                 raise ValueError("candidate batch does not exist")
-            edges = self.read_edges(batch_id=batch_id, active_only=False)
-            issues = self.read_issues(batch_id=batch_id, active_only=False)
+            candidate_id = batch_id.strip()
+            edges = self.read_edges(batch_id=candidate_id, active_only=False)
+            issues = self.read_issues(batch_id=candidate_id, active_only=False)
+            program_states = self.read_program_states(
+                batch_id=candidate_id, active_only=False
+            )
             self._validate_candidate_in_transaction(
                 connection,
                 MaterializationBatch(
-                    batch_id=batch_id.strip(),
+                    batch_id=candidate_id,
                     observed_at=_parse_datetime(str(row[0])),
                     edges=edges,
                     issues=issues,
+                    program_states=program_states,
                 ),
             )
 
@@ -675,6 +888,91 @@ class SQLiteMaterializationStore:
         )
         return tuple(_edge_from_row(row) for row in rows)
 
+    def read_program_states(
+        self,
+        *,
+        batch_id: str | None = None,
+        active_only: bool = False,
+    ) -> tuple[ProgramState, ...]:
+        rows = self._read_rows(
+            PROGRAM_STATE_SELECT_SQL,
+            PROGRAM_STATE_ORDER_SQL,
+            batch_id=batch_id,
+            active_only=active_only,
+        )
+        return tuple(_program_state_from_row(row) for row in rows)
+
+    def list_batch_metadata(self) -> tuple[BatchMetadata, ...]:
+        """按 observed_at 返回所有历史 batch，旧 batch 只读不修改。"""
+
+        with self._connection_scope() as connection:
+            # SQL is selected from a fixed module constant.
+            # pi-lens-ignore: python-sql-injection
+            rows = connection.execute(BATCH_METADATA_SELECT_SQL).fetchall()
+        return tuple(_batch_metadata_from_row(row) for row in rows)
+
+    list_batches = list_batch_metadata
+
+    def get_batch_metadata(self, batch_id: str) -> BatchMetadata | None:
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            raise ValueError("batch_id must be a non-empty string")
+        return next(
+            (
+                item
+                for item in self.list_batch_metadata()
+                if item.batch_id == batch_id.strip()
+            ),
+            None,
+        )
+
+    def reconcile_issue_lifecycle(
+        self,
+        previous_batch_id: str,
+        current_batch_id: str,
+    ):
+        current_metadata = self.get_batch_metadata(current_batch_id)
+        if current_metadata is None:
+            raise ValueError("current batch does not exist")
+        return reconcile_issue_lifecycle(
+            self.read_issues(batch_id=previous_batch_id),
+            self.read_issues(batch_id=current_batch_id),
+            observed_at=current_metadata.observed_at,
+        )
+
+    def diff_lineage_batches(
+        self,
+        previous_batch_id: str,
+        current_batch_id: str,
+    ):
+        return diff_lineage_batches(
+            self.read_edges(batch_id=previous_batch_id),
+            self.read_edges(batch_id=current_batch_id),
+        )
+
+    compare_batches = diff_lineage_batches
+
+    def diff_environments(
+        self,
+        dev_batch_id: str | None = None,
+        prod_batch_id: str | None = None,
+        *,
+        dev_environment: str = "DEV",
+        prod_environment: str = "PROD",
+        dev_source_profile: str | None = None,
+        prod_source_profile: str | None = None,
+    ):
+        return diff_environments(
+            self.read_edges(batch_id=dev_batch_id, active_only=dev_batch_id is None),
+            self.read_edges(
+                batch_id=prod_batch_id,
+                active_only=prod_batch_id is None,
+            ),
+            dev_environment=dev_environment,
+            prod_environment=prod_environment,
+            dev_source_profile=dev_source_profile,
+            prod_source_profile=prod_source_profile,
+        )
+
     def read_issues(
         self,
         *,
@@ -687,25 +985,7 @@ class SQLiteMaterializationStore:
             batch_id=batch_id,
             active_only=active_only,
         )
-        return tuple(
-            LineageIssue(
-                environment=str(row[0]),
-                source_profile=str(row[1]),
-                program_name=str(row[2]),
-                issue_type=IssueType(str(row[3])),
-                severity=str(row[4]),
-                stable_key=row[5],
-                node_key=row[6],
-                branch_sink=row[7],
-                message=str(row[8]),
-                evidence=_decode_evidence(str(row[9])),
-                batch_id=str(row[10]),
-                first_seen_at=_parse_datetime(str(row[11])),
-                last_seen_at=_parse_datetime(str(row[12])),
-                is_active=bool(row[13]),
-            )
-            for row in rows
-        )
+        return tuple(_issue_from_row(row) for row in rows)
 
 
 MaterializationSQLiteStore = SQLiteMaterializationStore

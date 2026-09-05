@@ -136,6 +136,7 @@ class LineageDomainTests(unittest.TestCase):
                 "TARGET_MISMATCH",
                 "CYCLE_DETECTED",
                 "SELF_REFERENCE",
+                "LINEAGE_BRANCH_BROKEN",
             },
         )
 

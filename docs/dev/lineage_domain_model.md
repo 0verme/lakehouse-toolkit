@@ -8,7 +8,9 @@
 
 | 对象 | 作用 | 关键 optional 语义 |
 | --- | --- | --- |
+| `ProgramIdentity` | 程序实例的稳定 identity | `environment/source_profile/program_name` 三元组；不把没有稳定来源的 `job_key` 猜测加入。 |
 | `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示 Provider 无法提供预期结果表；`source_hash=None` 表示尚未提供 hash。 |
+| `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、first/last seen、last changed、batch 与 active 标记，不保存完整源码。 |
 | `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |
 | `PhysicalEdge` | 程序内部有向边 | `source` 是上游，`target` 是下游；允许指向 TMP，也不在此阶段吞掉自引用。 |
 | `LineageEdge` | 正式业务血缘的 direct fact | `program_name`/`job_key`、`source_hash`、`batch_id`、时间字段和不含源码的结构化 `evidence` 可由后续采集/发布阶段补齐。 |
@@ -86,6 +88,7 @@ TARGET_NOT_FOUND
 TARGET_MISMATCH
 CYCLE_DETECTED
 SELF_REFERENCE
+LINEAGE_BRANCH_BROKEN
 ```
 
 一个程序通常只有一个正式结果表只是 default assumption，不是模型约束。后续
@@ -139,3 +142,5 @@ Blast Radius 的完整语义见 [`lineage_query.md`](lineage_query.md)。
 - `tools/search`、`tools/integrations`、`jobs`、`apps` 的现有生产/演示入口。
 
 这些入口的实际调用和方向兼容点见 [`lineage_call_graph.md`](lineage_call_graph.md)。
+Phase 7 的增量、历史、diff、issue lifecycle 和 legacy decision 见
+[`lineage_incremental_history.md`](lineage_incremental_history.md)。

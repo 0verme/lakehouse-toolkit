@@ -33,6 +33,7 @@ class IssueType(str, Enum):
     TARGET_MISMATCH = "TARGET_MISMATCH"
     CYCLE_DETECTED = "CYCLE_DETECTED"
     SELF_REFERENCE = "SELF_REFERENCE"
+    LINEAGE_BRANCH_BROKEN = "LINEAGE_BRANCH_BROKEN"
 
 
 TemporaryAssetRule = Callable[[str], bool]
@@ -150,6 +151,34 @@ def compute_source_hash(
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramIdentity:
+    """一个程序实例的稳定 identity。
+
+    ``program_name`` 只有在 ``environment`` 和 ``source_profile`` 相同的
+    scope 内才有意义。Phase 7 不把没有稳定来源的 ``job_key`` 猜测性地加入
+    identity；如果 Provider 以后提供稳定 job identity，应单独扩展 Provider
+    contract，而不是改变本类已有三元组的语义。
+    """
+
+    environment: str
+    source_profile: str
+    program_name: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("environment", "source_profile", "program_name"):
+            _require_text(getattr(self, field_name), field_name)
+            object.__setattr__(self, field_name, getattr(self, field_name).strip())
+
+    @property
+    def scope(self) -> tuple[str, str]:
+        return (self.environment, self.source_profile)
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.environment, self.source_profile, self.program_name)
+
+
+@dataclass(frozen=True, slots=True)
 class ProgramSource:
     """Parser 的统一程序输入，不携带来源连接或文件系统细节。
 
@@ -182,6 +211,87 @@ class ProgramSource:
             raise ValueError("expected_target must be a string or None")
         if self.source_hash is not None and not isinstance(self.source_hash, str):
             raise ValueError("source_hash must be a string or None")
+
+    @property
+    def identity(self) -> ProgramIdentity:
+        return ProgramIdentity(
+            environment=self.environment,
+            source_profile=self.source_profile,
+            program_name=self.program_name,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramState:
+    """可持久化的当前程序状态；历史 batch 通过 ``batch_id`` 保留。"""
+
+    environment: str
+    source_profile: str
+    program_name: str
+    source_hash: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    last_changed_at: datetime | None = None
+    batch_id: str | None = None
+    is_active: bool = True
+
+    def __post_init__(self) -> None:
+        identity = ProgramIdentity(
+            self.environment,
+            self.source_profile,
+            self.program_name,
+        )
+        object.__setattr__(self, "environment", identity.environment)
+        object.__setattr__(self, "source_profile", identity.source_profile)
+        object.__setattr__(self, "program_name", identity.program_name)
+        if self.source_hash is not None and (
+            not isinstance(self.source_hash, str) or not self.source_hash.strip()
+        ):
+            raise ValueError("source_hash must be a non-empty string or None")
+        for field_name in ("first_seen_at", "last_seen_at"):
+            if not isinstance(getattr(self, field_name), datetime):
+                raise TypeError(f"{field_name} must be a datetime")
+        if self.last_changed_at is not None and not isinstance(
+            self.last_changed_at, datetime
+        ):
+            raise TypeError("last_changed_at must be a datetime or None")
+        if self.batch_id is not None:
+            _require_text(self.batch_id, "batch_id")
+            object.__setattr__(self, "batch_id", self.batch_id.strip())
+        if not isinstance(self.is_active, bool):
+            raise TypeError("is_active must be a boolean")
+
+    @property
+    def identity(self) -> ProgramIdentity:
+        return ProgramIdentity(
+            self.environment,
+            self.source_profile,
+            self.program_name,
+        )
+
+    @classmethod
+    def from_source(
+        cls,
+        source: ProgramSource,
+        *,
+        observed_at: datetime,
+        batch_id: str | None = None,
+        first_seen_at: datetime | None = None,
+        last_changed_at: datetime | None = None,
+    ) -> ProgramState:
+        if not isinstance(source, ProgramSource):
+            raise TypeError("source must be a ProgramSource")
+        return cls(
+            environment=source.environment,
+            source_profile=source.source_profile,
+            program_name=source.program_name,
+            source_hash=source.source_hash,
+            first_seen_at=first_seen_at or observed_at,
+            last_seen_at=observed_at,
+            last_changed_at=last_changed_at,
+            batch_id=batch_id,
+            is_active=True,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,7 +442,9 @@ __all__ = [
     "PhysicalEdge",
     "PhysicalNode",
     "PhysicalNodeKind",
+    "ProgramIdentity",
     "ProgramSource",
+    "ProgramState",
     "TemporaryAssetRule",
     "is_formal_asset",
     "is_temporary_asset",
