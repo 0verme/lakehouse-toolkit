@@ -106,6 +106,11 @@ target = downstream
 `DWM.DEMO_B`。旧实现中如果使用相反方向的内部 adjacency，不得直接当作新领域
 `PhysicalEdge` 或 `LineageEdge`；应在对应迁移 Phase 增加 adapter。
 
+Phase 6 查询继续消费这一定义：`environment` 是 graph boundary，
+`source_profile` 只是可选的 provenance/filter dimension；省略 profile 时，同一环境
+内不同 profile 的正式 edge 可以连接同一张业务图。查询、depth、Viewer contract 和
+Blast Radius 的完整语义见 [`lineage_query.md`](lineage_query.md)。
+
 ## TMP 判定边界
 
 仓库已有两类 TMP 逻辑，本模型不覆盖它们：

@@ -146,6 +146,29 @@ ISSUE_ORDER_SQL = (
     "IFNULL(stable_key, ''), IFNULL(node_key, ''), IFNULL(branch_sink, ''), id"
 )
 
+EDGE_OUTGOING_NEIGHBOR_SQL = (
+    EDGE_SELECT_SQL
+    + " WHERE environment = ? AND source_table = ? AND is_active = 1"
+    + EDGE_ORDER_SQL
+)
+EDGE_OUTGOING_PROFILE_NEIGHBOR_SQL = (
+    EDGE_SELECT_SQL
+    + " WHERE environment = ? AND source_table = ? AND is_active = 1"
+    + " AND source_profile = ?"
+    + EDGE_ORDER_SQL
+)
+EDGE_INCOMING_NEIGHBOR_SQL = (
+    EDGE_SELECT_SQL
+    + " WHERE environment = ? AND target_table = ? AND is_active = 1"
+    + EDGE_ORDER_SQL
+)
+EDGE_INCOMING_PROFILE_NEIGHBOR_SQL = (
+    EDGE_SELECT_SQL
+    + " WHERE environment = ? AND target_table = ? AND is_active = 1"
+    + " AND source_profile = ?"
+    + EDGE_ORDER_SQL
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PublishResult:
@@ -175,6 +198,24 @@ def _decode_evidence(value: str) -> Mapping[str, object] | str | None:
     if decoded is None or isinstance(decoded, (str, Mapping)):
         return decoded
     raise ValueError("stored evidence must be a JSON object, string, or null")
+
+
+def _edge_from_row(row: Any) -> LineageEdge:
+    return LineageEdge(
+        environment=str(row[0]),
+        source_profile=str(row[1]),
+        source_table=str(row[2]),
+        target_table=str(row[3]),
+        program_name=row[4],
+        job_key=row[5],
+        evidence_type=str(row[6]),
+        evidence=_decode_evidence(str(row[7])),
+        source_hash=row[8],
+        batch_id=str(row[9]),
+        observed_at=_parse_datetime(str(row[10])),
+        updated_at=_parse_datetime(str(row[11])),
+        is_active=bool(row[12]),
+    )
 
 
 def _prepare_batch(batch: MaterializationBatch) -> MaterializationBatch:
@@ -551,6 +592,75 @@ class SQLiteMaterializationStore:
             # pi-lens-ignore: python-sql-injection
             return connection.execute(sql, params).fetchall()
 
+    def _read_neighbor_edges(
+        self,
+        *,
+        environment: str,
+        table: str,
+        source_profile: str | None,
+        outgoing: bool,
+    ) -> tuple[LineageEdge, ...]:
+        for value, field_name in ((environment, "environment"), (table, "table")):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        if source_profile is not None and (
+            not isinstance(source_profile, str) or not source_profile.strip()
+        ):
+            raise ValueError("source_profile must be a non-empty string or None")
+
+        if outgoing:
+            if source_profile is None:
+                query_sql = EDGE_OUTGOING_NEIGHBOR_SQL
+            else:
+                query_sql = EDGE_OUTGOING_PROFILE_NEIGHBOR_SQL
+        elif source_profile is None:
+            query_sql = EDGE_INCOMING_NEIGHBOR_SQL
+        else:
+            query_sql = EDGE_INCOMING_PROFILE_NEIGHBOR_SQL
+
+        params: list[object] = [environment.strip(), table.strip()]
+        if source_profile is not None:
+            params.append(source_profile.strip())
+
+        with self._connection_scope() as connection:
+            # SQL is selected from fixed source/target/profile branches above;
+            # table, environment and profile values remain parameters.
+            # pi-lens-ignore: python-sql-injection
+            rows = connection.execute(query_sql, tuple(params)).fetchall()
+        return tuple(_edge_from_row(row) for row in rows)
+
+    def read_outgoing_edges(
+        self,
+        *,
+        environment: str,
+        source_table: str,
+        source_profile: str | None = None,
+    ) -> tuple[LineageEdge, ...]:
+        """只读 active snapshot 中从 source_table 出发的窄 edge 集合。"""
+
+        return self._read_neighbor_edges(
+            environment=environment,
+            table=source_table,
+            source_profile=source_profile,
+            outgoing=True,
+        )
+
+    def read_incoming_edges(
+        self,
+        *,
+        environment: str,
+        target_table: str,
+        source_profile: str | None = None,
+    ) -> tuple[LineageEdge, ...]:
+        """只读 active snapshot 中指向 target_table 的窄 edge 集合。"""
+
+        return self._read_neighbor_edges(
+            environment=environment,
+            table=target_table,
+            source_profile=source_profile,
+            outgoing=False,
+        )
+
     def read_edges(
         self,
         *,
@@ -563,24 +673,7 @@ class SQLiteMaterializationStore:
             batch_id=batch_id,
             active_only=active_only,
         )
-        return tuple(
-            LineageEdge(
-                environment=str(row[0]),
-                source_profile=str(row[1]),
-                source_table=str(row[2]),
-                target_table=str(row[3]),
-                program_name=row[4],
-                job_key=row[5],
-                evidence_type=str(row[6]),
-                evidence=_decode_evidence(str(row[7])),
-                source_hash=row[8],
-                batch_id=str(row[9]),
-                observed_at=_parse_datetime(str(row[10])),
-                updated_at=_parse_datetime(str(row[11])),
-                is_active=bool(row[12]),
-            )
-            for row in rows
-        )
+        return tuple(_edge_from_row(row) for row in rows)
 
     def read_issues(
         self,
