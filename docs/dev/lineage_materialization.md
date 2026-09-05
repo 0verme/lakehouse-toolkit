@@ -193,14 +193,12 @@ ProgramSource provider
 
 ## 本阶段边界
 
-Phase 5 明确不实现：
+Phase 5 明确不实现（由后续 Phase 6 独立消费本阶段 snapshot）：
 
-- Query API、upstream/downstream recursive query；
-- `lineage_closure`、Viewer JSON contract 或 `lineage-viewer` 集成；
-- Blast Radius、impact analysis；
 - source_hash incremental rebuild；
 - historical diff、DEV vs PROD diff、长期 issue trend 或 30 天判定；
 - 旧 `lineage`/`search`/`integrations` 工具批量迁移、删除或收口；
 - Phase 7 lifecycle/history 能力。
 
-Phase 6 后续再负责 Query、Viewer contract 和 Blast Radius。
+Phase 6 的实现见 [`lineage_query.md`](lineage_query.md)：它只从 active
+`lineage_edge` 做窄读取和统一 BFS，不改变 Phase 5 的持久化事实语义。

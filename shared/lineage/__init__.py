@@ -51,6 +51,21 @@ from .physical_dag import (  # pyright: ignore[reportMissingImports]
     extract_program_sql_steps,
     extract_sql_steps,
 )
+from .query import (  # pyright: ignore[reportMissingImports]
+    DEFAULT_QUERY_DEPTH,
+    DEFAULT_QUERY_MAX_NODES,
+    BlastRadiusResult,
+    LineageDirection,
+    LineageEdgeReader,
+    LineageGraphEdge,
+    LineageNode,
+    LineageQueryResult,
+    LineageQueryService,
+    analyze_blast_radius,
+    query_downstream,
+    query_lineage,
+    query_upstream,
+)
 
 __all__ = [
     "AuditResult",
@@ -81,6 +96,15 @@ __all__ = [
     "extract_program_sql_steps",
     "extract_sql_steps",
     "DEFAULT_MATERIALIZATION_DB_PATH",
+    "DEFAULT_QUERY_DEPTH",
+    "DEFAULT_QUERY_MAX_NODES",
+    "BlastRadiusResult",
+    "LineageDirection",
+    "LineageEdgeReader",
+    "LineageGraphEdge",
+    "LineageNode",
+    "LineageQueryResult",
+    "LineageQueryService",
     "MaterializationBatch",
     "MaterializationSQLiteStore",
     "ProgramMaterialization",
@@ -94,4 +118,8 @@ __all__ = [
     "materialize_program_lineage",
     "new_batch_id",
     "publish_materialization_batch",
+    "analyze_blast_radius",
+    "query_downstream",
+    "query_lineage",
+    "query_upstream",
 ]
