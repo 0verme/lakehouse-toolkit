@@ -71,6 +71,7 @@ streamlit run apps/svn_check/app.py --server.address 127.0.0.1 --server.port 850
 | --- | --- |
 | `configs/database.example.yaml` | 可选 JDBC profile 模板 |
 | `configs/audit_datasource.example.yaml` | 本地 PostgreSQL metadata profile |
+| `configs/lineage_providers.example.yaml` | DEV 多 MySQL profile 与 PROD adapter 身份模板 |
 | `configs/migrate/clusters.example.json` | 两个 demo 集群的迁移模板 |
 | `configs/svn.example.yaml` | SVN 项目地址和环境变量引用模板 |
 | `configs/tools.yaml` | 通用工具注册表 |
