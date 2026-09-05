@@ -239,7 +239,8 @@ class LineageEdge:
 
     一条 ``LineageEdge`` 表示某环境下，一个正式上游资产到一个正式下游
     资产的直接业务血缘事实。它不是全量递归祖先关系；TMP 只在 Physical
-    DAG 阶段保留，默认不能作为正式业务资产进入此对象。
+    DAG 阶段保留，默认不能作为正式业务资产进入此对象。``evidence`` 可携带
+    不含完整源码的结构化 provenance，供 materialization adapter 序列化。
     """
 
     environment: str
@@ -254,6 +255,7 @@ class LineageEdge:
     observed_at: datetime | None = None
     updated_at: datetime | None = None
     is_active: bool = True
+    evidence: Mapping[str, object] | str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (

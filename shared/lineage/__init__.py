@@ -1,8 +1,8 @@
-"""共享血缘能力与 Phase 1 领域对象。"""
+"""共享血缘能力、Physical DAG 审计与 Phase 5 materialization。"""
 
 from .audit import (  # pyright: ignore[reportMissingImports]
-    AuditResult,
     ISSUE_SEVERITY_POLICY,
+    AuditResult,
     LineageAuditResult,
     ProgramLineageAuditor,
     audit_program_physical_dag,
@@ -23,6 +23,24 @@ from .domain import (
     is_temporary_asset,
     normalize_asset_name,
 )
+from .materialization import (  # pyright: ignore[reportMissingImports]
+    MaterializationBatch,
+    ProgramMaterialization,
+    build_materialization_batch,
+    collapse_tmp_edges,
+    materialize_batch,
+    materialize_program,
+    materialize_program_lineage,
+    new_batch_id,
+)
+from .materialization_sqlite import (  # pyright: ignore[reportMissingImports]
+    DEFAULT_MATERIALIZATION_DB_PATH,
+    MaterializationSQLiteStore,
+    PublishResult,
+    SQLiteMaterializationStore,
+    initialize_materialization_schema,
+    publish_materialization_batch,
+)
 from .physical_dag import (  # pyright: ignore[reportMissingImports]
     ProgramPhysicalDAG,
     ProgramPhysicalDAGBuilder,
@@ -33,7 +51,6 @@ from .physical_dag import (  # pyright: ignore[reportMissingImports]
     extract_program_sql_steps,
     extract_sql_steps,
 )
-
 
 __all__ = [
     "AuditResult",
@@ -63,4 +80,18 @@ __all__ = [
     "compute_lineage_issue_stable_key",
     "extract_program_sql_steps",
     "extract_sql_steps",
+    "DEFAULT_MATERIALIZATION_DB_PATH",
+    "MaterializationBatch",
+    "MaterializationSQLiteStore",
+    "ProgramMaterialization",
+    "PublishResult",
+    "SQLiteMaterializationStore",
+    "build_materialization_batch",
+    "collapse_tmp_edges",
+    "initialize_materialization_schema",
+    "materialize_batch",
+    "materialize_program",
+    "materialize_program_lineage",
+    "new_batch_id",
+    "publish_materialization_batch",
 ]

@@ -11,7 +11,7 @@
 | `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示 Provider 无法提供预期结果表；`source_hash=None` 表示尚未提供 hash。 |
 | `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |
 | `PhysicalEdge` | 程序内部有向边 | `source` 是上游，`target` 是下游；允许指向 TMP，也不在此阶段吞掉自引用。 |
-| `LineageEdge` | 正式业务血缘的 direct fact | `program_name`/`job_key`、`source_hash`、`batch_id` 和时间字段可由后续采集/发布阶段补齐。 |
+| `LineageEdge` | 正式业务血缘的 direct fact | `program_name`/`job_key`、`source_hash`、`batch_id`、时间字段和不含源码的结构化 `evidence` 可由后续采集/发布阶段补齐。 |
 | `LineageIssue` | Physical DAG 审计事实 | `node_key`、`branch_sink` 与 `stable_key` 可按 issue 类型选择；生命周期时间字段可在首次发现时补齐。 |
 
 ### `ProgramSource`
@@ -68,7 +68,8 @@ DWM.DEMO_B → DWA.DEMO_C
 ```
 
 禁止在 Phase 1 以方便查询为由提前存成 `A → DWA.DEMO_C`。`LineageEdge` 默认
-拒绝名称规则识别出的 TMP endpoint；完整 collapse 留给 Phase 5。
+拒绝名称规则识别出的 TMP endpoint；可选 `evidence` 只保存轻量 provenance，完整
+collapse 留给 Phase 5。
 
 ### `LineageIssue`
 
