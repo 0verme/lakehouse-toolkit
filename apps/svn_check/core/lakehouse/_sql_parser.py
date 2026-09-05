@@ -1,37 +1,14 @@
 import re
 
+from shared.lineage.sql_parser import (  # pyright: ignore[reportMissingImports]
+    split_sql_statements as _split_sql_statements,
+)
+
 
 def split_sql_statements(sql_text):
-    statements = []
-    current = []
-    in_single_quote = False
-    in_double_quote = False
-    i = 0
-    while i < len(sql_text):
-        ch = sql_text[i]
-        if ch == "'" and not in_double_quote:
-            if in_single_quote and i + 1 < len(sql_text) and sql_text[i + 1] == "'":
-                current.append(ch)
-                current.append(sql_text[i + 1])
-                i += 2
-                continue
-            in_single_quote = not in_single_quote
-        elif ch == '"' and not in_single_quote:
-            in_double_quote = not in_double_quote
+    """兼容旧 import，实际实现复用 shared helper。"""
 
-        if ch == ";" and not in_single_quote and not in_double_quote:
-            statement = "".join(current).strip()
-            if statement:
-                statements.append(statement)
-            current = []
-        else:
-            current.append(ch)
-        i += 1
-
-    tail = "".join(current).strip()
-    if tail:
-        statements.append(tail)
-    return statements
+    return _split_sql_statements(sql_text)
 
 
 def split_top_level_commas(text):

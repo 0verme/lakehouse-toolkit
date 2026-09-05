@@ -371,9 +371,54 @@ def derive_target_candidates(
 
 
 def strip_sql_comments(script_code: str) -> str:
-    text = re.sub(r"/\*.*?\*/", " ", script_code or "", flags=re.S)
-    text = re.sub(r"--.*?$", " ", text, flags=re.M)
-    return text
+    """移除 SQL 注释，但保留引号文本中的 ``--`` 与 ``/*``。"""
+
+    text = script_code or ""
+    result: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            result.append(char)
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    result.append(text[index + 1])
+                    index += 2
+                    continue
+                quote = None
+            elif char == "\\" and index + 1 < len(text):
+                result.append(text[index + 1])
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            result.append(char)
+            index += 1
+            continue
+        if text.startswith("--", index):
+            newline = text.find("\n", index + 2)
+            if newline == -1:
+                result.extend(" " for _ in text[index:])
+                break
+            result.extend(" " for _ in text[index:newline])
+            result.append("\n")
+            index = newline + 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            end = len(text) if end == -1 else end + 2
+            result.extend(
+                char if char in {"\r", "\n"} else " " for char in text[index:end]
+            )
+            index = end
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
 
 
 def extract_tables_from_code(script_code: str) -> set[str]:
