@@ -292,6 +292,7 @@ class LineageIssue:
     first_seen_at: datetime | None = None
     last_seen_at: datetime | None = None
     is_active: bool = True
+    stable_key: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("environment", "source_profile", "program_name"):
@@ -302,7 +303,21 @@ class LineageIssue:
             _require_text(self.node_key, "node_key")
         if self.branch_sink is not None:
             _require_text(self.branch_sink, "branch_sink")
+        if self.stable_key is not None:
+            _require_text(self.stable_key, "stable_key")
         object.__setattr__(self, "issue_type", IssueType(self.issue_type))
+
+    @property
+    def issue_key(self) -> str | None:
+        """兼容调用方对稳定 issue identity 的另一种命名。"""
+
+        return self.stable_key
+
+    @property
+    def fingerprint(self) -> str | None:
+        """稳定 identity 的语义别名；不会根据 message 或时间变化。"""
+
+        return self.stable_key
 
 
 __all__ = [
