@@ -8,6 +8,8 @@ materialization consumes ``LineageEdge`` and ``LineageIssue``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -95,6 +97,56 @@ def is_formal_asset(
 def _require_text(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
+
+
+def decode_code(value: object) -> str:
+    """将 metadata 中常见的代码值转换为稳定的文本。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def normalize_program_name(value: object) -> str:
+    """解码并清理程序名；Provider 会对空值显式失败。"""
+
+    return decode_code(value).strip()
+
+
+def normalize_expected_target(value: object) -> str | None:
+    """将可选的 expected target 映射为空值或非空文本。"""
+
+    text = decode_code(value).strip()
+    return text or None
+
+
+def compute_source_hash(
+    program_name: str,
+    script_code: str,
+    expected_target: str | None,
+) -> str:
+    """按固定 JSON canonical 计算 Phase 2 Provider 的 SHA-256。"""
+
+    if not isinstance(program_name, str):
+        raise TypeError("program_name must be a string")
+    if not isinstance(script_code, str):
+        raise TypeError("script_code must be a string")
+    if expected_target is not None and not isinstance(expected_target, str):
+        raise TypeError("expected_target must be a string or None")
+
+    canonical = json.dumps(
+        {
+            "expected_target": expected_target,
+            "program_name": program_name,
+            "script_code": script_code,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +307,8 @@ class LineageIssue:
 
 __all__ = [
     "DEFAULT_TEMPORARY_ASSET_RULES",
+    "compute_source_hash",
+    "decode_code",
     "IssueType",
     "LineageEdge",
     "LineageIssue",
@@ -266,4 +320,6 @@ __all__ = [
     "is_formal_asset",
     "is_temporary_asset",
     "normalize_asset_name",
+    "normalize_expected_target",
+    "normalize_program_name",
 ]

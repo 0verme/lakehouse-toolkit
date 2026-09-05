@@ -1,0 +1,36 @@
+---
+# 公开示例：只提交 profile 结构和环境变量名，不提交连接值。
+# 本地覆盖请复制为 configs/lineage_providers.local.yaml（该文件已被忽略）。
+
+mysql_process_profiles:
+  - name: mysql_dev_a
+    environment: DEV
+    host_env: LAKEHOUSE_DEV_A_MYSQL_HOST
+    port_env: LAKEHOUSE_DEV_A_MYSQL_PORT
+    user_env: LAKEHOUSE_DEV_A_MYSQL_USER
+    password_env: LAKEHOUSE_DEV_A_MYSQL_PASSWORD
+    database_env: LAKEHOUSE_DEV_A_MYSQL_DATABASE
+    table: demo_meta.processes
+    program_name_column: process_name
+    script_code_column: script_code
+    # demo_meta.processes 没有固定的 expected target 字段；不填即为 None。
+    expected_target_column: null
+    batch_size: 200
+
+  - name: mysql_dev_b
+    environment: DEV
+    host_env: LAKEHOUSE_DEV_B_MYSQL_HOST
+    port_env: LAKEHOUSE_DEV_B_MYSQL_PORT
+    user_env: LAKEHOUSE_DEV_B_MYSQL_USER
+    password_env: LAKEHOUSE_DEV_B_MYSQL_PASSWORD
+    database_env: LAKEHOUSE_DEV_B_MYSQL_DATABASE
+    table: demo_meta.processes
+    program_name_column: process_name
+    script_code_column: script_code
+    expected_target_column: null
+    batch_size: 200
+
+# profile 数量没有固定上限；真实部署可按 1..N 增删上述项。
+production:
+  environment: PROD
+  source_profile: production_metadata

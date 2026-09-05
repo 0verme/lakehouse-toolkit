@@ -9,6 +9,7 @@ from functools import lru_cache
 
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
+from shared.lineage.domain import decode_code
 
 DB_CONFIG = {
     "host": os.getenv("PYTOOLS_LINEAGE_MYSQL_HOST", "localhost"),
@@ -189,14 +190,6 @@ def select_mysql_sql(sql: str, params: tuple = ()):
             cursor.close()
     finally:
         db.close()
-
-
-def decode_code(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (bytes, bytearray)):
-        return value.decode("utf-8", errors="ignore")
-    return str(value)
 
 
 def normalize_input_name(value: str) -> str:

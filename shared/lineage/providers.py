@@ -1,0 +1,527 @@
+"""统一的 ProgramSource provider 边界。
+
+Provider 只读取并映射程序来源，不解析 SQL，也不构建 Physical DAG。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Generator, Iterable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+from shared.config.env import metadata_table, required_env, safe_identifier
+from shared.lineage.domain import (
+    ProgramSource,
+    compute_source_hash,
+    decode_code,
+    normalize_expected_target,
+    normalize_program_name,
+)
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+CONFIG_PATH = ROOT_DIR / "configs" / "lineage_providers.local.yaml"
+EXAMPLE_CONFIG_PATH = ROOT_DIR / "configs" / "lineage_providers.example.yaml"
+
+
+class ProviderError(RuntimeError):
+    """Provider 读取或映射失败，错误信息不包含密码或完整连接串。"""
+
+
+@runtime_checkable
+class ProgramSourceProvider(Protocol):
+    """向后续 Parser 暴露的最小程序来源协议。"""
+
+    def iter_program_sources(self) -> Iterable[ProgramSource]:
+        """以 streaming 方式产生统一的 ``ProgramSource``。"""
+        return ()
+
+
+@dataclass(frozen=True, slots=True)
+class MySQLConnectionSettings:
+    """已从环境变量解析出的 MySQL 连接参数。"""
+
+    host: str
+    port: int
+    user: str
+    password: str = field(repr=False)
+    database: str
+    charset: str = "utf8mb4"
+    autocommit: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class MySQLProcessProfile:
+    """一个 DEV MySQL 来源 profile 的安全配置描述。
+
+    profile 只保存环境变量名，不保存连接密码。表名和列名在构造时经过
+    SQL identifier 校验；真正的连接值到 Provider 开始读取时才解析。
+    """
+
+    name: str
+    environment: str
+    host_env: str
+    port_env: str
+    user_env: str
+    password_env: str
+    database_env: str
+    process_table: str = "demo_meta.processes"
+    program_name_column: str = "process_name"
+    script_code_column: str = "script_code"
+    expected_target_column: str | None = None
+    batch_size: int = 200
+    charset: str = "utf8mb4"
+    autocommit: bool = True
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "name",
+            "environment",
+            "host_env",
+            "port_env",
+            "user_env",
+            "password_env",
+            "database_env",
+            "process_table",
+            "program_name_column",
+            "script_code_column",
+            "charset",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+
+        target_column = self.expected_target_column
+        if target_column is not None:
+            if not isinstance(target_column, str):
+                raise ValueError("expected_target_column must be a string or None")
+            target_column = target_column.strip() or None
+            object.__setattr__(self, "expected_target_column", target_column)
+
+        if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
+            raise ValueError("batch_size must be a positive integer")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if not isinstance(self.autocommit, bool):
+            raise ValueError("autocommit must be a boolean")
+
+        safe_identifier(self.process_table, "process table")
+        safe_identifier(self.program_name_column, "program name column")
+        safe_identifier(self.script_code_column, "script code column")
+        if self.expected_target_column is not None:
+            safe_identifier(self.expected_target_column, "expected target column")
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> MySQLProcessProfile:
+        """从 example/local YAML 的一项 profile 创建配置对象。"""
+
+        if not isinstance(raw, Mapping):
+            raise ValueError("mysql process profile must be a mapping")
+
+        def text(key: str) -> str:
+            value = str(raw.get(key, "") or "").strip()
+            if not value:
+                raise ValueError(f"mysql process profile missing required field: {key}")
+            return value
+
+        raw_batch_size = raw.get("batch_size", 200)
+        if isinstance(raw_batch_size, bool) or not isinstance(
+            raw_batch_size, (int, str)
+        ):
+            raise ValueError("mysql process profile batch_size must be an integer")
+        try:
+            batch_size = int(raw_batch_size)
+        except ValueError as exc:
+            raise ValueError(
+                "mysql process profile batch_size must be an integer"
+            ) from exc
+
+        raw_autocommit = raw.get("autocommit", True)
+        if isinstance(raw_autocommit, str):
+            normalized_autocommit = raw_autocommit.strip().lower()
+            if normalized_autocommit in {"true", "1", "yes"}:
+                raw_autocommit = True
+            elif normalized_autocommit in {"false", "0", "no"}:
+                raw_autocommit = False
+            else:
+                raise ValueError("mysql process profile autocommit must be a boolean")
+        if not isinstance(raw_autocommit, bool):
+            raise ValueError("mysql process profile autocommit must be a boolean")
+
+        process_table = str(
+            raw.get("table", raw.get("process_table", "")) or ""
+        ).strip()
+        if not process_table:
+            process_table = metadata_table("processes", "processes")
+
+        expected_target_column = raw.get("expected_target_column")
+        if expected_target_column is not None:
+            expected_target_column = str(expected_target_column).strip() or None
+
+        return cls(
+            name=text("name"),
+            environment=text("environment"),
+            host_env=text("host_env"),
+            port_env=text("port_env"),
+            user_env=text("user_env"),
+            password_env=text("password_env"),
+            database_env=text("database_env"),
+            process_table=process_table,
+            program_name_column=str(
+                raw.get("program_name_column", "process_name")
+            ).strip(),
+            script_code_column=str(
+                raw.get("script_code_column", "script_code")
+            ).strip(),
+            expected_target_column=expected_target_column,
+            batch_size=batch_size,
+            charset=str(raw.get("charset", "utf8mb4") or "utf8mb4").strip(),
+            autocommit=raw_autocommit,
+        )
+
+    def resolve_connection_settings(self) -> MySQLConnectionSettings:
+        """解析本 profile 的连接环境变量，缺失时带来源上下文失败。"""
+
+        context = _profile_context(self.environment, self.name)
+
+        def required_value(env_name: str, label: str, *, preserve: bool = False) -> str:
+            try:
+                value = required_env(env_name)
+            except RuntimeError as exc:
+                raise ProviderError(
+                    f"{context}: missing {label} environment variable {env_name}"
+                ) from exc
+            return value if preserve else value.strip()
+
+        host = required_value(self.host_env, "host")
+        user = required_value(self.user_env, "user")
+        password = required_value(self.password_env, "password", preserve=True)
+        database = required_value(self.database_env, "database")
+        port_text = required_value(self.port_env, "port")
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise ProviderError(f"{context}: port must be an integer") from exc
+        if not 1 <= port <= 65535:
+            raise ProviderError(f"{context}: port must be between 1 and 65535")
+
+        return MySQLConnectionSettings(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            charset=self.charset,
+            autocommit=self.autocommit,
+        )
+
+
+ConnectionFactory = Callable[[MySQLConnectionSettings], Any]
+LegacyProcessLoader = Callable[[], Iterable[object]]
+ExpectedTargetGetter = Callable[[object], object | None]
+
+
+def _profile_context(environment: str, source_profile: str) -> str:
+    return f"environment={environment} source_profile={source_profile}"
+
+
+def default_mysql_connection_factory(settings: MySQLConnectionSettings):
+    """创建真实 MySQL 连接；不提供任何 host/账号/密码默认值。"""
+
+    import pymysql
+
+    return pymysql.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        database=settings.database,
+        charset=settings.charset,
+        autocommit=settings.autocommit,
+    )
+
+
+def _build_process_query(profile: MySQLProcessProfile) -> str:
+    columns = [
+        safe_identifier(profile.program_name_column, "program name column"),
+        safe_identifier(profile.script_code_column, "script code column"),
+    ]
+    if profile.expected_target_column is not None:
+        columns.append(
+            safe_identifier(profile.expected_target_column, "expected target column")
+        )
+    table = safe_identifier(profile.process_table, "process table")
+    script_column = safe_identifier(profile.script_code_column, "script code column")
+    # 这里只拼接已通过 identifier 校验的配置名，没有把运行时值拼入 SQL。
+    # pi-lens-ignore: python-sql-injection
+    return (
+        f"SELECT {', '.join(columns)} FROM {table} "  # noqa: S608
+        f"WHERE {script_column} IS NOT NULL"
+    )
+
+
+def _close_quietly(resource: Any) -> None:
+    if resource is None:
+        return
+    try:
+        resource.close()
+    except Exception:
+        return
+
+
+class MySQLProcessProvider:
+    """从一个 MySQL profile 分批产生 ``ProgramSource``。"""
+
+    def __init__(
+        self,
+        profile: MySQLProcessProfile,
+        *,
+        connection_factory: ConnectionFactory | None = None,
+    ) -> None:
+        if not isinstance(profile, MySQLProcessProfile):
+            raise TypeError("profile must be a MySQLProcessProfile")
+        self.profile = profile
+        self.connection_factory = connection_factory or default_mysql_connection_factory
+        self.query = _build_process_query(profile)
+
+    def iter_program_sources(self) -> Generator[ProgramSource, None, None]:
+        """解析凭据后返回 lazy iterator；数据库连接在开始迭代时建立。"""
+
+        settings = self.profile.resolve_connection_settings()
+        return self._iter_program_sources(settings)
+
+    def _iter_program_sources(
+        self, settings: MySQLConnectionSettings
+    ) -> Generator[ProgramSource, None, None]:
+        context = _profile_context(self.profile.environment, self.profile.name)
+        connection = None
+        cursor = None
+        try:
+            try:
+                connection = self.connection_factory(settings)
+                cursor = connection.cursor()
+                # SQL 仅包含经过 safe_identifier 校验的配置标识符。
+                cursor.execute(self.query)
+            except Exception as exc:
+                raise ProviderError(
+                    f"{context}: failed to open or query MySQL metadata"
+                ) from exc
+
+            row_number = 0
+            while True:
+                try:
+                    batch = cursor.fetchmany(self.profile.batch_size)
+                except Exception as exc:
+                    raise ProviderError(
+                        f"{context}: failed to fetch a metadata batch"
+                    ) from exc
+                if not batch:
+                    break
+                for row in batch:
+                    row_number += 1
+                    try:
+                        yield self._row_to_program_source(row)
+                    except ProviderError:
+                        raise
+                    except Exception as exc:
+                        raise ProviderError(
+                            f"{context}: invalid metadata row {row_number}: {exc}"
+                        ) from exc
+        finally:
+            _close_quietly(cursor)
+            _close_quietly(connection)
+
+    def _row_to_program_source(self, row: object) -> ProgramSource:
+        program_value = _row_value(row, 0, self.profile.program_name_column)
+        script_value = _row_value(row, 1, self.profile.script_code_column)
+        target_value = None
+        if self.profile.expected_target_column is not None:
+            target_value = _row_value(row, 2, self.profile.expected_target_column)
+
+        program_name = normalize_program_name(program_value)
+        if not program_name:
+            raise ValueError("program_name must be a non-empty value")
+        script_code = decode_code(script_value)
+        expected_target = normalize_expected_target(target_value)
+        return ProgramSource(
+            environment=self.profile.environment,
+            source_profile=self.profile.name,
+            program_name=program_name,
+            script_code=script_code,
+            expected_target=expected_target,
+            source_hash=compute_source_hash(program_name, script_code, expected_target),
+        )
+
+
+def _row_value(row: object, index: int, key: str) -> object:
+    if isinstance(row, Mapping):
+        if key not in row:
+            raise ValueError(f"row is missing column {key}")
+        return row[key]
+    try:
+        return row[index]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise ValueError(f"row is missing column {key}") from exc
+
+
+def _default_legacy_process_loader() -> Iterable[object]:
+    """惰性导入旧 loader，避免修改旧入口或在 import 时连接数据库。"""
+
+    from shared.lineage.lineage_builder import load_process_infos
+
+    return load_process_infos()
+
+
+class ProductionProvider:
+    """将现有 production metadata loader 适配为 ``ProgramSource``。
+
+    默认只使用旧 ``ProcessInfo.process_name`` 和 ``script_code``。旧对象没有
+    独立 expected target 字段时保持 ``None``；调用方可注入 getter 提供明确的
+    metadata 字段，但 adapter 不会从程序名或 SQL 内容猜测 target。
+    """
+
+    def __init__(
+        self,
+        process_loader: LegacyProcessLoader | None = None,
+        *,
+        environment: str = "PROD",
+        source_profile: str = "production_metadata",
+        expected_target_getter: ExpectedTargetGetter | None = None,
+    ) -> None:
+        if not isinstance(environment, str) or not environment.strip():
+            raise ValueError("environment must be a non-empty string")
+        if not isinstance(source_profile, str) or not source_profile.strip():
+            raise ValueError("source_profile must be a non-empty string")
+        self.environment = environment.strip()
+        self.source_profile = source_profile.strip()
+        self.process_loader = process_loader or _default_legacy_process_loader
+        self.expected_target_getter = expected_target_getter
+
+    def iter_program_sources(self) -> Generator[ProgramSource, None, None]:
+        context = _profile_context(self.environment, self.source_profile)
+        try:
+            legacy_rows = self.process_loader()
+        except Exception as exc:
+            raise ProviderError(
+                f"{context}: failed to load production metadata"
+            ) from exc
+        return self._iter_legacy_rows(legacy_rows)
+
+    def _iter_legacy_rows(
+        self, legacy_rows: Iterable[object]
+    ) -> Generator[ProgramSource, None, None]:
+        context = _profile_context(self.environment, self.source_profile)
+        try:
+            for row_number, row in enumerate(legacy_rows, start=1):
+                try:
+                    program_value = _legacy_value(
+                        row, ("program_name", "process_name"), required=True
+                    )
+                    script_value = _legacy_value(
+                        row, ("script_code", "code"), required=True
+                    )
+                    if self.expected_target_getter is not None:
+                        target_value = self.expected_target_getter(row)
+                    else:
+                        target_value = _legacy_value(
+                            row, ("expected_target",), required=False
+                        )
+                    program_name = normalize_program_name(program_value)
+                    if not program_name:
+                        raise ValueError("program_name must be a non-empty value")
+                    script_code = decode_code(script_value)
+                    expected_target = normalize_expected_target(target_value)
+                    yield ProgramSource(
+                        environment=self.environment,
+                        source_profile=self.source_profile,
+                        program_name=program_name,
+                        script_code=script_code,
+                        expected_target=expected_target,
+                        source_hash=compute_source_hash(
+                            program_name, script_code, expected_target
+                        ),
+                    )
+                except ProviderError:
+                    raise
+                except Exception as exc:
+                    raise ProviderError(
+                        f"{context}: invalid legacy metadata row {row_number}: {exc}"
+                    ) from exc
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"{context}: failed while iterating production metadata"
+            ) from exc
+
+
+def _legacy_value(
+    row: object, names: tuple[str, ...], *, required: bool
+) -> object | None:
+    missing = object()
+    value: object = missing
+    if isinstance(row, Mapping):
+        for name in names:
+            if name in row:
+                value = row[name]
+                break
+    else:
+        for name in names:
+            if hasattr(row, name):
+                value = getattr(row, name)
+                break
+    if value is missing:
+        if required:
+            raise ValueError(f"legacy row is missing field {names[0]}")
+        return None
+    return value
+
+
+def iter_program_sources(
+    providers: Iterable[ProgramSourceProvider],
+) -> Generator[ProgramSource, None, None]:
+    """按 provider 顺序 streaming 聚合，不缓存全部程序。"""
+
+    for provider in providers:
+        yield from provider.iter_program_sources()
+
+
+def load_mysql_process_profiles(
+    config_path: str | Path | None = None,
+) -> list[MySQLProcessProfile]:
+    """加载 local/example YAML 中的 1..N 个 MySQL process profiles。"""
+
+    import yaml
+
+    path = (
+        Path(config_path)
+        if config_path is not None
+        else (CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_CONFIG_PATH)
+    )
+    with path.open(encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, Mapping):
+        raise ValueError("lineage provider config must be a mapping")
+
+    raw_profiles = data.get("mysql_process_profiles", [])
+    if not isinstance(raw_profiles, list):
+        raise ValueError("mysql_process_profiles must be a list")
+    return [MySQLProcessProfile.from_mapping(item) for item in raw_profiles]
+
+
+__all__ = [
+    "ConnectionFactory",
+    "ExpectedTargetGetter",
+    "EXAMPLE_CONFIG_PATH",
+    "LegacyProcessLoader",
+    "MySQLConnectionSettings",
+    "MySQLProcessProfile",
+    "MySQLProcessProvider",
+    "ProductionProvider",
+    "ProgramSourceProvider",
+    "ProviderError",
+    "default_mysql_connection_factory",
+    "iter_program_sources",
+    "load_mysql_process_profiles",
+]
