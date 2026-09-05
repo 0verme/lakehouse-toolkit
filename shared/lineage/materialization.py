@@ -34,6 +34,7 @@ from shared.lineage.domain import (
     PhysicalEdge,
     PhysicalNode,
     PhysicalNodeKind,
+    ProgramState,
     is_temporary_asset,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
@@ -57,6 +58,7 @@ class MaterializationBatch:
     observed_at: datetime
     edges: tuple[LineageEdge, ...] = ()
     issues: tuple[LineageIssue, ...] = ()
+    program_states: tuple[ProgramState, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.batch_id, str) or not self.batch_id.strip():
@@ -66,6 +68,9 @@ class MaterializationBatch:
         object.__setattr__(self, "batch_id", self.batch_id.strip())
         object.__setattr__(self, "edges", tuple(self.edges))
         object.__setattr__(self, "issues", tuple(self.issues))
+        object.__setattr__(self, "program_states", tuple(self.program_states))
+        if any(not isinstance(state, ProgramState) for state in self.program_states):
+            raise TypeError("program_states must contain ProgramState values")
 
 
 def new_batch_id() -> str:

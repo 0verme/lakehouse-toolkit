@@ -1,4 +1,13 @@
 # !/bin/python
+"""Deprecated compatibility tool for legacy SQL/schedule-to-DWF tracing.
+
+The formal table lineage path is now ``jobs.crontab.imp_lineage_edge`` plus
+``LineageQueryService``. This tool remains available because its DWF cutoff and
+interactive report are not API-compatible replacements; remove it only after
+external caller confirmation and a compatibility adapter.
+"""
+
+# ruff: noqa: I001
 from __future__ import annotations
 
 import os
@@ -6,8 +15,13 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from pywebio.input import TEXT, input_group, radio, textarea
-from pywebio.output import put_table
+from pywebio.input import (  # pyright: ignore[reportMissingImports]
+    TEXT,
+    input_group,
+    radio,
+    textarea,
+)
+from pywebio.output import put_table  # pyright: ignore[reportMissingImports]
 
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
@@ -80,7 +94,7 @@ class TraceResult:
 
 
 def get_db():
-    import pymysql
+    import pymysql  # pyright: ignore[reportMissingModuleSource]
 
     return pymysql.connect(**get_mysql_config())
 

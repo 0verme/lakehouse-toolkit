@@ -155,13 +155,17 @@ separators=(",", ":"))` 形式保存，不使用 pickle、`repr()` 或 Python `h
 计数和 active 状态。它也能正确表示“成功发布但本批次没有 edge”的 snapshot；否则
 只能从业务行反推 active batch。它不是历史 diff 或 Query API。
 
+Phase 7 在同一 batch contract 下新增 `lineage_program_state`，保存程序 identity、
+`source_hash`、first/last seen、last changed 与 active 状态；旧 batch 的 edge、issue
+和 program state 都保留为 historical snapshot。
+
 ## Atomic Batch Publish
 
 `SQLiteMaterializationStore.publish()` 在同一个 transaction 中完成：
 
 ```text
 BEGIN IMMEDIATE
-  insert inactive candidate batch/edges/issues
+  insert inactive candidate batch/edges/issues/program states
   validate row counts、identity 和 JSON evidence
   deactivate previous batch
   activate new batch
@@ -193,12 +197,10 @@ ProgramSource provider
 
 ## 本阶段边界
 
-Phase 5 明确不实现（由后续 Phase 6 独立消费本阶段 snapshot）：
-
-- source_hash incremental rebuild；
-- historical diff、DEV vs PROD diff、长期 issue trend 或 30 天判定；
-- 旧 `lineage`/`search`/`integrations` 工具批量迁移、删除或收口；
-- Phase 7 lifecycle/history 能力。
+Phase 5 本身仍只负责纯 materialization 与 atomic publish；增量、历史、diff、issue
+lifecycle 和 legacy decision 由 Phase 7 追加，详见
+[`lineage_incremental_history.md`](lineage_incremental_history.md)。
 
 Phase 6 的实现见 [`lineage_query.md`](lineage_query.md)：它只从 active
-`lineage_edge` 做窄读取和统一 BFS，不改变 Phase 5 的持久化事实语义。
+`lineage_edge` 做窄读取和统一 BFS，不改变 Phase 5 的持久化事实语义；Phase 7 不把
+历史结果塞进 Viewer contract。

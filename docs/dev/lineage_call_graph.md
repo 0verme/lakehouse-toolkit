@@ -163,7 +163,10 @@ adapter 或逐步迁移。
   不复用现有字段 SQLite 表作为正式事实表。
 - **Phase 6**：让 query、Blast Radius 和 Viewer JSON 只读取 materialized edge；Viewer
   不连接外部 metadata。
-- **Phase 7**：使用 hash 做增量，补历史/diff，确认调用后再清理重复实现。
+- **Phase 7**：使用 hash 做增量，补历史/diff，确认调用后再清理重复实现；实际
+  identity、snapshot boundary、legacy decision 见
+  [`lineage_incremental_history.md`](lineage_incremental_history.md) 和
+  [`lineage_legacy_migration.md`](lineage_legacy_migration.md)。
 
 ## Phase 1 边界
 

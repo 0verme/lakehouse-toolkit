@@ -38,6 +38,7 @@ class LineageEdgeReader(Protocol):
         source_profile: str | None = None,
     ) -> Iterable[LineageEdge]:
         """返回 scope 内以 ``source_table`` 为 source 的 active edges。"""
+        return ()
 
     def read_incoming_edges(
         self,
@@ -47,6 +48,7 @@ class LineageEdgeReader(Protocol):
         source_profile: str | None = None,
     ) -> Iterable[LineageEdge]:
         """返回 scope 内以 ``target_table`` 为 target 的 active edges。"""
+        return ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,9 +413,9 @@ class LineageQueryService:
                 continue
             source = _normalize_table(edge.source_table)
             target = _normalize_table(edge.target_table)
-            if direction is LineageDirection.DOWNSTREAM and source == current:
-                pairs.add((source, target))
-            elif direction is LineageDirection.UPSTREAM and target == current:
+            if (direction is LineageDirection.DOWNSTREAM and source == current) or (
+                direction is LineageDirection.UPSTREAM and target == current
+            ):
                 pairs.add((source, target))
         return tuple(sorted(pairs))
 

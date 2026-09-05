@@ -142,5 +142,7 @@ impact 是否受安全限制裁剪。unknown root 返回零 impact，`root=None`
 source_profile 都是参数；不会把用户提供的表名拼接为 SQL 标识符。查询只读
 active snapshot，不查询历史 candidate，也不创建 `lineage_closure`。
 
-本阶段不新增 closure/transitive materialization，不实现历史 diff、incremental
-rebuild、DEV/PROD diff 或 lineage-viewer 前端集成。
+Phase 6 本身不新增 closure/transitive materialization；Phase 7 在独立的
+history/diff API 中实现历史 batch、incremental rebuild 和 DEV/PROD diff，但仍不
+把它们混入 Query/Viewer contract，也不创建 `lineage_closure`。详见
+[`lineage_incremental_history.md`](lineage_incremental_history.md)。

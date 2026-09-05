@@ -31,6 +31,7 @@ ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
         IssueType.CYCLE_DETECTED: "HIGH",
         IssueType.SELF_REFERENCE: "HIGH",
         IssueType.ORPHAN_BRANCH: "MEDIUM",
+        IssueType.LINEAGE_BRANCH_BROKEN: "HIGH",
         IssueType.MULTI_SINK_CANDIDATE: "MEDIUM",
     }
 )
@@ -368,7 +369,10 @@ def compute_lineage_issue_stable_key(
         "scope": "program",
         "source_profile": source_profile,
     }
-    if resolved_type is IssueType.ORPHAN_BRANCH:
+    if resolved_type in (
+        IssueType.ORPHAN_BRANCH,
+        IssueType.LINEAGE_BRANCH_BROKEN,
+    ):
         identity["scope"] = "branch"
         identity["branch_sink"] = branch_sink
     elif resolved_type is IssueType.SELF_REFERENCE:
