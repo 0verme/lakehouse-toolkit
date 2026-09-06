@@ -20,6 +20,7 @@ coverage/
 # Runtime output and generated exports
 logs/
 runtime/
+artifacts/
 tmp/
 temp/
 cache/
