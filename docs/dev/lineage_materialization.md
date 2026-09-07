@@ -197,13 +197,37 @@ ProgramSource provider
 
 ### 定时任务可观测性
 
-定时任务复用了 progress logging PR #25（`ccb5e60`）的低基数脱敏日志约定，在
+定时任务复用了已合并的 progress logging PR #25（`ccb5e60`）的低基数脱敏日志约定，在
 `source_load`、`incremental_plan`、`build`、`publish` 和 `job` 边界输出已 flush 的阶段
 状态。build progress 默认每 500 个本轮 rebuild 程序输出一次；日志只包含 count、耗时、
 受限 batch ID 与异常 class，不输出 program name、源码、SQL、表名或 connection settings。
 coverage funnel 的聚合行以 `stage=coverage` 单独输出，详见
-[`lineage_coverage.md`](lineage_coverage.md)。该 progress PR 仍可独立审阅/合并，当前
-入口不要求它先合并。
+[`lineage_coverage.md`](lineage_coverage.md)。
+
+直接运行：
+
+```bash
+python jobs/crontab/imp_lineage_edge.py
+```
+
+本轮只 rebuild 100 个程序时，`build total` 也只会是 100；日志不会为每个
+`ProgramSource` 输出一条记录：
+
+```text
+stage=job status=STARTED providers=4
+stage=source_load status=SUCCESS sources=20470 elapsed_ms=...
+stage=incremental_plan status=SUCCESS total=20470 new=20470 changed=0 unchanged=0 deleted=0 rebuild=20470 elapsed_ms=...
+stage=build status=STARTED total=20470
+stage=build status=RUNNING processed=500 total=20470 percent=2 elapsed_ms=...
+stage=build status=SUCCESS processed=20470 edges=... issues=... elapsed_ms=...
+stage=publish status=SUCCESS batch_id=batch-... edges=... issues=... previous=- elapsed_ms=...
+stage=job status=SUCCESS elapsed_ms=...
+```
+
+`stage=job status=SUCCESS` 只会在 SQLite atomic publish 完成后出现。中途的 STARTED/RUNNING
+日志只表示计算进度，不表示 snapshot 已经发布；失败时会输出
+`status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。当前实现使用
+固定 count progress；如果未来需要在单个程序长时间运行期间提供 heartbeat，可单独增加时间阈值。
 
 ## 本阶段边界
 
