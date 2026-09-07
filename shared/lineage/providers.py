@@ -5,6 +5,7 @@ Provider 只读取并映射程序来源，不解析 SQL，也不构建 Physical 
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Generator, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,39 @@ EXAMPLE_CONFIG_PATH = ROOT_DIR / "configs" / "lineage_providers.example.yaml"
 
 class ProviderError(RuntimeError):
     """Provider 读取或映射失败，错误信息不包含密码或完整连接串。"""
+
+
+class LineageDependencyError(RuntimeError):
+    """Lineage CLI 启动所需的 Python 依赖不可用。"""
+
+    def __init__(self, dependency: str) -> None:
+        self.dependency = dependency
+        super().__init__(f"missing Python dependency: {dependency}")
+
+
+class LineageConfigError(ValueError):
+    """配置加载或校验失败；字段信息只包含安全的结构诊断。"""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        reason: str | None = None,
+        line: int | None = None,
+        column: int | None = None,
+    ) -> None:
+        self.code = code
+        self.reason = reason
+        self.line = line
+        self.column = column
+        details = [code]
+        if reason:
+            details.append(f"reason={reason}")
+        if line is not None:
+            details.append(f"line={line}")
+        if column is not None:
+            details.append(f"column={column}")
+        super().__init__(" ".join(details))
 
 
 @runtime_checkable
@@ -670,27 +704,125 @@ def iter_program_sources(
         yield from provider.iter_program_sources()
 
 
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+_SAFE_VALIDATION_TAILS = {
+    "must be a non-empty string",
+    "must be a string or None",
+    "must be a positive integer",
+    "must be a boolean",
+    "must be a mapping",
+    "must be an integer",
+}
+
+
+def _safe_profile_reason(error: Exception) -> str:
+    """将 profile 校验错误归一为不包含配置值的字段级诊断。"""
+
+    message = str(error)
+    if message == "mysql process profile must be a mapping":
+        return "profile must be a mapping"
+    if message == (
+        "mysql process profile must configure exactly one of "
+        "connection, connection_env, or legacy *_env fields"
+    ):
+        return "configure exactly one connection source"
+
+    required_prefix = "mysql process profile missing required field: "
+    if message.startswith(required_prefix):
+        field_name = message.removeprefix(required_prefix)
+        if _FIELD_NAME_RE.fullmatch(field_name):
+            return f"missing required field: {field_name}"
+
+    connection_required_prefix = "connection missing required field: "
+    if message.startswith(connection_required_prefix):
+        field_name = message.removeprefix(connection_required_prefix)
+        if _FIELD_NAME_RE.fullmatch(field_name):
+            return f"connection missing required field: {field_name}"
+
+    if message.startswith("Invalid SQL "):
+        label = message.removeprefix("Invalid SQL ").split(":", 1)[0].strip()
+        if label and all(character.isalnum() or character == " " for character in label):
+            return f"invalid SQL identifier for {label.lower()}"
+
+    candidate = message
+    if candidate.startswith("mysql process profile "):
+        candidate = candidate.removeprefix("mysql process profile ")
+    if " must " in candidate:
+        field_name, tail = candidate.split(" must ", 1)
+        if _FIELD_NAME_RE.fullmatch(field_name) and f"must {tail}" in _SAFE_VALIDATION_TAILS:
+            return f"{field_name} must {tail}"
+
+    return "profile fields or structure are invalid"
+
+
+def _yaml_error_location(error: Exception) -> tuple[int | None, int | None]:
+    mark = getattr(error, "problem_mark", None) or getattr(
+        error, "context_mark", None
+    )
+    line = getattr(mark, "line", None)
+    column = getattr(mark, "column", None)
+    return (
+        line + 1 if isinstance(line, int) and line >= 0 else None,
+        column + 1 if isinstance(column, int) and column >= 0 else None,
+    )
+
+
 def load_mysql_process_profiles(
     config_path: str | Path | None = None,
 ) -> list[MySQLProcessProfile]:
     """加载 local/example YAML 中的 1..N 个 MySQL process profiles。"""
 
-    import yaml
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        if exc.name == "yaml":
+            raise LineageDependencyError("PyYAML") from exc
+        raise
 
     path = (
         Path(config_path)
         if config_path is not None
         else (CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_CONFIG_PATH)
     )
-    with path.open(encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except FileNotFoundError as exc:
+        raise LineageConfigError("CONFIG_NOT_FOUND") from exc
+    except (OSError, UnicodeError) as exc:
+        raise LineageConfigError("CONFIG_READ_ERROR") from exc
+    except yaml.YAMLError as exc:
+        line, column = _yaml_error_location(exc)
+        raise LineageConfigError(
+            "YAML_INVALID",
+            line=line,
+            column=column,
+        ) from exc
+
     if not isinstance(data, Mapping):
-        raise ValueError("lineage provider config must be a mapping")
+        raise LineageConfigError(
+            "CONFIG_INVALID",
+            reason="root must be a mapping",
+        )
 
     raw_profiles = data.get("mysql_process_profiles", [])
     if not isinstance(raw_profiles, list):
-        raise ValueError("mysql_process_profiles must be a list")
-    return [MySQLProcessProfile.from_mapping(item) for item in raw_profiles]
+        raise LineageConfigError(
+            "CONFIG_INVALID",
+            reason="mysql_process_profiles must be a list",
+        )
+
+    profiles: list[MySQLProcessProfile] = []
+    for index, item in enumerate(raw_profiles):
+        try:
+            profiles.append(MySQLProcessProfile.from_mapping(item))
+        except (TypeError, ValueError) as exc:
+            reason = _safe_profile_reason(exc)
+            raise LineageConfigError(
+                "CONFIG_INVALID",
+                reason=f"profile[{index}] {reason}",
+            ) from exc
+    return profiles
 
 
 __all__ = [
@@ -698,6 +830,8 @@ __all__ = [
     "ExpectedTargetGetter",
     "EXAMPLE_CONFIG_PATH",
     "LegacyProcessLoader",
+    "LineageConfigError",
+    "LineageDependencyError",
     "MySQLConnectionSettings",
     "MySQLProcessProfile",
     "MySQLProcessProvider",

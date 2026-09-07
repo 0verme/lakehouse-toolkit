@@ -7,7 +7,11 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
-from shared.lineage.providers import load_mysql_process_profiles
+from shared.lineage.providers import (
+    LineageConfigError,
+    LineageDependencyError,
+    load_mysql_process_profiles,
+)
 from shared.lineage.verification import (  # pyright: ignore[reportMissingImports]
     DEFAULT_REPORT_PATH,
     SnapshotStatus,
@@ -70,20 +74,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     _configure_logging()
 
     try:
-        config_exists = args.config.is_file()
+        if not args.config.exists():
+            _log_config_failure("CONFIG_NOT_FOUND")
+            return 2
+        if not args.config.is_file():
+            _log_config_failure("CONFIG_READ_ERROR")
+            return 2
     except OSError:
-        config_exists = False
-    if not config_exists:
-        LOGGER.error("stage=config status=FAILED")
+        _log_config_failure("CONFIG_READ_ERROR")
         return 2
 
     try:
         profiles = load_mysql_process_profiles(args.config)
-    except Exception:
-        LOGGER.error("stage=config status=FAILED")
+    except Exception as exc:
+        if isinstance(exc, LineageDependencyError):
+            _log_dependency_failure(exc)
+        elif isinstance(exc, LineageConfigError):
+            _log_config_failure(
+                exc.code,
+                reason=exc.reason,
+                line=exc.line,
+                column=exc.column,
+            )
+        elif isinstance(exc, FileNotFoundError):
+            _log_config_failure("CONFIG_NOT_FOUND")
+        elif isinstance(exc, OSError):
+            _log_config_failure("CONFIG_READ_ERROR")
+        elif isinstance(exc, ModuleNotFoundError) and exc.name == "yaml":
+            _log_dependency_failure(LineageDependencyError("PyYAML"))
+        else:
+            _log_unexpected_config_failure(exc)
         return 2
     if not profiles:
-        LOGGER.error("stage=config status=FAILED")
+        _log_config_failure(
+            "CONFIG_INVALID",
+            reason="mysql_process_profiles must contain at least one profile",
+        )
         return 2
 
     results = verify_mysql_profiles(
@@ -147,6 +173,38 @@ def _report_is_complete(report) -> bool:
         SnapshotStatus.COMPLETE.value,
         SnapshotStatus.NOT_RUN.value,
     }
+
+
+def _log_dependency_failure(error: LineageDependencyError) -> None:
+    LOGGER.error(
+        'stage=dependency status=FAILED dependency=%s '
+        'hint="run: python -m pip install -r requirements.txt"',
+        error.dependency,
+    )
+
+
+def _log_config_failure(
+    error: str,
+    *,
+    reason: str | None = None,
+    line: int | None = None,
+    column: int | None = None,
+) -> None:
+    fields = [f"stage=config status=FAILED error={error}"]
+    if line is not None:
+        fields.append(f"line={line}")
+    if column is not None:
+        fields.append(f"column={column}")
+    if reason:
+        fields.append(f"reason={reason}")
+    LOGGER.error(" ".join(fields))
+
+
+def _log_unexpected_config_failure(error: Exception) -> None:
+    LOGGER.error(
+        "stage=config status=FAILED error=UNEXPECTED exception=%s",
+        type(error).__name__,
+    )
 
 
 def _non_negative_int(value: str) -> int:
