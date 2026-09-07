@@ -143,7 +143,7 @@ psql -h 127.0.0.1 -U demo_user -d pytools_demo -f docs/dev/local_pg_audit_meta.s
 ## 安全说明
 
 - 本仓库只公开源代码、虚构 fixture 和独立 demo metadata model。
-- 所有凭据必须通过环境变量或外部 Secret 管理器注入；缺失必填变量会以 `Missing required environment variable XXX` 明确失败。
+- 共享配置中的凭据必须通过环境变量或外部 Secret 管理器注入；内网人工执行可在被忽略的 `*.local.yaml` 使用 `connection`。环境变量模式缺失必填变量会明确失败。
 - 默认网络地址仅用于本地或 `.example.invalid` 文档示例，应用不会自动连接生产服务。
 - `runtime/`、`logs/`、SQLite、HTML、CSV、SQL 压缩包、密钥文件和外部 JAR 已加入 `.gitignore`。
 - `resources/jars/` 不包含 JDBC 驱动。需要 JDBC 的使用者必须依据目标数据库官方文档和适用许可证自行获取，并放到本地配置指定的位置。

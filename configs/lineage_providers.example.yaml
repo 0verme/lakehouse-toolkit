@@ -1,15 +1,18 @@
 ---
-# 公开示例：只提交 profile 结构和环境变量名，不提交连接值。
-# 本地覆盖请复制为 configs/lineage_providers.local.yaml（该文件已被忽略）。
+# 公开示例：connection 只使用 demo 占位值；真实值请仅写入被忽略的
+# configs/lineage_providers.local.yaml。CI / Docker 场景可使用 connection_env。
+# 每个 profile 选择一种连接来源：connection、connection_env 或 legacy 顶层 *_env。
 
 mysql_process_profiles:
+  # 内网 Windows 人工执行可在 local 配置中使用 connection，减少环境变量数量。
   - name: mysql_dev_a
     environment: DEV
-    host_env: LAKEHOUSE_DEV_A_MYSQL_HOST
-    port_env: LAKEHOUSE_DEV_A_MYSQL_PORT
-    user_env: LAKEHOUSE_DEV_A_MYSQL_USER
-    password_env: LAKEHOUSE_DEV_A_MYSQL_PASSWORD
-    database_env: LAKEHOUSE_DEV_A_MYSQL_DATABASE
+    connection:
+      host: 127.0.0.1
+      port: 3306
+      user: DEMO_USER
+      password: DEMO_PASSWORD_VALUE
+      database: demo_meta
     table: demo_meta.processes
     program_name_column: process_name
     script_code_column: script_code
@@ -17,13 +20,30 @@ mysql_process_profiles:
     expected_target_column: null
     batch_size: 200
 
+  # CI / Docker 可只提交环境变量名，连接值仍由运行环境注入。
   - name: mysql_dev_b
     environment: DEV
-    host_env: LAKEHOUSE_DEV_B_MYSQL_HOST
-    port_env: LAKEHOUSE_DEV_B_MYSQL_PORT
-    user_env: LAKEHOUSE_DEV_B_MYSQL_USER
-    password_env: LAKEHOUSE_DEV_B_MYSQL_PASSWORD
-    database_env: LAKEHOUSE_DEV_B_MYSQL_DATABASE
+    connection_env:
+      host: LAKEHOUSE_DEV_B_MYSQL_HOST
+      port: LAKEHOUSE_DEV_B_MYSQL_PORT
+      user: LAKEHOUSE_DEV_B_MYSQL_USER
+      password: LAKEHOUSE_DEV_B_MYSQL_PASSWORD
+      database: LAKEHOUSE_DEV_B_MYSQL_DATABASE
+    table: demo_meta.processes
+    program_name_column: process_name
+    script_code_column: script_code
+    expected_target_column: null
+    batch_size: 200
+
+  # 兼容现有 legacy 顶层 host_env / port_env / user_env / password_env /
+  # database_env；迁移时无需一次性修改所有 profile。
+  - name: mysql_dev_legacy
+    environment: DEV
+    host_env: LAKEHOUSE_DEV_LEGACY_MYSQL_HOST
+    port_env: LAKEHOUSE_DEV_LEGACY_MYSQL_PORT
+    user_env: LAKEHOUSE_DEV_LEGACY_MYSQL_USER
+    password_env: LAKEHOUSE_DEV_LEGACY_MYSQL_PASSWORD
+    database_env: LAKEHOUSE_DEV_LEGACY_MYSQL_DATABASE
     table: demo_meta.processes
     program_name_column: process_name
     script_code_column: script_code

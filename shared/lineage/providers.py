@@ -37,9 +37,19 @@ class ProgramSourceProvider(Protocol):
         return ()
 
 
+_CONNECTION_KEYS = ("host", "port", "user", "password", "database")
+_LEGACY_CONNECTION_ENV_FIELDS = (
+    "host_env",
+    "port_env",
+    "user_env",
+    "password_env",
+    "database_env",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class MySQLConnectionSettings:
-    """已从环境变量解析出的 MySQL 连接参数。"""
+    """已归一化的 MySQL 连接参数。"""
 
     host: str
     port: int
@@ -52,19 +62,22 @@ class MySQLConnectionSettings:
 
 @dataclass(frozen=True, slots=True)
 class MySQLProcessProfile:
-    """一个 DEV MySQL 来源 profile 的安全配置描述。
+    """一个 DEV MySQL 来源 profile 的连接和 metadata 配置描述。
 
-    profile 只保存环境变量名，不保存连接密码。表名和列名在构造时经过
-    SQL identifier 校验；真正的连接值到 Provider 开始读取时才解析。
+    连接来源可以是本地 ``connection`` 值、``connection_env`` 环境变量名，
+    或兼容现有配置的顶层 ``*_env`` 字段。三种来源都只在 Provider 开始
+    读取时归一为 ``MySQLConnectionSettings``；嵌套连接配置不会进入 profile
+    的 repr，避免直接密码被意外打印。
     """
 
     name: str
     environment: str
-    host_env: str
-    port_env: str
-    user_env: str
-    password_env: str
-    database_env: str
+    # These fields remain in their original order for positional-call compatibility.
+    host_env: str = ""
+    port_env: str = ""
+    user_env: str = ""
+    password_env: str = field(default_factory=str)
+    database_env: str = ""
     process_table: str = "demo_meta.processes"
     program_name_column: str = "process_name"
     script_code_column: str = "script_code"
@@ -72,16 +85,17 @@ class MySQLProcessProfile:
     batch_size: int = 200
     charset: str = "utf8mb4"
     autocommit: bool = True
+    connection: Mapping[str, object] | None = field(
+        default=None, repr=False, hash=False
+    )
+    connection_env: Mapping[str, object] | None = field(
+        default=None, repr=False, hash=False
+    )
 
     def __post_init__(self) -> None:
         for field_name in (
             "name",
             "environment",
-            "host_env",
-            "port_env",
-            "user_env",
-            "password_env",
-            "database_env",
             "process_table",
             "program_name_column",
             "script_code_column",
@@ -112,6 +126,42 @@ class MySQLProcessProfile:
         if self.expected_target_column is not None:
             safe_identifier(self.expected_target_column, "expected target column")
 
+        legacy_fields_present = any(
+            value is not None and (not isinstance(value, str) or bool(value.strip()))
+            for value in (
+                getattr(self, field_name)
+                for field_name in _LEGACY_CONNECTION_ENV_FIELDS
+            )
+        )
+        source_count = sum(
+            source is not None
+            for source in (self.connection, self.connection_env)
+        ) + int(legacy_fields_present)
+        if source_count != 1:
+            raise ValueError(
+                "mysql process profile must configure exactly one of "
+                "connection, connection_env, or legacy *_env fields"
+            )
+
+        if self.connection is not None:
+            object.__setattr__(
+                self,
+                "connection",
+                _copy_connection_mapping(self.connection, "connection"),
+            )
+        if self.connection_env is not None:
+            object.__setattr__(
+                self,
+                "connection_env",
+                _copy_connection_env_mapping(self.connection_env),
+            )
+        if legacy_fields_present:
+            for field_name in _LEGACY_CONNECTION_ENV_FIELDS:
+                value = getattr(self, field_name)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{field_name} must be a non-empty string")
+                object.__setattr__(self, field_name, value.strip())
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> MySQLProcessProfile:
         """从 example/local YAML 的一项 profile 创建配置对象。"""
@@ -123,6 +173,19 @@ class MySQLProcessProfile:
             value = str(raw.get(key, "") or "").strip()
             if not value:
                 raise ValueError(f"mysql process profile missing required field: {key}")
+            return value
+
+        def optional_text(key: str) -> str:
+            if key not in raw or raw[key] is None:
+                return ""
+            return str(raw[key]).strip()
+
+        def source_mapping(key: str) -> Mapping[str, object] | None:
+            value = raw.get(key)
+            if value is None:
+                return None
+            if not isinstance(value, Mapping):
+                raise ValueError(f"mysql process profile {key} must be a mapping")
             return value
 
         raw_batch_size = raw.get("batch_size", 200)
@@ -162,11 +225,11 @@ class MySQLProcessProfile:
         return cls(
             name=text("name"),
             environment=text("environment"),
-            host_env=text("host_env"),
-            port_env=text("port_env"),
-            user_env=text("user_env"),
-            password_env=text("password_env"),
-            database_env=text("database_env"),
+            host_env=optional_text("host_env"),
+            port_env=optional_text("port_env"),
+            user_env=optional_text("user_env"),
+            password_env=optional_text("password_env"),
+            database_env=optional_text("database_env"),
             process_table=process_table,
             program_name_column=str(
                 raw.get("program_name_column", "process_name")
@@ -178,43 +241,163 @@ class MySQLProcessProfile:
             batch_size=batch_size,
             charset=str(raw.get("charset", "utf8mb4") or "utf8mb4").strip(),
             autocommit=raw_autocommit,
+            connection=source_mapping("connection"),
+            connection_env=source_mapping("connection_env"),
         )
 
     def resolve_connection_settings(self) -> MySQLConnectionSettings:
-        """解析本 profile 的连接环境变量，缺失时带来源上下文失败。"""
+        """解析三种连接配置来源，统一返回 ``MySQLConnectionSettings``。"""
 
         context = _profile_context(self.environment, self.name)
-
-        def required_value(env_name: str, label: str, *, preserve: bool = False) -> str:
-            try:
-                value = required_env(env_name)
-            except RuntimeError as exc:
-                raise ProviderError(
-                    f"{context}: missing {label} environment variable {env_name}"
-                ) from exc
-            return value if preserve else value.strip()
-
-        host = required_value(self.host_env, "host")
-        user = required_value(self.user_env, "user")
-        password = required_value(self.password_env, "password", preserve=True)
-        database = required_value(self.database_env, "database")
-        port_text = required_value(self.port_env, "port")
-        try:
-            port = int(port_text)
-        except ValueError as exc:
-            raise ProviderError(f"{context}: port must be an integer") from exc
-        if not 1 <= port <= 65535:
-            raise ProviderError(f"{context}: port must be between 1 and 65535")
-
-        return MySQLConnectionSettings(
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-            database=database,
+        if self.connection is not None:
+            return _settings_from_connection(
+                self.connection,
+                context,
+                charset=self.charset,
+                autocommit=self.autocommit,
+            )
+        if self.connection_env is not None:
+            return _settings_from_environment(
+                self.connection_env,
+                context,
+                charset=self.charset,
+                autocommit=self.autocommit,
+            )
+        return _settings_from_environment(
+            {
+                "host": self.host_env,
+                "port": self.port_env,
+                "user": self.user_env,
+                "password": self.password_env,
+                "database": self.database_env,
+            },
+            context,
             charset=self.charset,
             autocommit=self.autocommit,
         )
+
+
+def _copy_connection_mapping(
+    source: Mapping[str, object], label: str
+) -> dict[str, object]:
+    if not isinstance(source, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    copied = dict(source)
+    for key in _CONNECTION_KEYS:
+        if key not in copied:
+            raise ValueError(f"{label} missing required field: {key}")
+    return copied
+
+
+def _copy_connection_env_mapping(
+    source: Mapping[str, object],
+) -> dict[str, object]:
+    copied = _copy_connection_mapping(source, "connection_env")
+    for key in _CONNECTION_KEYS:
+        value = copied[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"connection_env.{key} must be a non-empty environment variable name"
+            )
+        copied[key] = value.strip()
+    return copied
+
+
+def _settings_from_connection(
+    values: Mapping[str, object],
+    context: str,
+    *,
+    charset: str,
+    autocommit: bool,
+) -> MySQLConnectionSettings:
+    host = _direct_text(values, "host", context)
+    user = _direct_text(values, "user", context)
+    password = _direct_text(values, "password", context, preserve=True)
+    database = _direct_text(values, "database", context)
+    port = _parse_port(values.get("port"), context, source="connection")
+    return MySQLConnectionSettings(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset=charset,
+        autocommit=autocommit,
+    )
+
+
+def _direct_text(
+    values: Mapping[str, object],
+    key: str,
+    context: str,
+    *,
+    preserve: bool = False,
+) -> str:
+    if key not in values:
+        raise ProviderError(f"{context}: connection missing required field {key}")
+    value = values[key]
+    if not isinstance(value, str) or not value.strip():
+        raise ProviderError(f"{context}: connection {key} must be a non-empty string")
+    return value if preserve else value.strip()
+
+
+def _settings_from_environment(
+    env_names: Mapping[str, object],
+    context: str,
+    *,
+    charset: str,
+    autocommit: bool,
+) -> MySQLConnectionSettings:
+    def required_value(key: str, label: str, *, preserve: bool = False) -> str:
+        env_name = env_names.get(key)
+        if not isinstance(env_name, str) or not env_name.strip():
+            raise ProviderError(
+                f"{context}: missing environment variable name for {label}"
+            )
+        env_name = env_name.strip()
+        try:
+            value = required_env(env_name)
+        except RuntimeError as exc:
+            raise ProviderError(
+                f"{context}: missing {label} environment variable {env_name}"
+            ) from exc
+        return value if preserve else value.strip()
+
+    host = required_value("host", "host")
+    user = required_value("user", "user")
+    password = required_value("password", "password", preserve=True)
+    database = required_value("database", "database")
+    port_text = required_value("port", "port")
+    port = _parse_port(port_text, context)
+    return MySQLConnectionSettings(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset=charset,
+        autocommit=autocommit,
+    )
+
+
+def _parse_port(
+    value: object,
+    context: str,
+    *,
+    source: str | None = None,
+) -> int:
+    prefix = f"{source} " if source else ""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ProviderError(f"{context}: {prefix}port must be an integer")
+    try:
+        port = int(value) if isinstance(value, int) else int(value.strip())
+    except (TypeError, ValueError) as exc:
+        raise ProviderError(f"{context}: {prefix}port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ProviderError(
+            f"{context}: {prefix}port must be between 1 and 65535"
+        )
+    return port
 
 
 ConnectionFactory = Callable[[MySQLConnectionSettings], Any]

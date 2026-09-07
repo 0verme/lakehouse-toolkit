@@ -40,10 +40,41 @@ profile 数量没有固定上限。`configs/lineage_providers.example.yaml` 展�
 个 profile 的配置形状；本地使用时复制为被忽略的
 `configs/lineage_providers.local.yaml`，不要把真实值提交到仓库。
 
-每个 profile 只保存 `host_env`、`port_env`、`user_env`、`password_env` 和
-`database_env` 等环境变量名。MySQL 连接值在开始读取时解析，缺少任一必填值会
-带着 `environment` 和 `source_profile` 显式失败，不会回退到 `localhost`、demo
-数据库或空密码。
+每个 profile 选择一种连接来源，三种来源最终都归一为同一个
+`MySQLConnectionSettings`：
+
+1. `connection`：适合被忽略的 `lineage_providers.local.yaml`，直接填写
+   `host`、`port`、`user`、`password`、`database`；
+2. `connection_env`：填写上述五个字段对应的环境变量名，适合 CI / Docker；
+3. legacy 顶层 `host_env`、`port_env`、`user_env`、`password_env`、
+   `database_env`：保持已有配置不变。
+
+例如本地模式为：
+
+```yaml
+connection:
+  host: 127.0.0.1
+  port: 3306
+  user: DEMO_USER
+  password: DEMO_PASSWORD_VALUE
+  database: demo_meta
+```
+
+环境变量模式为：
+
+```yaml
+connection_env:
+  host: LAKEHOUSE_DEV_A_MYSQL_HOST
+  port: LAKEHOUSE_DEV_A_MYSQL_PORT
+  user: LAKEHOUSE_DEV_A_MYSQL_USER
+  password: LAKEHOUSE_DEV_A_MYSQL_PASSWORD
+  database: LAKEHOUSE_DEV_A_MYSQL_DATABASE
+```
+
+同一 profile 不应同时配置多种来源；这样可以避免迁移期间出现不明确的凭据
+优先级。连接值在 Provider 开始读取时解析，缺少任一必填值会带着
+`environment` 和 `source_profile` 显式失败，不会回退到 `localhost`、demo 数据库
+或空密码。直接值不会进入 profile 的 `repr`，但仍只能放在被忽略的本地配置中。
 
 `table`、`program_name_column`、`script_code_column` 和可选的
 `expected_target_column` 都会通过 `shared.config.env.safe_identifier` 校验后才
@@ -104,7 +135,8 @@ metadata 字段时可以注入 `expected_target_getter`。
 
 ## 安全与边界
 
-仓库只提交 example 配置，其中使用 `demo_meta` 和占位环境变量名。真实连接值应
-由 `*.local.yaml`、环境变量或外部 secret manager 提供。Phase 2 不实现 Parser、
-Physical DAG、Audit、TMP collapse、materialization、query/viewer、incremental
-rebuild 或 history/diff。
+仓库只提交 example 配置，其中使用 `demo_meta`、demo 占位值和占位环境变量名。
+真实密码、Token、私钥和连接串不得提交；内网人工执行可将 `connection` 写入被
+忽略的 `*.local.yaml`，CI / Docker 应使用 `connection_env` 或外部 secret manager。
+Phase 2 不实现 Parser、Physical DAG、Audit、TMP collapse、materialization、
+query/viewer、incremental rebuild 或 history/diff。
