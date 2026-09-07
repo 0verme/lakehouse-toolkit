@@ -9,7 +9,7 @@ import re
 from collections.abc import Callable, Generator, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from shared.config.env import metadata_table, required_env, safe_identifier
 from shared.lineage.domain import (
@@ -18,6 +18,7 @@ from shared.lineage.domain import (
     decode_code,
     normalize_expected_target,
     normalize_program_name,
+    parse_declared_primary_target,
 )
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -101,7 +102,8 @@ class MySQLProcessProfile:
     连接来源可以是本地 ``connection`` 值、``connection_env`` 环境变量名，
     或兼容现有配置的顶层 ``*_env`` 字段。三种来源都只在 Provider 开始
     读取时归一为 ``MySQLConnectionSettings``；嵌套连接配置不会进入 profile
-    的 repr，避免直接密码被意外打印。
+    的 repr，避免直接密码被意外打印。``primary_target_strategy`` 默认只
+    使用 explicit target；程序名策略必须同时配置已核验的 prefix。
     """
 
     name: str
@@ -125,6 +127,8 @@ class MySQLProcessProfile:
     connection_env: Mapping[str, object] | None = field(
         default=None, repr=False, hash=False
     )
+    primary_target_strategy: str = "explicit"
+    program_name_target_prefix: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -147,6 +151,12 @@ class MySQLProcessProfile:
             target_column = target_column.strip() or None
             object.__setattr__(self, "expected_target_column", target_column)
 
+        strategy, target_prefix = _normalize_primary_target_config(
+            self.primary_target_strategy, self.program_name_target_prefix
+        )
+        object.__setattr__(self, "primary_target_strategy", strategy)
+        object.__setattr__(self, "program_name_target_prefix", target_prefix)
+
         if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
             raise ValueError("batch_size must be a positive integer")
         if self.batch_size <= 0:
@@ -168,9 +178,8 @@ class MySQLProcessProfile:
             )
         )
         source_count = sum(
-            source is not None
-            for source in (self.connection, self.connection_env)
-        ) + int(legacy_fields_present)
+            source is not None for source in (self.connection, self.connection_env)
+        ) + (1 if legacy_fields_present else 0)
         if source_count != 1:
             raise ValueError(
                 "mysql process profile must configure exactly one of "
@@ -256,6 +265,13 @@ class MySQLProcessProfile:
         if expected_target_column is not None:
             expected_target_column = str(expected_target_column).strip() or None
 
+        primary_target_strategy = raw.get("primary_target_strategy", "explicit")
+        if primary_target_strategy is None:
+            primary_target_strategy = "explicit"
+        program_name_target_prefix = raw.get("program_name_target_prefix")
+        if program_name_target_prefix is not None:
+            program_name_target_prefix = str(program_name_target_prefix).strip() or None
+
         return cls(
             name=text("name"),
             environment=text("environment"),
@@ -277,6 +293,8 @@ class MySQLProcessProfile:
             autocommit=raw_autocommit,
             connection=source_mapping("connection"),
             connection_env=source_mapping("connection_env"),
+            primary_target_strategy=str(primary_target_strategy),
+            program_name_target_prefix=program_name_target_prefix,
         )
 
     def resolve_connection_settings(self) -> MySQLConnectionSettings:
@@ -560,7 +578,13 @@ class MySQLProcessProvider:
         if not program_name:
             raise ValueError("program_name must be a non-empty value")
         script_code = decode_code(script_value)
-        expected_target = normalize_expected_target(target_value)
+        explicit_target = normalize_expected_target(target_value)
+        expected_target = _resolve_primary_target(
+            program_name,
+            explicit_target=explicit_target,
+            strategy=self.profile.primary_target_strategy,
+            program_name_target_prefix=self.profile.program_name_target_prefix,
+        )
         return ProgramSource(
             environment=self.profile.environment,
             source_profile=self.profile.name,
@@ -577,7 +601,7 @@ def _row_value(row: object, index: int, key: str) -> object:
             raise ValueError(f"row is missing column {key}")
         return row[key]
     try:
-        return row[index]  # type: ignore[index]
+        return cast(Any, row)[index]
     except (IndexError, KeyError, TypeError) as exc:
         raise ValueError(f"row is missing column {key}") from exc
 
@@ -595,7 +619,8 @@ class ProductionProvider:
 
     默认只使用旧 ``ProcessInfo.process_name`` 和 ``script_code``。旧对象没有
     独立 expected target 字段时保持 ``None``；调用方可注入 getter 提供明确的
-    metadata 字段，但 adapter 不会从程序名或 SQL 内容猜测 target。
+    metadata 字段。程序名 target 只有在调用方显式启用 strategy 和 prefix 时
+    才会作为 declared primary hint 解析。
     """
 
     def __init__(
@@ -605,6 +630,8 @@ class ProductionProvider:
         environment: str = "PROD",
         source_profile: str = "production_metadata",
         expected_target_getter: ExpectedTargetGetter | None = None,
+        primary_target_strategy: str = "explicit",
+        program_name_target_prefix: str | None = None,
     ) -> None:
         if not isinstance(environment, str) or not environment.strip():
             raise ValueError("environment must be a non-empty string")
@@ -614,6 +641,12 @@ class ProductionProvider:
         self.source_profile = source_profile.strip()
         self.process_loader = process_loader or _default_legacy_process_loader
         self.expected_target_getter = expected_target_getter
+        (
+            self.primary_target_strategy,
+            self.program_name_target_prefix,
+        ) = _normalize_primary_target_config(
+            primary_target_strategy, program_name_target_prefix
+        )
 
     def iter_program_sources(self) -> Generator[ProgramSource, None, None]:
         context = _profile_context(self.environment, self.source_profile)
@@ -648,7 +681,13 @@ class ProductionProvider:
                     if not program_name:
                         raise ValueError("program_name must be a non-empty value")
                     script_code = decode_code(script_value)
-                    expected_target = normalize_expected_target(target_value)
+                    explicit_target = normalize_expected_target(target_value)
+                    expected_target = _resolve_primary_target(
+                        program_name,
+                        explicit_target=explicit_target,
+                        strategy=self.primary_target_strategy,
+                        program_name_target_prefix=self.program_name_target_prefix,
+                    )
                     yield ProgramSource(
                         environment=self.environment,
                         source_profile=self.source_profile,
@@ -671,6 +710,53 @@ class ProductionProvider:
             raise ProviderError(
                 f"{context}: failed while iterating production metadata"
             ) from exc
+
+
+_PRIMARY_TARGET_STRATEGIES = frozenset({"explicit", "program_name"})
+_PRIMARY_TARGET_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*_$")
+
+
+def _normalize_primary_target_config(
+    strategy: object, prefix: object
+) -> tuple[str, str | None]:
+    normalized_strategy = str(strategy or "").strip().lower()
+    if normalized_strategy not in _PRIMARY_TARGET_STRATEGIES:
+        raise ValueError(
+            "primary_target_strategy must be one of: explicit, program_name"
+        )
+
+    normalized_prefix: str | None = None
+    if prefix is not None:
+        if not isinstance(prefix, str):
+            raise ValueError("program_name_target_prefix must be a string or None")
+        normalized_prefix = prefix.strip().upper() or None
+        if normalized_prefix is not None and not _PRIMARY_TARGET_PREFIX_RE.fullmatch(
+            normalized_prefix
+        ):
+            raise ValueError(
+                "program_name_target_prefix must be an identifier prefix ending with _"
+            )
+
+    if normalized_strategy == "program_name" and normalized_prefix is None:
+        raise ValueError(
+            "program_name_target_prefix is required when "
+            "primary_target_strategy is program_name"
+        )
+    return normalized_strategy, normalized_prefix
+
+
+def _resolve_primary_target(
+    program_name: str,
+    *,
+    explicit_target: str | None,
+    strategy: str,
+    program_name_target_prefix: str | None,
+) -> str | None:
+    if explicit_target is not None:
+        return explicit_target
+    if strategy != "program_name":
+        return None
+    return parse_declared_primary_target(program_name, program_name_target_prefix)
 
 
 def _legacy_value(

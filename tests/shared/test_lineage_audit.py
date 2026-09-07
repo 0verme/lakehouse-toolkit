@@ -11,7 +11,12 @@ from shared.lineage.audit import (  # pyright: ignore[reportMissingImports]
     compute_lineage_issue_stable_key,
     issue_severity,
 )
-from shared.lineage.domain import IssueType, LineageIssue, ProgramSource
+from shared.lineage.domain import (
+    IssueType,
+    LineageIssue,
+    ProgramSource,
+    parse_declared_primary_target,
+)
 from shared.lineage.lineage_builder import normalize_table_name
 from shared.lineage.physical_dag import (
     ProgramPhysicalDAG,
@@ -25,6 +30,7 @@ from tests.fixtures.lineage.phase4_audit_programs import (  # pyright: ignore[re
     MULTIPLE_CYCLES_PROGRAM,
     NORMAL_PROGRAM,
     ORPHAN_BRANCH_PROGRAM,
+    PROGRAM_NAME_DECLARED_PRIMARY_MULTI_SINK_PROGRAM,
     SELF_REFERENCE_PROGRAM,
     TARGET_MISMATCH_PROGRAM,
     TARGET_NOT_FOUND_PROGRAM,
@@ -150,6 +156,40 @@ class LineageAuditTests(unittest.TestCase):
         self.assertEqual(multi_evidence["expected_target"], EXPECTED_TARGET)
         orphan = issue_of(result, IssueType.ORPHAN_BRANCH)
         self.assertEqual(orphan.branch_sink, normalize_table_name("DWA.DEMO_OTHER"))
+
+    def test_program_name_declared_primary_is_only_a_hint_and_keeps_other_sinks(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DEMO_DWM.RESULT_A:1:00",
+            script_code=PROGRAM_NAME_DECLARED_PRIMARY_MULTI_SINK_PROGRAM,
+            expected_target=parse_declared_primary_target("005:DEMO_DWM.RESULT_A:1:00"),
+        )
+        dag = build_program_physical_dag(source)
+        result = audit_program_physical_dag(dag)
+
+        primary = normalize_table_name("DWM.RESULT_A")
+        secondary = normalize_table_name("DWM.RESULT_B")
+        self.assertEqual(dag.expected_target, primary)
+        self.assertEqual(dag.sinks, (primary, secondary))
+        self.assertEqual(
+            {edge.target for edge in dag.edges},
+            {primary, secondary},
+        )
+
+        multi_sink = issue_of(result, IssueType.MULTI_SINK_CANDIDATE)
+        evidence = evidence_of(multi_sink)
+        self.assertEqual(evidence["expected_target"], primary)
+        self.assertEqual(evidence["formal_sinks"], [primary, secondary])
+        self.assertEqual(evidence["sinks"], [primary, secondary])
+        self.assertEqual(
+            issue_of(result, IssueType.ORPHAN_BRANCH).branch_sink,
+            secondary,
+        )
+        self.assertNotIn(
+            IssueType.TARGET_MISMATCH,
+            {issue.issue_type for issue in result.issues},
+        )
 
     def test_target_not_found_does_not_turn_every_branch_into_orphan(self):
         result = audit_program_physical_dag(build_dag(TARGET_NOT_FOUND_PROGRAM))

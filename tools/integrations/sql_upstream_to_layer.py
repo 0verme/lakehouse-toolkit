@@ -26,6 +26,7 @@ from pywebio.output import put_table  # pyright: ignore[reportMissingImports]
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
 from shared.db.gaussdb import select_sql_with_profile
+from shared.lineage.domain import parse_declared_primary_target
 from shared.ui.export_helper import put_table_exports
 from shared.ui.pywebio_helper import (
     put_black_text,
@@ -166,6 +167,10 @@ def process_task_name(process_name: str) -> str:
 
 
 def process_target_name(process_name: str) -> str:
+    declared_target = parse_declared_primary_target(process_name)
+    if declared_target is not None:
+        return normalize_table_name(declared_target)
+
     parts = str(process_name or "").split(":")
     if len(parts) > 1:
         return normalize_table_name(parts[1])

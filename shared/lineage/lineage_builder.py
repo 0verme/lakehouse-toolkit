@@ -9,7 +9,7 @@ from functools import lru_cache
 
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
-from shared.lineage.domain import decode_code
+from shared.lineage.domain import decode_code, parse_declared_primary_target
 
 DB_CONFIG = {
     "host": os.getenv("PYTOOLS_LINEAGE_MYSQL_HOST", "localhost"),
@@ -339,6 +339,10 @@ def process_task_name(process_name: str) -> str:
 
 @lru_cache(maxsize=32768)
 def process_target_name(process_name: str) -> str:
+    declared_target = parse_declared_primary_target(process_name)
+    if declared_target is not None:
+        return normalize_table_name(declared_target)
+
     parts = str(process_name or "").split(":")
     if len(parts) > 1:
         return normalize_table_name(parts[1])

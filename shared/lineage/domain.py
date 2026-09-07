@@ -67,6 +67,93 @@ DEFAULT_TEMPORARY_ASSET_RULES: tuple[TemporaryAssetRule, ...] = (
     _default_tmp_name_rule,
 )
 
+# ``DEMO_`` is the public fixture/legacy naming namespace.  Production
+# providers must opt in explicitly with ``primary_target_strategy`` and a
+# configured prefix; this default only keeps the standalone parser compatible
+# with the documented demo format.
+DEFAULT_PROGRAM_NAME_TARGET_PREFIX = "DEMO_"
+_DECLARED_TARGET_SCHEMAS = frozenset(
+    {"DM", "DWA", "DWD", "DWF", "DWM", "DWO", "DWP", "DWE"}
+)
+_PROGRAM_NAME_SEQUENCE_RE = re.compile(r"^\d{3}$")
+_PROGRAM_NAME_REVISION_RE = re.compile(r"^\d+$")
+_PROGRAM_NAME_CLOCK_RE = re.compile(r"^\d{2}$")
+_DECLARED_TARGET_RE = re.compile(
+    r"^(?P<schema>[A-Z][A-Z0-9_]*)\.(?P<table>[A-Z][A-Z0-9_$]*)$"
+)
+_PROGRAM_NAME_TARGET_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*_$")
+
+
+def extract_program_declared_target_token(program_name: object) -> str | None:
+    """从高置信 legacy ``program_name`` 格式提取第二段 target token。
+
+    公开格式为 ``NNN:<program-target>:<revision>:<clock>``。只接受四段、
+    数字 sequence/revision/clock 和非空 target 段，避免把任意带冒号的名称
+    当成 declared target。
+    """
+
+    parts = decode_code(program_name).strip().split(":")
+    if len(parts) != 4:
+        return None
+
+    sequence, target_token, revision, clock = (part.strip() for part in parts)
+    if not _PROGRAM_NAME_SEQUENCE_RE.fullmatch(sequence):
+        return None
+    if not _PROGRAM_NAME_REVISION_RE.fullmatch(revision):
+        return None
+    if not _PROGRAM_NAME_CLOCK_RE.fullmatch(clock):
+        return None
+    if not target_token or ":" in target_token:
+        return None
+    return target_token.upper()
+
+
+def _normalize_program_name_target_prefix(prefix: object) -> str | None:
+    normalized = decode_code(prefix).strip().upper()
+    if not normalized or not _PROGRAM_NAME_TARGET_PREFIX_RE.fullmatch(normalized):
+        return None
+    return normalized
+
+
+def normalize_declared_target_from_program_name(
+    target_token: object,
+    program_name_target_prefix: object = DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
+) -> str | None:
+    """按明确配置剥离程序命名空间并返回 plain ``SCHEMA.TABLE``。
+
+    这里只移除完整匹配的配置前缀，不根据下划线位置、最后一个 schema
+    或 ``XXX_DWM`` 等形状猜测。schema 也必须属于当前已知的 warehouse
+    schema 集合；失败时统一返回 ``None``。
+    """
+
+    prefix = _normalize_program_name_target_prefix(program_name_target_prefix)
+    token = decode_code(target_token).strip().upper()
+    if prefix is None or not token.startswith(prefix):
+        return None
+
+    candidate = token[len(prefix) :]
+    match = _DECLARED_TARGET_RE.fullmatch(candidate)
+    if match is None:
+        return None
+    schema = match.group("schema")
+    if schema not in _DECLARED_TARGET_SCHEMAS:
+        return None
+    return f"{schema}.{match.group('table')}"
+
+
+def parse_declared_primary_target(
+    program_name: object,
+    program_name_target_prefix: object = DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
+) -> str | None:
+    """提取并规范化 ``program_name`` 中的 declared primary target hint。"""
+
+    target_token = extract_program_declared_target_token(program_name)
+    if target_token is None:
+        return None
+    return normalize_declared_target_from_program_name(
+        target_token, program_name_target_prefix
+    )
+
 
 def is_temporary_asset(
     asset_name: str | None,
@@ -433,6 +520,7 @@ class LineageIssue:
 
 
 __all__ = [
+    "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
     "DEFAULT_TEMPORARY_ASSET_RULES",
     "compute_source_hash",
     "decode_code",
@@ -449,6 +537,9 @@ __all__ = [
     "is_formal_asset",
     "is_temporary_asset",
     "normalize_asset_name",
+    "normalize_declared_target_from_program_name",
     "normalize_expected_target",
     "normalize_program_name",
+    "parse_declared_primary_target",
+    "extract_program_declared_target_token",
 ]

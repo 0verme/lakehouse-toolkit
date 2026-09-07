@@ -11,8 +11,11 @@ from shared.lineage.domain import (
     PhysicalNode,
     PhysicalNodeKind,
     ProgramSource,
+    extract_program_declared_target_token,
     is_formal_asset,
     is_temporary_asset,
+    normalize_declared_target_from_program_name,
+    parse_declared_primary_target,
 )
 
 
@@ -44,6 +47,49 @@ class LineageDomainTests(unittest.TestCase):
 
         self.assertIsNone(source.expected_target)
         self.assertIsNone(source.source_hash)
+
+    def test_program_name_declared_primary_target_uses_configured_namespace_rule(self):
+        self.assertEqual(
+            parse_declared_primary_target("005:DEMO_DWM.RESULT_A:1:00"),
+            "DWM.RESULT_A",
+        )
+        self.assertEqual(
+            parse_declared_primary_target("005:DEMO_DWD.TABLE_B:1:00"),
+            "DWD.TABLE_B",
+        )
+        self.assertEqual(
+            extract_program_declared_target_token("005:DEMO_DWM.RESULT_A:1:00"),
+            "DEMO_DWM.RESULT_A",
+        )
+        self.assertEqual(
+            normalize_declared_target_from_program_name("DEMO_DWM.RESULT_A"),
+            "DWM.RESULT_A",
+        )
+
+    def test_program_name_declared_primary_target_is_conservative(self):
+        malformed_values = (
+            "",
+            "005::1:00",
+            "005:DEMO_DWM.RESULT_A:1",
+            "not-a-program-name",
+            "005:DEMO_DWM.RESULT_A:one:00",
+        )
+        for value in malformed_values:
+            with self.subTest(value=value):
+                self.assertIsNone(parse_declared_primary_target(value))
+
+        self.assertIsNone(parse_declared_primary_target("005:OTHER_DWM.RESULT_A:1:00"))
+        self.assertIsNone(
+            parse_declared_primary_target(
+                "005:TEST_DWM.RESULT_A:1:00", program_name_target_prefix="DEMO_"
+            )
+        )
+        self.assertEqual(
+            parse_declared_primary_target(
+                "005:TEST_DWM.RESULT_A:1:00", program_name_target_prefix="TEST_"
+            ),
+            "DWM.RESULT_A",
+        )
 
     def test_physical_edge_direction_is_upstream_to_downstream(self):
         edge = PhysicalEdge(source="ODS.DEMO_A", target="DWM.DEMO_B")

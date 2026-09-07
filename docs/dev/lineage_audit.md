@@ -58,6 +58,11 @@ Severity 由 `ISSUE_SEVERITY_POLICY` 集中定义，并通过 `issue_severity()`
 
 `expected_target` 的规则如下：
 
+`expected_target` 也可以由 profile 显式启用的
+`program_name -> declared primary target` 策略产生；此时它仍只是 primary
+result hint，不是唯一结果声明。所有实际 terminal sink 都保留并参与
+`MULTI_SINK_CANDIDATE` 审计。
+
 1. `expected_target is None`：没有权威 target，不生成
    `TARGET_NOT_FOUND`、`TARGET_MISMATCH` 或 `ORPHAN_BRANCH`；仍可生成 sink、cycle
    和 self-reference issue。
