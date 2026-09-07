@@ -45,15 +45,21 @@ SVN 继续保持 development/audit source（Role B）。本次没有新增 `SVNP
 configs/lineage_providers.local.yaml
 ```
 
-`*.local.yaml` 已在 `.gitignore` 中。local config 只能保存逻辑 profile、已经过 `safe_identifier` 校验的表/列配置和环境变量名；不要把连接值写入 YAML。
+`*.local.yaml` 已在 `.gitignore` 中。内网 Windows 人工执行可在 local config
+中直接填写 `connection`，减少多套 DEV 连接所需的环境变量；共享配置、CI / Docker
+则应使用 `connection_env` 或 legacy 顶层 `*_env`，由运行环境注入真实值。
 
 每个 profile 可配置：
 
 - `name`、`environment`；
-- `host_env`、`port_env`、`user_env`、`password_env`、`database_env`；
+- 三选一的 `connection`、`connection_env`，或 legacy 的
+  `host_env`、`port_env`、`user_env`、`password_env`、`database_env`；
 - `table`、`program_name_column`、`script_code_column`；
 - 可选 `expected_target_column`；
 - `batch_size`。
+
+`connection` 中的直接值只能保存在被忽略的本地配置，不得提交真实密码、Token、
+私钥或连接串；缺少必填连接字段时命令会显式失败，不会使用弱默认值。
 
 缺少显式 `--config`、文件不存在或 profile 配置不合法时，命令会显式失败，不会 fallback 到真实默认地址或公开 demo 数据库。
 

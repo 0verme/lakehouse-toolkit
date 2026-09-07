@@ -13,6 +13,7 @@ from unittest.mock import patch
 from shared.lineage.domain import ProgramSource, compute_source_hash
 from shared.lineage.lineage_builder import ProcessInfo
 from shared.lineage.providers import (  # pyright: ignore[reportMissingImports]
+    MySQLConnectionSettings,
     MySQLProcessProfile,
     MySQLProcessProvider,
     ProductionProvider,
@@ -95,6 +96,87 @@ def environment_for(profile: MySQLProcessProfile) -> dict[str, str]:
 
 
 class LineageProviderTests(unittest.TestCase):
+    def test_connection_sources_normalize_to_same_settings(self):
+        legacy_profile = make_profile("mysql_dev_a")
+        direct_profile = MySQLProcessProfile.from_mapping(
+            {
+                "name": "mysql_dev_a_direct",
+                "environment": "DEV",
+                "connection": {
+                    "host": "127.0.0.1",
+                    "port": 3306,
+                    "user": "DEMO_USER",
+                    "password": "DEMO_PASSWORD_VALUE",
+                    "database": "demo_meta",
+                },
+                "table": "demo_meta.processes",
+                "program_name_column": "process_name",
+                "script_code_column": "script_code",
+                "expected_target_column": "expected_target",
+                "batch_size": 200,
+            }
+        )
+        connection_env_profile = MySQLProcessProfile.from_mapping(
+            {
+                "name": "mysql_dev_a_env",
+                "environment": "DEV",
+                "connection_env": {
+                    "host": legacy_profile.host_env,
+                    "port": legacy_profile.port_env,
+                    "user": legacy_profile.user_env,
+                    "password": legacy_profile.password_env,
+                    "database": legacy_profile.database_env,
+                },
+                "table": "demo_meta.processes",
+                "program_name_column": "process_name",
+                "script_code_column": "script_code",
+                "expected_target_column": "expected_target",
+                "batch_size": 200,
+            }
+        )
+
+        with patch.dict(
+            os.environ, environment_for(legacy_profile), clear=False
+        ):
+            legacy_settings = legacy_profile.resolve_connection_settings()
+            env_settings = connection_env_profile.resolve_connection_settings()
+
+        self.assertIsInstance(direct_profile.resolve_connection_settings(), MySQLConnectionSettings)
+        self.assertEqual(direct_profile.resolve_connection_settings(), legacy_settings)
+        self.assertEqual(env_settings, legacy_settings)
+        self.assertNotIn("DEMO_PASSWORD_VALUE", repr(direct_profile))
+
+    def test_connection_sources_require_one_complete_source(self):
+        connection = {
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "DEMO_USER",
+            "password": "DEMO_PASSWORD_VALUE",
+            "database": "demo_meta",
+        }
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            MySQLProcessProfile(
+                name="mysql_ambiguous",
+                environment="DEV",
+                connection=connection,
+                connection_env={
+                    "host": "HOST",
+                    "port": "PORT",
+                    "user": "USER",
+                    "password": "PASSWORD",
+                    "database": "DATABASE",
+                },
+            )
+
+        incomplete_connection = dict(connection)
+        del incomplete_connection["database"]
+        with self.assertRaisesRegex(ValueError, "connection missing required field: database"):
+            MySQLProcessProfile(
+                name="mysql_incomplete",
+                environment="DEV",
+                connection=incomplete_connection,
+            )
+
     def test_mysql_provider_contract_and_repeated_fetchmany(self):
         profile = make_profile(batch_size=2)
         rows = [
@@ -434,6 +516,46 @@ mysql_process_profiles:
         self.assertEqual(profiles[0].name, "mysql_dev_demo")
         self.assertEqual(profiles[0].batch_size, 7)
         self.assertEqual(profiles[0].expected_target_column, "expected_target")
+
+    def test_load_mysql_process_profiles_supports_all_connection_shapes(self):
+        config = """
+mysql_process_profiles:
+  - name: mysql_direct
+    environment: DEV
+    connection:
+      host: 127.0.0.1
+      port: 3306
+      user: DEMO_USER
+      password: DEMO_PASSWORD_VALUE
+      database: demo_meta
+  - name: mysql_nested_env
+    environment: DEV
+    connection_env:
+      host: DEMO_HOST
+      port: DEMO_PORT
+      user: DEMO_USER
+      password: DEMO_PASSWORD
+      database: DEMO_DATABASE
+  - name: mysql_legacy
+    environment: DEV
+    host_env: LEGACY_HOST
+    port_env: LEGACY_PORT
+    user_env: LEGACY_USER
+    password_env: LEGACY_PASSWORD
+    database_env: LEGACY_DATABASE
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "providers.yaml"
+            path.write_text(config, encoding="utf-8")
+            profiles = load_mysql_process_profiles(path)
+
+        self.assertEqual(
+            [profile.name for profile in profiles],
+            ["mysql_direct", "mysql_nested_env", "mysql_legacy"],
+        )
+        self.assertIsNotNone(profiles[0].connection)
+        self.assertIsNotNone(profiles[1].connection_env)
+        self.assertEqual(profiles[2].host_env, "LEGACY_HOST")
 
 
 if __name__ == "__main__":
