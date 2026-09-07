@@ -63,6 +63,17 @@ streamlit run apps/svn_check/app.py --server.address 127.0.0.1 --server.port 850
 
 `svn_check` 可在“本地目录审计”模式下直接分析 `tests/fixtures/demo_workspace`，无需 SVN 或数据库。
 
+Production SVN working copy 的严格 Python inventory / primary target 验证使用独立命令：
+
+```bash
+python -m tools.lineage.verify_svn_sources \
+  --config configs/lineage_providers.local.yaml \
+  --sample-only \
+  --sample-limit 20
+```
+
+完整路径规则和 Windows 内网执行顺序见 [`docs/dev/lineage_svn_verification.md`](docs/dev/lineage_svn_verification.md)。
+
 ## 配置方式
 
 公开模板：
@@ -72,6 +83,8 @@ streamlit run apps/svn_check/app.py --server.address 127.0.0.1 --server.port 850
 | `configs/database.example.yaml` | 可选 JDBC profile 模板 |
 | `configs/audit_datasource.example.yaml` | 本地 PostgreSQL metadata profile |
 | `configs/lineage_providers.example.yaml` | DEV 多 MySQL profile 与 PROD adapter 身份模板 |
+| `configs/svn_inventory.example.yaml` | SVN working copy profile 的虚构路径模板 |
+| `docs/dev/lineage_svn_verification.md` | Production SVN Python 清单、主结果表推导与内网验证步骤 |
 | `configs/migrate/clusters.example.json` | 两个 demo 集群的迁移模板 |
 | `configs/svn.example.yaml` | SVN 项目地址和环境变量引用模板 |
 | `configs/tools.yaml` | 通用工具注册表 |

@@ -1,0 +1,12 @@
+# 公开示例只使用虚构本地路径。真实 root_path 只写入被忽略的
+# configs/lineage_providers.local.yaml，不提交生产路径。
+svn_profiles:
+  - name: prod_svn_processing
+    environment: PROD
+    root_path: "E:/demo/svn/production"
+    layout: processing
+
+  - name: prod_svn_dwf
+    environment: PROD
+    root_path: "/home/demo/svn/production"
+    layout: dwf
