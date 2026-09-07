@@ -8,5 +8,5 @@ svn_profiles:
 
   - name: prod_svn_dwf
     environment: PROD
-    root_path: "/home/demo/svn/production"
+    root_path: "E:/demo/svn/production"
     layout: dwf
