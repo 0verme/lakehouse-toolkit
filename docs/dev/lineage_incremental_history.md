@@ -21,6 +21,12 @@ environment / source_profile / program_name
 规则，不重新计算另一种 hash。`None` 或空 hash 永远不能产生 `UNCHANGED`，会
 保守地进入 rebuild。
 
+Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
+`shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
+`lineage-pipeline-v1`。它不是 Git commit SHA。凡是会改变 parser/DAG/audit/
+materialization 结果的规则升级，都必须在同一变更中把这个 constant bump 到新的
+语义版本，并在本文记录原因。
+
 ## Incremental planner
 
 `shared.lineage.evolution.plan_incremental()`（也从
@@ -30,8 +36,8 @@ environment / source_profile / program_name
 | 状态 | 条件 | 执行 |
 | --- | --- | --- |
 | `NEW` | 没有 active identity | parser、DAG、audit、materialize |
-| `UNCHANGED` | 当前非空 hash 等于 active state hash | 跳过 parser/DAG/audit，复用旧 facts |
-| `CHANGED` | identity 存在但 hash 不同或当前 hash 缺失 | 重建该程序 |
+| `UNCHANGED` | 当前非空 hash 等于 active state hash，且 pipeline version 相等 | 跳过 parser/DAG/audit，复用旧 facts |
+| `CHANGED` | identity 存在但 hash 或 pipeline version 不同，或当前 hash 缺失 | 重建该程序 |
 | `DELETED` | 仅完整 snapshot scope 内缺失 | 从新 active candidate 移除，历史保留 |
 
 planner 会拒绝当前 snapshot 的 duplicate identity，也不会把程序重命名猜成
@@ -63,6 +69,7 @@ environment
 source_profile
 program_name
 source_hash
+pipeline_version
 first_seen_at
 last_seen_at
 last_changed_at
@@ -74,6 +81,25 @@ is_active
 identity 唯一。`SQLiteMaterializationStore.read_program_states()` 返回当前或
 指定 batch 的 state。`MaterializationBatch.program_states` 是兼容性扩展，旧的
 不带 state 的手工 batch 仍可 publish，但下一次会按缺少 state 的程序保守重建。
+
+### Pipeline version cache invalidation
+
+planner 只有在以下两个条件同时满足时才返回 `UNCHANGED`：
+
+```text
+current.source_hash == previous.source_hash != NULL
+AND previous.pipeline_version == LINEAGE_PIPELINE_VERSION
+```
+
+因此：源码 hash 相同且版本相同会复用；hash 变化会返回 `CHANGED`；hash 相同
+但版本变化也会返回 `CHANGED`。从旧 SQLite schema 迁移的 `ProgramState` 的
+`pipeline_version` 保持为 `NULL`，第一次运行会保守 rebuild，成功 publish 后
+写入当前版本。迁移只新增 nullable column 和 schema `user_version`，不会更新或
+删除历史 batch、`lineage_edge`、`lineage_issue`。
+
+需要 bump pipeline version 的场景包括：parser 提取规则、primary target 解析、
+Physical DAG 节点/边语义、audit 判定、TMP collapse 或 materialization evidence
+语义发生改变；仅改变日志文案或运行参数不需要 bump。
 
 ## Issue lifecycle
 
@@ -154,6 +180,75 @@ adapter 提供可选的 `dev_source_profile` / `prod_source_profile` 显式过�
 `jobs/crontab/imp_lineage_edge.py` 的全量编排接到增量 candidate executor；
 调度漫游、字段映射、DWF 截止和 audit summary 等语义不同的入口保留兼容，
 没有证据就不删除。
+
+## 正常增量运行
+
+日常运行直接执行 cron 入口，不传 controlled replay 参数：
+
+```bash
+python jobs/crontab/imp_lineage_edge.py
+```
+
+它扫描所有配置的 provider，在 active `ProgramState` 上同时比较
+`source_hash` 和 `LINEAGE_PIPELINE_VERSION`，只把 `NEW`/`CHANGED` 程序送入
+parser/DAG/audit，并把 `UNCHANGED` facts 合并进新的完整 snapshot。所有 provider
+成功后才允许 complete snapshot 的 `DELETED` 判定；任一读取或 rebuild 失败都会
+保留旧 active batch。
+
+## Controlled replay 与内网验证阶梯
+
+正常定时运行不传 `--profile`、`--limit` 时，仍扫描全部 provider，并沿用
+`complete_snapshot` 的生产行为。需要验证新 parser 时，使用 controlled replay：
+
+```bash
+python jobs/crontab/imp_lineage_edge.py \
+  --profile mysql_dev_a_data \
+  --limit 100 \
+  --force-rebuild \
+  --progress-every 10 \
+  --slow-threshold-ms 5000
+```
+
+`--profile` 只保留指定 `source_profile`；`--limit` 不截断 provider 读取，而是在
+收集完选定 profile 后按 `ProgramIdentity`（environment/source_profile/
+program_name）排序取前 N 个，只有这 N 个进入 parser/DAG/audit。日志会给出
+`replay_mode`、`selected_profiles`、`source_total`、`replay_total`、
+`force_rebuild` 和 `partial_snapshot`，不输出源码、SQL、表名或连接凭据。
+
+任何 controlled replay（包括只指定 profile）都按 partial snapshot 发布；尤其是
+使用 `--limit` 时，sample 外的程序不能被判定为 `DELETED`。因此 replay 不会因
+未读取的程序触发 complete snapshot DELETE，但它也不用于宣称某个 profile 已经
+完整同步。推荐内网验证阶梯：
+
+```text
+100 programs
+→ 500 programs
+→ one profile
+→ all profiles
+```
+
+不建议直接对约 2 万程序使用 `--force-rebuild`：当前 parser/DAG/audit 是逐程序
+同步路径，已观测到 38 个 rebuild 约耗时 17 分钟；全量会放大故障半径和等待时间，
+也会让性能瓶颈难以归因。先用小样本确认结果和耗时，再逐级扩大。
+
+## Slow program 日志定位
+
+默认只输出聚合 build 日志；单程序总耗时超过 5 秒（可用
+`--slow-threshold-ms` 调整）时才输出一行：
+
+```text
+stage=build_program status=SLOW program_id=<stable-short-hash> \
+  build_program_physical_dag_ms=... \
+  audit_program_physical_dag_ms=... \
+  single_program_total_ms=...
+```
+
+`build_program_physical_dag_ms` 高说明优先检查 parser/Physical DAG 提取路径，
+`audit_program_physical_dag_ms` 高说明优先检查 audit 图遍历和 issue 判定；两者
+都高则以 `single_program_total_ms` 为该程序的主要耗时。`build status=SUCCESS` 的
+`slow_programs`、`max_program_elapsed_ms`、`avg_program_elapsed_ms` 用于判断是
+少数长尾还是整体变慢。`program_id` 是不含程序名的稳定短 hash，可在同一受控
+sample 的重复运行中比对长尾，不应为定位方便而把源码、SQL 或表名写进生产日志。
 
 ### `lineage_closure` decision
 

@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence, Sized
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,7 +81,33 @@ COVERAGE_REPORT_PATH = Path(
     )
 ).expanduser()
 DEFAULT_PROGRESS_EVERY = 500
+DEFAULT_SLOW_THRESHOLD_MS = 5_000
 _SAFE_BATCH_ID = re.compile(r"batch-[A-Za-z0-9][A-Za-z0-9._-]{0,121}")
+_SAFE_PROFILE_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+@dataclass(slots=True)
+class _ProgramTimingStats:
+    slow_threshold_ms: int
+    processed: int = 0
+    slow_programs: int = 0
+    total_program_elapsed_ms: int = 0
+    max_program_elapsed_ms: int = 0
+
+    @property
+    def avg_program_elapsed_ms(self) -> int:
+        if self.processed == 0:
+            return 0
+        return self.total_program_elapsed_ms // self.processed
+
+    def observe(self, elapsed_ms: int) -> bool:
+        self.processed += 1
+        self.total_program_elapsed_ms += elapsed_ms
+        self.max_program_elapsed_ms = max(self.max_program_elapsed_ms, elapsed_ms)
+        is_slow = elapsed_ms > self.slow_threshold_ms
+        if is_slow:
+            self.slow_programs += 1
+        return is_slow
 
 
 def _emit_log(stage: str, status: str, **fields: object) -> None:
@@ -116,6 +143,133 @@ def _validate_progress_every(value: int) -> int:
     return value
 
 
+def _validate_limit(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("limit must be a non-negative integer")
+    return value
+
+
+def _validate_slow_threshold_ms(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("slow_threshold_ms must be a non-negative integer")
+    return value
+
+
+def _normalize_selected_profiles(
+    profiles: Iterable[str] | str | None,
+) -> tuple[str, ...]:
+    if profiles is None:
+        return ()
+    values = (profiles,) if isinstance(profiles, str) else profiles
+    try:
+        values = tuple(values)
+    except TypeError as exc:
+        raise ValueError("selected_profiles must be an iterable of strings") from exc
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValueError("selected_profiles must contain non-empty strings")
+    return tuple(sorted({value.strip() for value in values}))
+
+
+def _safe_profile_name(value: str) -> str:
+    candidate = value.strip()
+    return candidate if _SAFE_PROFILE_VALUE.fullmatch(candidate) else "<redacted>"
+
+
+def _format_selected_profiles(profiles: tuple[str, ...]) -> str:
+    if not profiles:
+        return "-"
+    return ",".join(_safe_profile_name(profile) for profile in profiles)
+
+
+def _replay_mode(profiles: tuple[str, ...], limit: int | None) -> str:
+    if profiles and limit is not None:
+        return "controlled_profile_limit"
+    if profiles:
+        return "controlled_profile"
+    if limit is not None:
+        return "controlled_limit"
+    return "normal"
+
+
+def _provider_source_profile(provider: object) -> str | None:
+    direct_profile = getattr(provider, "source_profile", None)
+    profile = getattr(provider, "profile", None)
+    candidates = (direct_profile, getattr(profile, "name", None))
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _iter_selected_program_sources(
+    providers: Iterable[ProgramSourceProvider],
+    selected_profiles: tuple[str, ...],
+) -> Iterable[ProgramSource]:
+    selected = set(selected_profiles)
+    for provider in providers:
+        provider_profile = _provider_source_profile(provider)
+        if selected and provider_profile is not None and provider_profile not in selected:
+            continue
+        for source in provider.iter_program_sources():
+            if (
+                selected
+                and isinstance(source, ProgramSource)
+                and source.identity.source_profile not in selected
+            ):
+                continue
+            yield source
+
+
+def _select_replay_sources(
+    program_sources: Iterable[ProgramSource],
+    limit: int | None,
+) -> tuple[ProgramSource, ...]:
+    sources = tuple(program_sources)
+    if limit is None:
+        return sources
+    if any(not isinstance(source, ProgramSource) for source in sources):
+        return sources
+    return tuple(sorted(sources, key=lambda source: source.identity.key)[:limit])
+
+
+def _anonymous_program_id(program_source: ProgramSource) -> str:
+    identity = "\x1f".join(program_source.identity.key)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+
+
+def _build_program_audit(
+    program_source: ProgramSource,
+    *,
+    observed_at: datetime,
+    batch_id: str,
+    timing: _ProgramTimingStats,
+) -> LineageAuditResult:
+    program_started_at = time.perf_counter()
+    dag_started_at = time.perf_counter()
+    dag = build_program_physical_dag(program_source)
+    dag_elapsed_ms = _elapsed_ms(dag_started_at)
+    audit_started_at = time.perf_counter()
+    audit = audit_program_physical_dag(
+        dag,
+        observed_at=observed_at,
+        batch_id=batch_id,
+    )
+    audit_elapsed_ms = _elapsed_ms(audit_started_at)
+    total_elapsed_ms = _elapsed_ms(program_started_at)
+    if timing.observe(total_elapsed_ms):
+        _emit_log(
+            "build_program",
+            "SLOW",
+            program_id=_anonymous_program_id(program_source),
+            build_program_physical_dag_ms=dag_elapsed_ms,
+            audit_program_physical_dag_ms=audit_elapsed_ms,
+            single_program_total_ms=total_elapsed_ms,
+        )
+    return audit
+
+
 def build_audits(
     program_sources: Iterable[ProgramSource],
     *,
@@ -125,21 +279,26 @@ def build_audits(
     count_program_totals: bool = True,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     progress_started_at: float | None = None,
+    slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
+    timing: _ProgramTimingStats | None = None,
 ) -> Iterable[LineageAuditResult]:
     """逐个复用 Builder/Auditor，并顺手累加可选 coverage。"""
 
     progress_every = _validate_progress_every(progress_every)
+    slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
+    timing = timing or _ProgramTimingStats(slow_threshold_ms)
     total = len(program_sources) if isinstance(program_sources, Sized) else None
     processed = 0
     for program_source in program_sources:
-        dag = build_program_physical_dag(program_source)
-        if coverage is not None:
-            coverage.observe_dag(dag, count_program=count_program_totals)
-        audit = audit_program_physical_dag(
-            dag,
+        audit = _build_program_audit(
+            program_source,
             observed_at=observed_at,
             batch_id=batch_id,
+            timing=timing,
         )
+        dag = audit.dag
+        if coverage is not None:
+            coverage.observe_dag(dag, count_program=count_program_totals)
         # consumer 在请求下一个 audit 前会先 materialize 当前结果。
         yield audit
         processed += 1
@@ -170,6 +329,8 @@ def build_candidate_batch(
     observe_materialized_edges: bool = True,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     progress_started_at: float | None = None,
+    slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
+    timing: _ProgramTimingStats | None = None,
 ) -> MaterializationBatch:
     """完成计算但不写库，返回可校验的 candidate batch。"""
 
@@ -182,6 +343,8 @@ def build_candidate_batch(
             count_program_totals=count_program_totals,
             progress_every=progress_every,
             progress_started_at=progress_started_at,
+            slow_threshold_ms=slow_threshold_ms,
+            timing=timing,
         ),
         batch_id=batch_id,
         observed_at=observed_at,
@@ -269,10 +432,12 @@ def build_incremental_candidate_batch(
     coverage: LineageCoverageAccumulator | None = None,
     force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
+    slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
 ) -> MaterializationBatch:
     """只重建 NEW/CHANGED，并把 candidate 合并成完整 snapshot。"""
 
     progress_every = _validate_progress_every(progress_every)
+    slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
     sources = tuple(program_sources)
     if coverage is not None:
         coverage.observe_sources(sources)
@@ -294,6 +459,7 @@ def build_incremental_candidate_batch(
                 deleted=base_plan.deleted,
                 complete_snapshot=base_plan.complete_snapshot,
                 snapshot_scopes=base_plan.snapshot_scopes,
+                pipeline_version=base_plan.pipeline_version,
             )
         else:
             plan = base_plan
@@ -320,7 +486,13 @@ def build_incremental_candidate_batch(
     )
 
     build_started_at = time.perf_counter()
-    _emit_log("build", "STARTED", total=len(rebuild_sources))
+    timing = _ProgramTimingStats(slow_threshold_ms)
+    _emit_log(
+        "build",
+        "STARTED",
+        total=len(rebuild_sources),
+        slow_threshold_ms=slow_threshold_ms,
+    )
     try:
         previous_edges = store.read_edges(active_only=True)
         previous_issues = store.read_issues(active_only=True)
@@ -334,6 +506,8 @@ def build_incremental_candidate_batch(
             observe_materialized_edges=False,
             progress_every=progress_every,
             progress_started_at=build_started_at,
+            slow_threshold_ms=slow_threshold_ms,
+            timing=timing,
         )
 
         retained_edges = [
@@ -420,6 +594,9 @@ def build_incremental_candidate_batch(
         "build",
         "SUCCESS",
         processed=len(rebuild_sources),
+        slow_programs=timing.slow_programs,
+        max_program_elapsed_ms=timing.max_program_elapsed_ms,
+        avg_program_elapsed_ms=timing.avg_program_elapsed_ms,
         edges=len(candidate.edges),
         issues=len(candidate.issues),
         elapsed_ms=_elapsed_ms(build_started_at),
@@ -445,6 +622,9 @@ def materialize_sources(
     coverage: LineageCoverageAccumulator | None = None,
     force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
+    selected_profiles: Iterable[str] | str | None = None,
+    limit: int | None = None,
+    slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
 ) -> PublishResult:
     """增量计算完整 candidate，再交给 SQLite adapter 做 atomic publish。
 
@@ -453,6 +633,11 @@ def materialize_sources(
     """
 
     progress_every = _validate_progress_every(progress_every)
+    selected_profiles = _normalize_selected_profiles(selected_profiles)
+    limit = _validate_limit(limit)
+    slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
+    controlled_replay = bool(selected_profiles or limit is not None)
+    effective_complete_snapshot = complete_snapshot and not controlled_replay
     resolved_batch_id = batch_id if batch_id is not None else new_batch_id()
     resolved_observed_at = (
         observed_at if observed_at is not None else datetime.now(timezone.utc)
@@ -462,7 +647,16 @@ def materialize_sources(
     source_started_at = time.perf_counter()
     _emit_log("source_load", "STARTED")
     try:
-        sources = tuple(program_sources)
+        loaded_sources = tuple(program_sources)
+        if selected_profiles:
+            selected = set(selected_profiles)
+            loaded_sources = tuple(
+                source
+                for source in loaded_sources
+                if not isinstance(source, ProgramSource)
+                or source.identity.source_profile in selected
+            )
+        sources = _select_replay_sources(loaded_sources, limit)
     except Exception as error:
         _emit_log(
             "source_load",
@@ -474,8 +668,19 @@ def materialize_sources(
     _emit_log(
         "source_load",
         "SUCCESS",
-        sources=len(sources),
+        sources=len(loaded_sources),
         elapsed_ms=_elapsed_ms(source_started_at),
+    )
+    _emit_log(
+        "replay",
+        "SELECTED",
+        replay_mode=_replay_mode(selected_profiles, limit),
+        selected_profiles=_format_selected_profiles(selected_profiles),
+        source_total=len(loaded_sources),
+        replay_total=len(sources),
+        limit="-" if limit is None else limit,
+        force_rebuild=bool(force_rebuild),
+        partial_snapshot=not effective_complete_snapshot,
     )
 
     candidate = build_incremental_candidate_batch(
@@ -484,11 +689,12 @@ def materialize_sources(
         batch_id=resolved_batch_id,
         observed_at=resolved_observed_at,
         job_keys=job_keys,
-        complete_snapshot=complete_snapshot,
+        complete_snapshot=effective_complete_snapshot,
         snapshot_scopes=snapshot_scopes,
         coverage=coverage,
         force_rebuild=force_rebuild,
         progress_every=progress_every,
+        slow_threshold_ms=slow_threshold_ms,
     )
 
     publish_started_at = time.perf_counter()
@@ -584,6 +790,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROGRESS_EVERY,
         help="emit build progress every N rebuilt programs",
     )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        metavar="SOURCE_PROFILE",
+        help="replay only this source_profile; repeat for multiple profiles",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="replay at most N programs after deterministic identity sorting",
+    )
+    parser.add_argument(
+        "--slow-threshold-ms",
+        type=int,
+        default=DEFAULT_SLOW_THRESHOLD_MS,
+        metavar="MS",
+        help="log per-program SLOW timing only when total elapsed time exceeds MS",
+    )
     return parser
 
 
@@ -594,6 +820,9 @@ def cli(argv: Sequence[str] | None = None) -> int:
         coverage_report_path=args.coverage_report,
         force_rebuild=args.force_rebuild,
         progress_every=args.progress_every,
+        selected_profiles=args.profile,
+        limit=args.limit,
+        slow_threshold_ms=args.slow_threshold_ms,
     )
 
 
@@ -612,33 +841,57 @@ def main(
     coverage_report_path: str | Path | None = COVERAGE_REPORT_PATH,
     force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
+    selected_profiles: Iterable[str] | str | None = None,
+    limit: int | None = None,
+    slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
 ) -> int:
     """定时任务边界；异常向外传播并由进程返回 non-zero。"""
 
     progress_every = _validate_progress_every(progress_every)
+    selected_profiles = _normalize_selected_profiles(selected_profiles)
+    limit = _validate_limit(limit)
+    slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
+    controlled_replay = bool(selected_profiles or limit is not None)
+    effective_complete_snapshot = complete_snapshot and not controlled_replay
     job_started_at = time.perf_counter()
     coverage = LineageCoverageAccumulator()
     try:
         active_providers = (
             tuple(providers) if providers is not None else load_default_providers()
         )
-        _emit_log("job", "STARTED", providers=len(active_providers))
+        _emit_log(
+            "job",
+            "STARTED",
+            providers=len(active_providers),
+            replay_mode=_replay_mode(selected_profiles, limit),
+            selected_profiles=_format_selected_profiles(selected_profiles),
+            force_rebuild=bool(force_rebuild),
+            partial_snapshot=not effective_complete_snapshot,
+        )
         resolved_scopes = (
             tuple(snapshot_scopes)
             if snapshot_scopes is not None
             else _provider_snapshot_scopes(active_providers)
         )
+        source_iterator = (
+            _iter_selected_program_sources(active_providers, selected_profiles)
+            if selected_profiles
+            else iter_program_sources(active_providers)
+        )
         result = materialize_sources(
-            iter_program_sources(active_providers),
+            source_iterator,
             db_path=db_path,
             batch_id=batch_id,
             observed_at=observed_at,
             job_keys=job_keys,
-            complete_snapshot=complete_snapshot,
+            complete_snapshot=effective_complete_snapshot,
             snapshot_scopes=resolved_scopes or None,
             coverage=coverage,
             force_rebuild=force_rebuild,
             progress_every=progress_every,
+            selected_profiles=selected_profiles,
+            limit=limit,
+            slow_threshold_ms=slow_threshold_ms,
         )
     except Exception as error:
         _emit_log(

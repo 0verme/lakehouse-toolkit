@@ -6,6 +6,7 @@ keeps the public concept discoverable without creating a second planner.
 
 from .domain import ProgramIdentity, ProgramSource, ProgramState
 from .evolution import (  # pyright: ignore[reportMissingImports]
+    LINEAGE_PIPELINE_VERSION,
     IncrementalPlan,
     IncrementalStatus,
     SnapshotScope,
@@ -17,6 +18,7 @@ from .evolution import (  # pyright: ignore[reportMissingImports]
 __all__ = [
     "IncrementalPlan",
     "IncrementalStatus",
+    "LINEAGE_PIPELINE_VERSION",
     "ProgramIdentity",
     "ProgramSource",
     "ProgramState",

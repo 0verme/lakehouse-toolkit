@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from shared.lineage.materialization import (  # pyright: ignore[reportMissingImp
     materialize_program,
 )
 from shared.lineage.materialization_sqlite import (  # pyright: ignore[reportMissingImports]
+    CURRENT_SCHEMA_VERSION,
     SQLiteMaterializationStore,
 )
 from shared.lineage.physical_dag import (
@@ -342,6 +344,70 @@ class LineageMaterializationTests(unittest.TestCase):
 
 
 class SQLiteMaterializationTests(unittest.TestCase):
+    def test_old_program_state_schema_is_migrated_without_losing_legacy_state(self):
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "legacy-lineage.db"
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE lineage_batch (
+                        batch_id TEXT PRIMARY KEY,
+                        observed_at TEXT NOT NULL,
+                        published_at TEXT,
+                        edge_count INTEGER NOT NULL,
+                        issue_count INTEGER NOT NULL,
+                        is_active INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE lineage_program_state (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        environment TEXT NOT NULL,
+                        source_profile TEXT NOT NULL,
+                        program_name TEXT NOT NULL,
+                        source_hash TEXT,
+                        first_seen_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL,
+                        last_changed_at TEXT,
+                        batch_id TEXT NOT NULL,
+                        is_active INTEGER NOT NULL
+                    );
+                    INSERT INTO lineage_batch(
+                        batch_id, observed_at, published_at, edge_count,
+                        issue_count, is_active
+                    ) VALUES (
+                        'batch-legacy', '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00', 0, 0, 1
+                    );
+                    INSERT INTO lineage_program_state(
+                        environment, source_profile, program_name, source_hash,
+                        first_seen_at, last_seen_at, last_changed_at, batch_id,
+                        is_active
+                    ) VALUES (
+                        'DEV', 'fixture', 'PROGRAM_LEGACY', 'legacy-hash',
+                        '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00', NULL,
+                        'batch-legacy', 1
+                    );
+                    """
+                )
+
+            store = SQLiteMaterializationStore(db_path)
+            states = store.read_program_states(active_only=True)
+            with closing(sqlite3.connect(db_path)) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(lineage_program_state)"
+                    )
+                }
+                schema_version = connection.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+
+        self.assertEqual(len(states), 1)
+        self.assertIsNone(states[0].pipeline_version)
+        self.assertIn("pipeline_version", columns)
+        self.assertEqual(schema_version, CURRENT_SCHEMA_VERSION)
+
     def test_schema_publish_and_structured_evidence_roundtrip(self):
         dag = build_dag(ORPHAN_BRANCH_PROGRAM, program_name="DEMO_PROGRAM_SQLITE")
         audit = audit_dag(dag, batch_id="batch-015")
@@ -437,6 +503,13 @@ class SQLiteMaterializationTests(unittest.TestCase):
                         "is_active",
                     }.issubset(issue_columns)
                 )
+                program_state_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(lineage_program_state)"
+                    )
+                }
+                self.assertIn("pipeline_version", program_state_columns)
             connection.close()
 
     def test_failed_publish_preserves_previous_complete_active_batch(self):

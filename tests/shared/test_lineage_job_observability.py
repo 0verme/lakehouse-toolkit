@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
@@ -125,6 +126,163 @@ class LineageJobObservabilityTests(unittest.TestCase):
         )
         self.assertIn("stage=build status=SUCCESS processed=5", output)
         self.assertNotIn("PROGRAM_DEMO_PROGRESS_", output)
+
+    def test_controlled_replay_filters_profile_and_limit_deterministically(self):
+        sources = [
+            source("PROGRAM_PROFILE_A_03", source_profile="profile_a"),
+            source("PROGRAM_PROFILE_A_01", source_profile="profile_a"),
+            source("PROGRAM_PROFILE_A_02", source_profile="profile_a"),
+            source("PROGRAM_PROFILE_B_01", source_profile="profile_b"),
+        ]
+        provider = FixtureProvider(sources)
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "lineage.db"
+            run_with_output(
+                imp_lineage_edge.main,
+                [provider],
+                db_path=db_path,
+                batch_id="batch-replay-initial",
+                observed_at=OBSERVED_AT,
+                coverage_report_path=None,
+            )
+            rebuilt_names = []
+            real_builder = imp_lineage_edge.build_program_physical_dag
+
+            def record_builder(program_source):
+                rebuilt_names.append(program_source.program_name)
+                return real_builder(program_source)
+
+            with patch(
+                "jobs.crontab.imp_lineage_edge.build_program_physical_dag",
+                side_effect=record_builder,
+            ):
+                result, output = run_with_output(
+                    imp_lineage_edge.main,
+                    [provider],
+                    db_path=db_path,
+                    batch_id="batch-replay-sample",
+                    observed_at=OBSERVED_AT.replace(day=2),
+                    coverage_report_path=None,
+                    selected_profiles=("profile_a",),
+                    limit=2,
+                    force_rebuild=True,
+                )
+
+            store = imp_lineage_edge.SQLiteMaterializationStore(db_path)
+            active_names = {
+                state.program_name
+                for state in store.read_program_states(active_only=True)
+            }
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            rebuilt_names,
+            ["PROGRAM_PROFILE_A_01", "PROGRAM_PROFILE_A_02"],
+        )
+        self.assertEqual(
+            active_names,
+            {
+                "PROGRAM_PROFILE_A_01",
+                "PROGRAM_PROFILE_A_02",
+                "PROGRAM_PROFILE_A_03",
+                "PROGRAM_PROFILE_B_01",
+            },
+        )
+        self.assertIn(
+            "stage=replay status=SELECTED "
+            "replay_mode=controlled_profile_limit selected_profiles=profile_a "
+            "source_total=3 replay_total=2 limit=2 force_rebuild=True "
+            "partial_snapshot=True",
+            output,
+        )
+        self.assertIn("stage=incremental_plan status=SUCCESS total=2", output)
+        self.assertIn("changed=2 unchanged=0 deleted=0 rebuild=2", output)
+
+    def test_slow_program_logs_stage_timings_without_sensitive_details(self):
+        program_source = source("PROGRAM_SLOW_OBSERVABILITY")
+        real_builder = imp_lineage_edge.build_program_physical_dag
+
+        def slow_builder(value):
+            time.sleep(0.02)
+            return real_builder(value)
+
+        with TemporaryDirectory() as directory:
+            with patch(
+                "jobs.crontab.imp_lineage_edge.build_program_physical_dag",
+                side_effect=slow_builder,
+            ):
+                _, output = run_with_output(
+                    imp_lineage_edge.materialize_sources,
+                    [program_source],
+                    db_path=Path(directory) / "lineage.db",
+                    batch_id="batch-slow-observability",
+                    observed_at=OBSERVED_AT,
+                    complete_snapshot=True,
+                    slow_threshold_ms=1,
+                )
+
+        self.assertIn("stage=build_program status=SLOW", output)
+        self.assertIn("build_program_physical_dag_ms=", output)
+        self.assertIn("audit_program_physical_dag_ms=", output)
+        self.assertIn("single_program_total_ms=", output)
+        self.assertIn("stage=build status=SUCCESS processed=1 slow_programs=1", output)
+        for secret in (
+            "PROGRAM_SLOW_OBSERVABILITY",
+            "INSERT INTO",
+            "DWA.DEMO_TARGET",
+        ):
+            self.assertNotIn(secret, output)
+
+    def test_fast_program_does_not_emit_slow_log(self):
+        program_source = source("PROGRAM_FAST_OBSERVABILITY")
+        with TemporaryDirectory() as directory:
+            _, output = run_with_output(
+                imp_lineage_edge.materialize_sources,
+                [program_source],
+                db_path=Path(directory) / "lineage.db",
+                batch_id="batch-fast-observability",
+                observed_at=OBSERVED_AT,
+                complete_snapshot=True,
+                slow_threshold_ms=10_000,
+            )
+
+        self.assertNotIn("stage=build_program status=SLOW", output)
+        self.assertIn("slow_programs=0", output)
+        self.assertIn("max_program_elapsed_ms=", output)
+        self.assertIn("avg_program_elapsed_ms=", output)
+
+    def test_default_parser_arguments_keep_production_defaults(self):
+        args = imp_lineage_edge.build_parser().parse_args([])
+
+        self.assertIsNone(args.profile)
+        self.assertIsNone(args.limit)
+        self.assertFalse(args.force_rebuild)
+        self.assertEqual(args.progress_every, imp_lineage_edge.DEFAULT_PROGRESS_EVERY)
+        self.assertEqual(
+            args.slow_threshold_ms,
+            imp_lineage_edge.DEFAULT_SLOW_THRESHOLD_MS,
+        )
+
+        controlled = imp_lineage_edge.build_parser().parse_args(
+            [
+                "--profile",
+                "profile_a",
+                "--profile",
+                "profile_b",
+                "--limit",
+                "100",
+                "--force-rebuild",
+                "--progress-every",
+                "10",
+                "--slow-threshold-ms",
+                "5000",
+            ]
+        )
+        self.assertEqual(controlled.profile, ["profile_a", "profile_b"])
+        self.assertEqual(controlled.limit, 100)
+        self.assertTrue(controlled.force_rebuild)
+        self.assertEqual(controlled.progress_every, 10)
+        self.assertEqual(controlled.slow_threshold_ms, 5000)
 
     def test_force_rebuild_reparses_an_unchanged_program(self):
         program_source = source("PROGRAM_DEMO_FORCE_REBUILD")
