@@ -364,6 +364,33 @@ class LineageProviderTests(unittest.TestCase):
 
         self.assertEqual(source.expected_target, "DWM.RESULT_A")
 
+    def test_customize_profile_maps_dws_program_name_with_configured_prefix(self):
+        profile = make_profile(
+            "mysql_dev_a_customize",
+            expected_target_column=None,
+            primary_target_strategy="program_name",
+            program_name_target_prefix="DWS_",
+        )
+        cursor = FakeCursor(
+            [
+                (
+                    "005:DWS_DWD.D_GJFK_ALGJ:1:00",
+                    "insert into DWD.D_GJFK_ALGJ select 1",
+                )
+            ]
+        )
+        connection = FakeConnection(cursor)
+
+        with patch.dict(os.environ, environment_for(profile), clear=False):
+            source = next(
+                MySQLProcessProvider(
+                    profile,
+                    connection_factory=lambda settings: connection,
+                ).iter_program_sources()
+            )
+
+        self.assertEqual(source.expected_target, "DWD.D_GJFK_ALGJ")
+
     def test_program_name_strategy_requires_explicit_prefix(self):
         with self.assertRaisesRegex(ValueError, "program_name_target_prefix"):
             make_profile(
@@ -538,7 +565,7 @@ class LineageProviderTests(unittest.TestCase):
     def test_load_mysql_process_profiles_from_yaml(self):
         config = """\
 mysql_process_profiles:
-  - name: mysql_dev_demo
+  - name: mysql_dev_a_customize
     environment: DEV
     host_env: DEMO_HOST
     port_env: DEMO_PORT
@@ -550,7 +577,7 @@ mysql_process_profiles:
     script_code_column: script_code
     expected_target_column: expected_target
     primary_target_strategy: program_name
-    program_name_target_prefix: DEMO_
+    program_name_target_prefix: DWS_
     batch_size: 7
 """
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -560,11 +587,11 @@ mysql_process_profiles:
             profiles = load_mysql_process_profiles(path)
 
         self.assertEqual(len(profiles), 1)
-        self.assertEqual(profiles[0].name, "mysql_dev_demo")
+        self.assertEqual(profiles[0].name, "mysql_dev_a_customize")
         self.assertEqual(profiles[0].batch_size, 7)
         self.assertEqual(profiles[0].expected_target_column, "expected_target")
         self.assertEqual(profiles[0].primary_target_strategy, "program_name")
-        self.assertEqual(profiles[0].program_name_target_prefix, "DEMO_")
+        self.assertEqual(profiles[0].program_name_target_prefix, "DWS_")
 
     def test_load_mysql_process_profiles_supports_all_connection_shapes(self):
         config = """
