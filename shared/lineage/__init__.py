@@ -19,6 +19,7 @@ from .coverage import (  # pyright: ignore[reportMissingImports]
     write_json_report as write_coverage_json_report,
 )
 from .domain import (
+    DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
     DEFAULT_TEMPORARY_ASSET_RULES,
     IssueType,
     LineageEdge,
@@ -30,9 +31,12 @@ from .domain import (
     ProgramSource,
     ProgramState,
     TemporaryAssetRule,
+    extract_program_declared_target_token,
     is_formal_asset,
     is_temporary_asset,
     normalize_asset_name,
+    normalize_declared_target_from_program_name,
+    parse_declared_primary_target,
 )
 from .evolution import (  # pyright: ignore[reportMissingImports]
     BatchMetadata,
@@ -101,6 +105,7 @@ from .query import (  # pyright: ignore[reportMissingImports]
 
 __all__ = [
     "AuditResult",
+    "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
     "CoverageReason",
     "DEFAULT_COVERAGE_REPORT_PATH",
     "LineageCoverageAccumulator",
@@ -127,10 +132,13 @@ __all__ = [
     "ProgramState",
     "SQLStep",
     "TemporaryAssetRule",
+    "extract_program_declared_target_token",
     "is_formal_asset",
     "is_temporary_asset",
     "issue_severity",
     "normalize_asset_name",
+    "normalize_declared_target_from_program_name",
+    "parse_declared_primary_target",
     "audit_program_physical_dag",
     "build_physical_dag",
     "build_program_physical_dag",

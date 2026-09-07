@@ -18,6 +18,11 @@ mysql_process_profiles:
     script_code_column: script_code
     # demo_meta.processes 没有固定的 expected target 字段；不填即为 None。
     expected_target_column: null
+    # 只有完成历史格式核验后才启用程序名 target hint。
+    # primary_target_strategy: program_name
+    # program_name_target_prefix: DEMO_
+    primary_target_strategy: explicit
+    program_name_target_prefix: null
     batch_size: 200
 
   # CI / Docker 可只提交环境变量名，连接值仍由运行环境注入。
@@ -33,6 +38,8 @@ mysql_process_profiles:
     program_name_column: process_name
     script_code_column: script_code
     expected_target_column: null
+    primary_target_strategy: explicit
+    program_name_target_prefix: null
     batch_size: 200
 
   # 兼容现有 legacy 顶层 host_env / port_env / user_env / password_env /
@@ -48,6 +55,8 @@ mysql_process_profiles:
     program_name_column: process_name
     script_code_column: script_code
     expected_target_column: null
+    primary_target_strategy: explicit
+    program_name_target_prefix: null
     batch_size: 200
 
 # profile 数量没有固定上限；真实部署可按 1..N 增删上述项。

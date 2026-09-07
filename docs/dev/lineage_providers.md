@@ -80,6 +80,17 @@ connection_env:
 `expected_target_column` 都会通过 `shared.config.env.safe_identifier` 校验后才
 进入查询模板。运行时数据仍由 cursor 返回，不把用户值拼接进 SQL。
 
+`primary_target_strategy` 默认是 `explicit`。只有已经核验历史命名协议的 profile
+才可以配置：
+
+```yaml
+primary_target_strategy: program_name
+program_name_target_prefix: DEMO_
+```
+
+这两个字段是独立的：`program_name_target_prefix` 是允许剥离的完整程序侧
+namespace，不会根据任意 `_`、最后一个 `_` 或 `XXX_DWM` 猜 schema。
+
 ## Batch / streaming
 
 `MySQLProcessProvider` 使用：
@@ -102,9 +113,18 @@ execute
 数据无法严格解码时沿用 `errors="ignore"`。空的 `expected_target` 会变成
 `None`，不会变成字符串 `"None"`。
 
-Provider 只有在 profile 或 legacy row 明确提供结果表字段时才填写
-`expected_target`。没有可靠字段时保持 `None`；不会从文件名、SQL 最后一个表、
-所有非 TMP 表或程序名猜测 target。
+Provider 优先使用 profile/legacy row 明确提供的结果表字段。若 profile 明确配置
+`primary_target_strategy: program_name`，才会额外尝试解析高置信格式
+`NNN:<program-target>:<revision>:<clock>` 的第二段：先由
+`extract_program_declared_target_token()` 提取 token，再由
+`normalize_declared_target_from_program_name()` 按配置前缀生成 plain
+`SCHEMA.TABLE`。例如 `005:DEMO_DWM.RESULT_A:1:00` 解析为
+`DWM.RESULT_A`，而不是 `DEMO_DWM.RESULT_A`。
+
+malformed 格式、前缀不匹配或 schema/table 无法安全验证时返回 `None`。该值只是
+`expected_target` 的 declared primary result hint；它不会替换 Physical DAG 中的
+其它 formal sink，也不会把多个 sink 变成唯一结果。没有显式 target 配置时，Provider
+默认不从文件名、SQL 最后一个表、所有非 TMP 表或程序名猜测 target。
 
 ## source_hash
 
@@ -127,7 +147,9 @@ ID、读取时间、batch ID 都不会进入 hash。因此相同语义输入得�
 `process_name` / `program_name` 和 `script_code` 转换为 `ProgramSource`，并使用
 默认 `environment="PROD"`、`source_profile="production_metadata"`。旧
 `ProcessInfo` 没有独立 target 字段时，`expected_target` 保持 `None`；需要明确
-metadata 字段时可以注入 `expected_target_getter`。
+metadata 字段时可以注入 `expected_target_getter`。若已核验历史
+`program_name` 格式，也可以在 `ProductionProvider` 上显式配置
+`primary_target_strategy="program_name"` 与 `program_name_target_prefix`。
 
 这是 adapter，不是 production metadata 查询重写：没有删除 `ProcessInfo`、没有
 复制一套 legacy SQL，也没有修改旧工具入口。旧调用方继续使用原来的 loader；新

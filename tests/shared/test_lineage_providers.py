@@ -67,6 +67,8 @@ def make_profile(
     *,
     batch_size: int = 200,
     expected_target_column: str | None = "expected_target",
+    primary_target_strategy: str = "explicit",
+    program_name_target_prefix: str | None = None,
 ) -> MySQLProcessProfile:
     prefix = name.upper()
     return MySQLProcessProfile(
@@ -82,6 +84,8 @@ def make_profile(
         script_code_column="script_code",
         expected_target_column=expected_target_column,
         batch_size=batch_size,
+        primary_target_strategy=primary_target_strategy,
+        program_name_target_prefix=program_name_target_prefix,
     )
 
 
@@ -339,6 +343,34 @@ class LineageProviderTests(unittest.TestCase):
 
         self.assertIsNone(source.expected_target)
 
+    def test_program_name_strategy_maps_declared_primary_target_hint(self):
+        profile = make_profile(
+            expected_target_column=None,
+            primary_target_strategy="program_name",
+            program_name_target_prefix="DEMO_",
+        )
+        cursor = FakeCursor(
+            [("005:DEMO_DWM.RESULT_A:1:00", "insert into DWM.RESULT_A select 1")]
+        )
+        connection = FakeConnection(cursor)
+
+        with patch.dict(os.environ, environment_for(profile), clear=False):
+            source = next(
+                MySQLProcessProvider(
+                    profile,
+                    connection_factory=lambda settings: connection,
+                ).iter_program_sources()
+            )
+
+        self.assertEqual(source.expected_target, "DWM.RESULT_A")
+
+    def test_program_name_strategy_requires_explicit_prefix(self):
+        with self.assertRaisesRegex(ValueError, "program_name_target_prefix"):
+            make_profile(
+                expected_target_column=None,
+                primary_target_strategy="program_name",
+            )
+
     def test_invalid_identifier_is_rejected_before_query(self):
         placeholder_key = "DEMO_AUTH_ENV"
         with self.assertRaises(ValueError):
@@ -455,6 +487,19 @@ class LineageProviderTests(unittest.TestCase):
         target_source = next(target_provider.iter_program_sources())
         self.assertEqual(target_source.expected_target, "DWM.EXPLICIT_TARGET")
 
+        declared_provider = ProductionProvider(
+            lambda: [
+                {
+                    "program_name": "005:DEMO_DWD.TABLE_B:1:00",
+                    "script_code": "insert into DWD.TABLE_B select 1",
+                }
+            ],
+            primary_target_strategy="program_name",
+            program_name_target_prefix="DEMO_",
+        )
+        declared_source = next(declared_provider.iter_program_sources())
+        self.assertEqual(declared_source.expected_target, "DWD.TABLE_B")
+
     def test_production_loader_error_has_context(self):
         def loader():
             raise OSError("metadata unavailable")
@@ -504,6 +549,8 @@ mysql_process_profiles:
     program_name_column: process_name
     script_code_column: script_code
     expected_target_column: expected_target
+    primary_target_strategy: program_name
+    program_name_target_prefix: DEMO_
     batch_size: 7
 """
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -516,6 +563,8 @@ mysql_process_profiles:
         self.assertEqual(profiles[0].name, "mysql_dev_demo")
         self.assertEqual(profiles[0].batch_size, 7)
         self.assertEqual(profiles[0].expected_target_column, "expected_target")
+        self.assertEqual(profiles[0].primary_target_strategy, "program_name")
+        self.assertEqual(profiles[0].program_name_target_prefix, "DEMO_")
 
     def test_load_mysql_process_profiles_supports_all_connection_shapes(self):
         config = """

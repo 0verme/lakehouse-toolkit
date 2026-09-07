@@ -13,7 +13,9 @@ from shared.lineage.lineage_builder import (
     is_terminal_upstream_table,
     merge_schedule_time_row,
     normalize_table_name,
+    parse_declared_primary_target,
     parse_schedule_time_seconds,
+    process_target_name,
 )
 
 
@@ -88,6 +90,14 @@ def reach(start: str, edges: set[tuple[str, str]]) -> set[str]:
 
 
 class dataLineageTests(unittest.TestCase):
+    def test_declared_primary_target_is_normalized_before_legacy_graph_use(self):
+        program_name = "005:DEMO_DWM.RESULT_A:1:00"
+        self.assertEqual(
+            parse_declared_primary_target(program_name),
+            "DWM.RESULT_A",
+        )
+        self.assertEqual(process_target_name(program_name), "DWS_DWM.RESULT_A")
+
     def test_build_lineage_graph_uses_script_code_edges(self):
         process_infos = [
             process(
@@ -476,7 +486,12 @@ class dataLineageTests(unittest.TestCase):
         self.assertIsNotNone(graph)
         self.assertEqual(captured["profile"], "demo")
         self.assertEqual(captured["tables"], {"DWS_DWM.T_ROOT", "DWS_DWD.T_KEEP"})
-        self.assertNotIn("DWS_DWD.CODE_STATUS_MAP", captured["tables"])
+        captured_tables = captured["tables"]
+        if not isinstance(captured_tables, set):
+            self.fail("schedule loader must capture a set of table names")
+        self.assertNotIn("DWS_DWD.CODE_STATUS_MAP", captured_tables)
+        if graph is None:
+            self.fail("targeted schedule graph must be built")
         self.assertTrue(
             all(
                 node.detail["调度时间"] == "2026-07-10 08:00:00"
@@ -547,6 +562,8 @@ class dataLineageTests(unittest.TestCase):
                     requested_table_names={"DWS_DWM.M_DEMO_DETAIL"},
                 )
 
+                if graph is None:
+                    self.fail("schedule graph must be built")
                 apply_schedule_times_to_graph(graph, result)
 
                 root = next(node for node in graph.nodes if node.type == "root_table")
@@ -563,7 +580,8 @@ class dataLineageTests(unittest.TestCase):
             max_depth=8,
             result_table_names={"DWS_DWM.T_ROOT", "DWS_DWD.T_MID", "DWS_DWF.T_SOURCE"},
         )
-        self.assertIsNotNone(graph)
+        if graph is None:
+            self.fail("schedule graph must be built")
         apply_schedule_times_to_graph(
             graph,
             {

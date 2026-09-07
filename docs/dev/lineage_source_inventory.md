@@ -189,13 +189,18 @@ WHERE script_code IS NOT NULL
 
 旧 builder 的 target 处理是另外一层：
 
-- `process_target_name()` 按 `process_name` 的 `:` 后半段推导表名；
+- `process_target_name()` 对高置信的 `NNN:<program-target>:<revision>:<clock>`
+  格式先复用 `parse_declared_primary_target()`，再转换为旧 graph 的
+  `DWS_<schema>.table` identity；
+- 其它 legacy 名称仍按既有 `:` 后半段兼容逻辑处理；
 - `process_task_name()` 从同一命名格式推导任务名；
 - `build_target_map()` 使用这个推导结果构建旧 graph。
 
-这是 legacy graph 的命名推导，不是 `ProgramSource.expected_target` 的可靠显式
-来源。V1 adapter 在没有明确 target 列/getter 时保持 `expected_target=None`，不
-把程序名或 SQL 最后一个表猜成 target。
+`parse_declared_primary_target()` 的结果是 declared primary result hint，不是
+唯一 sink。它只在 Provider profile 显式配置
+`primary_target_strategy: program_name` 和 `program_name_target_prefix` 时进入
+`ProgramSource.expected_target`；否则 V1 adapter 在没有明确 target 列/getter 时
+仍保持 `expected_target=None`，不把程序名或 SQL 最后一个表猜成 target。
 
 ### 3.3 Duplicated Historical Readers
 
@@ -257,7 +262,7 @@ backend topology。
 
 | Source of target-like value | Code evidence | Semantics / boundary |
 | --- | --- | --- |
-| process name suffix | `lineage_builder.process_target_name()`、`sql_upstream_to_layer.process_target_name()` | legacy 命名推导；不是 V1 显式 target。 |
+| process name suffix | `lineage_builder.process_target_name()`、`sql_upstream_to_layer.process_target_name()`、`schedule_diff.process_target_name()` | legacy 命名推导；高置信格式可经显式配置映射为 declared primary result hint，但不是唯一 sink，也不是默认 V1 显式 target。 |
 | process/profile target column | `MySQLProcessProfile.expected_target_column`、`MySQLProcessProvider._row_to_program_source()` | 只有 profile 明确配置列名时才映射到 `ProgramSource.expected_target`。 |
 | production legacy target field/getter | `ProductionProvider._legacy_value()`、`expected_target_getter` | 允许 explicit `expected_target` 或注入 getter；没有则保留 `None`。 |
 | programs metadata | `programs.target_table`，由 jobs/programs join 取得 | 程序 catalog 的显式目标；当前不自动加入 MySQL process provider。 |

@@ -7,10 +7,15 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from html import escape
 
-from pywebio.output import put_html, put_table, put_text
+from pywebio.output import (  # pyright: ignore[reportMissingImports]
+    put_html,
+    put_table,
+    put_text,
+)
 
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
+from shared.lineage.domain import parse_declared_primary_target
 from shared.ui.pywebio_helper import (
     put_black_text,
     put_red_text,
@@ -22,6 +27,7 @@ from shared.ui.pywebio_helper import (
 def get_db():
     import pymysql
 
+    # pi-lens-ignore: no-db-string-literal-password
     return pymysql.connect(
         host=os.getenv("PYTOOLS_MYSQL_HOST", "localhost"),
         user=required_env("PYTOOLS_MYSQL_USER"),
@@ -153,6 +159,10 @@ def process_task_name(process_name: str) -> str:
 
 
 def process_target_name(process_name: str) -> str:
+    declared_target = parse_declared_primary_target(process_name)
+    if declared_target is not None:
+        return normalize_table_name(declared_target)
+
     parts = str(process_name or "").split(":")
     if len(parts) > 1:
         return normalize_table_name(parts[1])
