@@ -195,6 +195,41 @@ ProgramSource provider
 它支持注入公开 fixture/mock provider，直接执行时从 local/example provider 配置读取，
 不会写入真实连接参数，也不会自动替换旧的 cron 或生产 lineage 入口。
 
+### 定时任务可观测性
+
+直接运行：
+
+```bash
+python jobs/crontab/imp_lineage_edge.py
+```
+
+Job 会在 source load、incremental plan、DAG/audit build 和 atomic publish
+边界输出已 flush 的阶段日志。默认每处理 500 个本轮需要 rebuild 的程序输出一条
+progress，不会为每个 `ProgramSource` 输出日志；本轮只 rebuild 100 个程序时，
+`build total` 也只会是 100：
+
+```text
+stage=job status=STARTED providers=4
+stage=source_load status=STARTED
+stage=source_load status=SUCCESS sources=20470 elapsed_ms=...
+stage=incremental_plan status=STARTED
+stage=incremental_plan status=SUCCESS total=20470 new=20470 changed=0 unchanged=0 deleted=0 rebuild=20470 elapsed_ms=...
+stage=build status=STARTED total=20470
+stage=build status=RUNNING processed=500 total=20470 percent=2 elapsed_ms=...
+stage=build status=RUNNING processed=1000 total=20470 percent=4 elapsed_ms=...
+stage=build status=SUCCESS processed=20470 edges=... issues=... elapsed_ms=...
+stage=publish status=STARTED
+stage=publish status=SUCCESS batch_id=batch-... edges=... issues=... previous=- elapsed_ms=...
+stage=job status=SUCCESS elapsed_ms=...
+```
+
+日志只输出 count、耗时、受限 batch ID 和异常 class；不输出 program name、源码、
+SQL、表名或 connection settings。`stage=job status=SUCCESS` 只会在 SQLite
+atomic publish 完成后出现。中途的 STARTED/RUNNING 日志只表示计算进度，不表示
+snapshot 已经发布；失败时会输出 `status=FAILED exception=<ExceptionClass>` 并保留
+原有异常传播/non-zero 行为。当前实现使用固定 count progress；如果未来需要在
+单个程序长时间运行期间提供 heartbeat，可单独增加时间阈值。
+
 ## 本阶段边界
 
 Phase 5 本身仍只负责纯 materialization 与 atomic publish；增量、历史、diff、issue
