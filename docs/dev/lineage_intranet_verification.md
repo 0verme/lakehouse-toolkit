@@ -37,6 +37,18 @@ SVN 继续保持 development/audit source（Role B）。本次没有新增 `SVNP
 
 异常只会被归一化为 `CONFIG_ERROR`、`CONNECT_ERROR`、`QUERY_ERROR`、`ROW_MAPPING_ERROR` 或 `DECODE_ERROR` 等安全错误分类。
 
+## Installation
+
+在仓库根目录安装运行依赖（包括 YAML 配置解析所需的 `PyYAML`）：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+建议使用执行命令对应的同一个 Python 环境安装依赖；不要只在其他 virtualenv
+中安装。缺少 `PyYAML` 时 CLI 会输出 `stage=dependency`，不会把依赖问题误报为
+配置错误。
+
 ## Local Config
 
 公开模板为 [`configs/lineage_providers.example.yaml`](../../configs/lineage_providers.example.yaml)。内网人工执行前复制为：
@@ -102,6 +114,21 @@ python -m tools.lineage.verify_sources \
 - `2`：配置或报告路径错误。
 
 命令日志只输出 `profile`、`environment`、stage、状态、行数和耗时，不输出 settings、raw row、SQL 或脚本内容。
+
+## Startup Diagnostics
+
+启动或配置错误统一返回 exit code `2`，并使用安全的错误分类：
+
+- `stage=dependency ... dependency=PyYAML`：当前 Python 环境缺少 PyYAML；运行
+  `python -m pip install -r requirements.txt` 后重试；
+- `error=CONFIG_NOT_FOUND`：`--config` 文件不存在；
+- `error=CONFIG_READ_ERROR`：文件无法读取或不是普通文件；
+- `error=YAML_INVALID line=<n> column=<n>`：YAML 语法错误；只显示位置，不显示原始 YAML 行；
+- `error=CONFIG_INVALID reason=...`：根节点、profile 列表或字段结构不合法；reason 只显示安全的字段/结构信息；
+- `error=UNEXPECTED exception=<ExceptionClass>`：未预期的启动异常；默认不输出异常对象内容。
+
+诊断日志不会打印密码、`password_env` 对应的环境变量值、完整连接信息、完整 YAML
+或异常原文。不要为了获取更多信息直接上传 local YAML 或 raw log。
 
 ## Report Schema
 
