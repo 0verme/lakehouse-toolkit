@@ -195,6 +195,16 @@ ProgramSource provider
 它支持注入公开 fixture/mock provider，直接执行时从 local/example provider 配置读取，
 不会写入真实连接参数，也不会自动替换旧的 cron 或生产 lineage 入口。
 
+### 定时任务可观测性
+
+定时任务复用了 progress logging PR #25（`ccb5e60`）的低基数脱敏日志约定，在
+`source_load`、`incremental_plan`、`build`、`publish` 和 `job` 边界输出已 flush 的阶段
+状态。build progress 默认每 500 个本轮 rebuild 程序输出一次；日志只包含 count、耗时、
+受限 batch ID 与异常 class，不输出 program name、源码、SQL、表名或 connection settings。
+coverage funnel 的聚合行以 `stage=coverage` 单独输出，详见
+[`lineage_coverage.md`](lineage_coverage.md)。该 progress PR 仍可独立审阅/合并，当前
+入口不要求它先合并。
+
 ## 本阶段边界
 
 Phase 5 本身仍只负责纯 materialization 与 atomic publish；增量、历史、diff、issue

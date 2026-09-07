@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from textwrap import dedent
 
 from shared.lineage.domain import (
@@ -107,14 +108,35 @@ _SQL_CALL_NAMES = {
     "exec_sql",
     "execute_query",
     "execute_sql",
+    "fetch_all",
     "query",
     "read_sql",
     "read_sql_query",
     "run_query",
     "run_sql",
+    "run_sql_with_profile",
+    "select_mysql_sql",
+    "select_sql",
+    "select_sql_with_profile",
     "sql",
 }
-_SQL_ARGUMENT_KEYWORDS = {"command", "query", "sql", "statement"}
+_SQL_ARGUMENT_KEYWORDS = {"command", "query", "sql", "sql_str", "statement"}
+
+
+class SQLExtractionReason(str, Enum):
+    """Safe parser-stage classification used by the coverage funnel."""
+
+    CANDIDATE_FOUND = "CANDIDATE_FOUND"
+    RAW_SQL = "RAW_SQL"
+    EMPTY_SCRIPT = "EMPTY_SCRIPT"
+    PYTHON_PARSE_FAILED = "PYTHON_PARSE_FAILED"
+    NO_SQL_CANDIDATE = "NO_SQL_CANDIDATE"
+    SQL_CALL_NOT_RECOGNIZED = "SQL_CALL_NOT_RECOGNIZED"
+    SQL_ARGUMENT_DYNAMIC = "SQL_ARGUMENT_DYNAMIC"
+    SQL_ARGUMENT_MISSING = "SQL_ARGUMENT_MISSING"
+    SQL_ARGUMENT_NOT_SQL = "SQL_ARGUMENT_NOT_SQL"
+    SQL_RETURN_DYNAMIC = "SQL_RETURN_DYNAMIC"
+    SQL_RETURN_NOT_SQL = "SQL_RETURN_NOT_SQL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +180,11 @@ ProgramSQLStep = SQLStep
 
 @dataclass(frozen=True, slots=True)
 class ProgramPhysicalDAG:
-    """一个程序的 Physical 图及后续审计所需的事实。"""
+    """一个程序的 Physical 图及后续审计所需的事实。
+
+    ``sql_candidate_count`` 与 ``sql_extraction_reason`` 来自同一次 parser
+    extraction，供 coverage funnel 使用，不保存候选 SQL 文本。
+    """
 
     program_source: ProgramSource
     nodes: tuple[PhysicalNode, ...]
@@ -166,6 +192,8 @@ class ProgramPhysicalDAG:
     steps: tuple[SQLStep, ...]
     sinks: tuple[str, ...]
     expected_target: str | None
+    sql_candidate_count: int = 0
+    sql_extraction_reason: str = SQLExtractionReason.NO_SQL_CANDIDATE.value
 
     @property
     def node_map(self) -> dict[str, PhysicalNode]:
@@ -183,6 +211,12 @@ class _SQLCandidate:
     text: str
     line_number: int | None
     column_number: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PythonCandidateExtraction:
+    candidates: tuple[_SQLCandidate, ...]
+    reason: SQLExtractionReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,23 +251,41 @@ def _node_position(node: ast.AST) -> tuple[int, int]:
     )
 
 
-def _is_sql_call(node: ast.Call) -> bool:
-    function = node.func
-    name = ""
+def _call_name(call: ast.Call) -> str:
+    function = call.func
     if isinstance(function, ast.Name):
-        name = function.id
-    elif isinstance(function, ast.Attribute):
-        name = function.attr
-    return name.lower() in _SQL_CALL_NAMES
+        return function.id.lower()
+    if isinstance(function, ast.Attribute):
+        return function.attr.lower()
+    return ""
 
 
-def _sql_argument(call: ast.Call) -> ast.AST | None:
-    if call.args:
-        return call.args[0]
+def _is_sql_call(node: ast.Call) -> bool:
+    return _call_name(node) in _SQL_CALL_NAMES
+
+
+def _sql_argument_candidates(call: ast.Call) -> tuple[ast.AST, ...]:
     for keyword in call.keywords:
         if keyword.arg and keyword.arg.lower() in _SQL_ARGUMENT_KEYWORDS:
-            return keyword.value
-    return None
+            return (keyword.value,)
+
+    name = _call_name(call)
+    if name in {"run_sql_with_profile", "select_sql_with_profile"}:
+        positions = (1,)
+    elif name in {"execute_sql", "fetch_all"}:
+        # The repository's shared helper takes (profile, sql), while the
+        # historical generic name also appears with SQL as its first argument.
+        positions = (0, 1)
+    else:
+        positions = (0,)
+    return tuple(call.args[index] for index in positions if index < len(call.args))
+
+
+def _diagnostic_argument_candidates(call: ast.Call) -> tuple[ast.AST, ...]:
+    for keyword in call.keywords:
+        if keyword.arg and keyword.arg.lower() in _SQL_ARGUMENT_KEYWORDS:
+            return (keyword.value,)
+    return (call.args[0],) if call.args else ()
 
 
 def _record_bindings(tree: ast.AST) -> dict[str, list[_PythonBinding]]:
@@ -399,38 +451,129 @@ def _looks_like_sql(text: str) -> bool:
     return bool(_SQL_LEADING_RE.match(without_comments))
 
 
-def _extract_python_candidates(script_code: str) -> tuple[_SQLCandidate, ...]:
+def _extract_python_candidates_with_reason(
+    script_code: str,
+) -> _PythonCandidateExtraction:
+    if not script_code.strip():
+        return _PythonCandidateExtraction((), SQLExtractionReason.EMPTY_SCRIPT)
+
     python_code = dedent(script_code)
     try:
         tree = ast.parse(python_code)
     except (SyntaxError, ValueError, TypeError):
         if _looks_like_sql(script_code):
-            return (_SQLCandidate(script_code, 1, 0),)
-        return ()
+            return _PythonCandidateExtraction(
+                (_SQLCandidate(script_code, 1, 0),),
+                SQLExtractionReason.RAW_SQL,
+            )
+        return _PythonCandidateExtraction((), SQLExtractionReason.PYTHON_PARSE_FAILED)
 
     bindings = _record_bindings(tree)
     calls = sorted(
-        (
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and _is_sql_call(node)
-        ),
+        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
         key=_node_position,
     )
     candidates: list[_SQLCandidate] = []
+    dynamic_argument = False
+    missing_argument = False
+    non_sql_argument = False
+    unrecognized_sql_call = False
+    recognized_sql_call = False
+    return_dynamic = False
+    return_not_sql = False
     for call in calls:
-        expression = _sql_argument(call)
-        if expression is None:
-            continue
         line_number, column_number = _node_position(call)
-        text = _resolve_static_text(
-            expression,
-            (line_number, column_number),
-            bindings,
+        if _is_sql_call(call):
+            recognized_sql_call = True
+            expressions = _sql_argument_candidates(call)
+            if not expressions:
+                missing_argument = True
+                continue
+            resolved_candidate = False
+            unresolved = False
+            for expression in expressions:
+                text = _resolve_static_text(
+                    expression,
+                    (line_number, column_number),
+                    bindings,
+                )
+                if text is None:
+                    unresolved = True
+                    continue
+                if _looks_like_sql(text):
+                    candidates.append(_SQLCandidate(text, line_number, column_number))
+                    resolved_candidate = True
+                    break
+                non_sql_argument = True
+            if not resolved_candidate and unresolved:
+                dynamic_argument = True
+            continue
+
+        for expression in _diagnostic_argument_candidates(call):
+            text = _resolve_static_text(
+                expression,
+                (line_number, column_number),
+                bindings,
+            )
+            if text is not None and _looks_like_sql(text):
+                # This is diagnostic-only: unknown wrappers are never parsed.
+                unrecognized_sql_call = True
+                break
+
+    if not recognized_sql_call and not unrecognized_sql_call:
+        return_candidates: list[_SQLCandidate] = []
+        return_nodes = sorted(
+            (item for item in ast.walk(tree) if isinstance(item, ast.Return)),
+            key=_node_position,
         )
-        if text is not None and _looks_like_sql(text):
-            candidates.append(_SQLCandidate(text, line_number, column_number))
-    return tuple(candidates)
+        if len(return_nodes) == 1:
+            node = return_nodes[0]
+            if node.value is None:
+                return_not_sql = True
+            else:
+                line_number, column_number = _node_position(node)
+                text = _resolve_static_text(
+                    node.value,
+                    (line_number, column_number),
+                    bindings,
+                )
+                if text is None:
+                    return_dynamic = True
+                elif _looks_like_sql(text):
+                    return_candidates.append(
+                        _SQLCandidate(text, line_number, column_number)
+                    )
+                else:
+                    return_not_sql = True
+        elif return_nodes:
+            # Mutually exclusive branches cannot be selected statically.
+            return_dynamic = True
+        if return_candidates:
+            candidates.extend(return_candidates)
+
+    if candidates:
+        reason = SQLExtractionReason.CANDIDATE_FOUND
+    elif unrecognized_sql_call:
+        reason = SQLExtractionReason.SQL_CALL_NOT_RECOGNIZED
+    elif return_dynamic:
+        reason = SQLExtractionReason.SQL_RETURN_DYNAMIC
+    elif return_not_sql:
+        reason = SQLExtractionReason.SQL_RETURN_NOT_SQL
+    elif dynamic_argument:
+        reason = SQLExtractionReason.SQL_ARGUMENT_DYNAMIC
+    elif missing_argument:
+        reason = SQLExtractionReason.SQL_ARGUMENT_MISSING
+    elif non_sql_argument:
+        reason = SQLExtractionReason.SQL_ARGUMENT_NOT_SQL
+    else:
+        reason = SQLExtractionReason.NO_SQL_CANDIDATE
+    return _PythonCandidateExtraction(tuple(candidates), reason)
+
+
+def _extract_python_candidates(script_code: str) -> tuple[_SQLCandidate, ...]:
+    """Compatibility helper returning candidates without parser diagnostics."""
+
+    return _extract_python_candidates_with_reason(script_code).candidates
 
 
 def _normalize_asset(raw_name: str | None) -> str | None:
@@ -572,13 +715,9 @@ def _parse_statement(
     )
 
 
-def extract_sql_steps(script_code: str) -> tuple[SQLStep, ...]:
-    """从 raw SQL 或已知 Python SQL execution context 提取 SQL steps。"""
-
-    if not isinstance(script_code, str) or not script_code.strip():
-        return ()
-
-    candidates = _extract_python_candidates(script_code)
+def _parse_sql_candidates(
+    candidates: Iterable[_SQLCandidate],
+) -> tuple[SQLStep, ...]:
     steps: list[SQLStep] = []
     statement_index = 0
     for candidate in candidates:
@@ -596,6 +735,15 @@ def extract_sql_steps(script_code: str) -> tuple[SQLStep, ...]:
             )
             statement_index += 1
     return tuple(steps)
+
+
+def extract_sql_steps(script_code: str) -> tuple[SQLStep, ...]:
+    """从 raw SQL 或已知 Python SQL execution context 提取 SQL steps。"""
+
+    if not isinstance(script_code, str) or not script_code.strip():
+        return ()
+    extraction = _extract_python_candidates_with_reason(script_code)
+    return _parse_sql_candidates(extraction.candidates)
 
 
 def _merge_edge_evidence(
@@ -660,7 +808,8 @@ def build_program_physical_dag(program_source: ProgramSource) -> ProgramPhysical
     if not isinstance(program_source, ProgramSource):
         raise TypeError("program_source must be a ProgramSource")
 
-    steps = extract_sql_steps(program_source.script_code)
+    extraction = _extract_python_candidates_with_reason(program_source.script_code)
+    steps = _parse_sql_candidates(extraction.candidates)
     nodes: dict[str, PhysicalNode] = {}
     edges: dict[tuple[str, str], PhysicalEdge] = {}
     written_targets: list[str] = []
@@ -723,6 +872,8 @@ def build_program_physical_dag(program_source: ProgramSource) -> ProgramPhysical
         steps=steps,
         sinks=sinks,
         expected_target=expected_target,
+        sql_candidate_count=len(extraction.candidates),
+        sql_extraction_reason=extraction.reason.value,
     )
 
 
@@ -750,6 +901,7 @@ def extract_program_sql_steps(script_code: str) -> tuple[SQLStep, ...]:
 
 __all__ = [
     "ProgramPhysicalDAG",
+    "SQLExtractionReason",
     "ProgramPhysicalDAGBuilder",
     "ProgramSQLStep",
     "SQLStep",
