@@ -6,10 +6,11 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import time
-from collections.abc import Iterable, Mapping, Sized
+from collections.abc import Iterable, Mapping, Sequence, Sized
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,11 @@ except ModuleNotFoundError:
 ensure_project_root_on_path()
 
 from shared.lineage.audit import LineageAuditResult, audit_program_physical_dag  # noqa: E402
+from shared.lineage.coverage import (  # noqa: E402
+    DEFAULT_COVERAGE_REPORT_PATH,
+    LineageCoverageAccumulator,
+    write_json_report as write_coverage_json_report,
+)
 from shared.lineage.domain import (  # noqa: E402
     LineageEdge,
     LineageIssue,
@@ -67,13 +73,18 @@ MATERIALIZATION_DB_PATH = Path(
         str(DEFAULT_MATERIALIZATION_DB_PATH),
     )
 ).expanduser()
-
+COVERAGE_REPORT_PATH = Path(
+    os.getenv(
+        "PYTOOLS_LINEAGE_COVERAGE_REPORT",
+        str(DEFAULT_COVERAGE_REPORT_PATH),
+    )
+).expanduser()
 DEFAULT_PROGRESS_EVERY = 500
 _SAFE_BATCH_ID = re.compile(r"batch-[A-Za-z0-9][A-Za-z0-9._-]{0,121}")
 
 
 def _emit_log(stage: str, status: str, **fields: object) -> None:
-    """Emit one flushed, low-cardinality job log line."""
+    """输出低基数且已脱敏的阶段日志。"""
 
     values = [f"stage={stage}", f"status={status}"]
     values.extend(f"{key}={value}" for key, value in fields.items())
@@ -85,13 +96,13 @@ def _elapsed_ms(started_at: float) -> int:
 
 
 def _exception_name(error: Exception) -> str:
-    """Return only the exception class; never expose provider error text."""
+    """只返回异常 class，避免把 provider 错误文本写入日志。"""
 
     return type(error).__name__
 
 
 def _safe_batch_id(value: str | None) -> str:
-    """Keep operator-facing batch IDs bounded and free of arbitrary text."""
+    """限制日志中的 batch ID，拒绝任意外部文本。"""
 
     if not isinstance(value, str):
         return "<redacted>"
@@ -110,22 +121,26 @@ def build_audits(
     *,
     batch_id: str,
     observed_at: datetime,
+    coverage: LineageCoverageAccumulator | None = None,
+    count_program_totals: bool = True,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     progress_started_at: float | None = None,
 ) -> Iterable[LineageAuditResult]:
-    """只编排既有 Builder 与 Auditor，逐个产生 audited DAG。"""
+    """逐个复用 Builder/Auditor，并顺手累加可选 coverage。"""
 
     progress_every = _validate_progress_every(progress_every)
     total = len(program_sources) if isinstance(program_sources, Sized) else None
     processed = 0
     for program_source in program_sources:
         dag = build_program_physical_dag(program_source)
+        if coverage is not None:
+            coverage.observe_dag(dag, count_program=count_program_totals)
         audit = audit_program_physical_dag(
             dag,
             observed_at=observed_at,
             batch_id=batch_id,
         )
-        # The consumer materializes this audit before requesting the next one.
+        # consumer 在请求下一个 audit 前会先 materialize 当前结果。
         yield audit
         processed += 1
         if (
@@ -150,16 +165,21 @@ def build_candidate_batch(
     batch_id: str,
     observed_at: datetime,
     job_keys: Mapping[str, str] | None = None,
+    coverage: LineageCoverageAccumulator | None = None,
+    count_program_totals: bool = True,
+    observe_materialized_edges: bool = True,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     progress_started_at: float | None = None,
 ) -> MaterializationBatch:
     """完成计算但不写库，返回可校验的 candidate batch。"""
 
-    return build_materialization_batch(
+    candidate = build_materialization_batch(
         build_audits(
             program_sources,
             batch_id=batch_id,
             observed_at=observed_at,
+            coverage=coverage,
+            count_program_totals=count_program_totals,
             progress_every=progress_every,
             progress_started_at=progress_started_at,
         ),
@@ -167,6 +187,9 @@ def build_candidate_batch(
         observed_at=observed_at,
         job_keys=job_keys,
     )
+    if coverage is not None and observe_materialized_edges:
+        coverage.observe_materialized_edges(candidate.edges)
+    return candidate
 
 
 def _fact_identity(value: LineageEdge | LineageIssue) -> ProgramIdentity | None:
@@ -243,23 +266,37 @@ def build_incremental_candidate_batch(
         SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]
     ]
     | None = None,
+    coverage: LineageCoverageAccumulator | None = None,
+    force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
 ) -> MaterializationBatch:
     """只重建 NEW/CHANGED，并把 candidate 合并成完整 snapshot。"""
 
     progress_every = _validate_progress_every(progress_every)
     sources = tuple(program_sources)
+    if coverage is not None:
+        coverage.observe_sources(sources)
 
     plan_started_at = time.perf_counter()
     _emit_log("incremental_plan", "STARTED")
     try:
         previous_states = store.read_program_states(active_only=True)
-        plan = plan_incremental(
+        base_plan = plan_incremental(
             sources,
             previous_states,
             complete_snapshot=complete_snapshot,
             snapshot_scopes=snapshot_scopes,
         )
+        if force_rebuild:
+            plan = IncrementalPlan(
+                new=base_plan.new,
+                changed=(*base_plan.changed, *base_plan.unchanged),
+                deleted=base_plan.deleted,
+                complete_snapshot=base_plan.complete_snapshot,
+                snapshot_scopes=base_plan.snapshot_scopes,
+            )
+        else:
+            plan = base_plan
     except Exception as error:
         _emit_log(
             "incremental_plan",
@@ -268,6 +305,7 @@ def build_incremental_candidate_batch(
             elapsed_ms=_elapsed_ms(plan_started_at),
         )
         raise
+
     rebuild_sources = plan.rebuild
     _emit_log(
         "incremental_plan",
@@ -291,6 +329,9 @@ def build_incremental_candidate_batch(
             batch_id=batch_id,
             observed_at=observed_at,
             job_keys=job_keys,
+            coverage=coverage,
+            count_program_totals=False,
+            observe_materialized_edges=False,
             progress_every=progress_every,
             progress_started_at=build_started_at,
         )
@@ -383,6 +424,8 @@ def build_incremental_candidate_batch(
         issues=len(candidate.issues),
         elapsed_ms=_elapsed_ms(build_started_at),
     )
+    if coverage is not None:
+        coverage.observe_materialized_edges(candidate.edges)
     return candidate
 
 
@@ -399,6 +442,8 @@ def materialize_sources(
         SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]
     ]
     | None = None,
+    coverage: LineageCoverageAccumulator | None = None,
+    force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
 ) -> PublishResult:
     """增量计算完整 candidate，再交给 SQLite adapter 做 atomic publish。
@@ -441,6 +486,8 @@ def materialize_sources(
         job_keys=job_keys,
         complete_snapshot=complete_snapshot,
         snapshot_scopes=snapshot_scopes,
+        coverage=coverage,
+        force_rebuild=force_rebuild,
         progress_every=progress_every,
     )
 
@@ -505,6 +552,51 @@ def load_default_providers(
     return tuple(MySQLProcessProvider(profile) for profile in profiles)
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build lineage facts and emit a sanitized parser coverage report."
+        )
+    )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=MATERIALIZATION_DB_PATH,
+        help="local SQLite materialization path",
+    )
+    parser.add_argument(
+        "--coverage-report",
+        type=Path,
+        default=COVERAGE_REPORT_PATH,
+        help="sanitized JSON report under artifacts/lineage_coverage/",
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help=(
+            "reparse every current ProgramSource instead of relying on source hashes; "
+            "use for a controlled coverage replay"
+        ),
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=DEFAULT_PROGRESS_EVERY,
+        help="emit build progress every N rebuilt programs",
+    )
+    return parser
+
+
+def cli(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return main(
+        db_path=args.db_path,
+        coverage_report_path=args.coverage_report,
+        force_rebuild=args.force_rebuild,
+        progress_every=args.progress_every,
+    )
+
+
 def main(
     providers: Iterable[ProgramSourceProvider] | None = None,
     *,
@@ -517,12 +609,15 @@ def main(
         SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]
     ]
     | None = None,
+    coverage_report_path: str | Path | None = COVERAGE_REPORT_PATH,
+    force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
 ) -> int:
     """定时任务边界；异常向外传播并由进程返回 non-zero。"""
 
     progress_every = _validate_progress_every(progress_every)
     job_started_at = time.perf_counter()
+    coverage = LineageCoverageAccumulator()
     try:
         active_providers = (
             tuple(providers) if providers is not None else load_default_providers()
@@ -533,7 +628,7 @@ def main(
             if snapshot_scopes is not None
             else _provider_snapshot_scopes(active_providers)
         )
-        materialize_sources(
+        result = materialize_sources(
             iter_program_sources(active_providers),
             db_path=db_path,
             batch_id=batch_id,
@@ -541,6 +636,8 @@ def main(
             job_keys=job_keys,
             complete_snapshot=complete_snapshot,
             snapshot_scopes=resolved_scopes or None,
+            coverage=coverage,
+            force_rebuild=force_rebuild,
             progress_every=progress_every,
         )
     except Exception as error:
@@ -551,12 +648,28 @@ def main(
             elapsed_ms=_elapsed_ms(job_started_at),
         )
         raise
-    _emit_log("job", "SUCCESS", elapsed_ms=_elapsed_ms(job_started_at))
+
+    coverage_report = coverage.report()
+    if coverage_report_path is not None:
+        try:
+            write_coverage_json_report(coverage_report, coverage_report_path)
+        except (OSError, ValueError):
+            _emit_log("coverage", "FAILED", reason="REPORT_WRITE_FAILED")
+    for coverage_line in coverage_report.log_lines():
+        print(coverage_line, flush=True)
+    _emit_log(
+        "job",
+        "SUCCESS",
+        batch_id=_safe_batch_id(result.batch_id),
+        edges=result.edge_count,
+        issues=result.issue_count,
+        elapsed_ms=_elapsed_ms(job_started_at),
+    )
     return 0
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(cli())
     except Exception:
         raise SystemExit(1) from None

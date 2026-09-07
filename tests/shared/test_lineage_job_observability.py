@@ -39,6 +39,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
                 db_path=Path(directory) / "lineage.db",
                 batch_id="batch-observability-1",
                 observed_at=OBSERVED_AT,
+                coverage_report_path=None,
             )
 
         self.assertEqual(result, 0)
@@ -57,6 +58,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
             "stage=publish status=SUCCESS batch_id=batch-observability-1",
             output,
         )
+        self.assertIn("stage=coverage environment=DEV source_profile=fixture", output)
         self.assertIn("stage=job status=SUCCESS", output)
 
     def test_source_load_failure_logs_safe_classification(self):
@@ -124,6 +126,37 @@ class LineageJobObservabilityTests(unittest.TestCase):
         self.assertIn("stage=build status=SUCCESS processed=5", output)
         self.assertNotIn("PROGRAM_DEMO_PROGRESS_", output)
 
+    def test_force_rebuild_reparses_an_unchanged_program(self):
+        program_source = source("PROGRAM_DEMO_FORCE_REBUILD")
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "lineage.db"
+            run_with_output(
+                imp_lineage_edge.main,
+                [FixtureProvider([program_source])],
+                db_path=db_path,
+                batch_id="batch-force-1",
+                observed_at=OBSERVED_AT,
+                coverage_report_path=None,
+            )
+            with patch(
+                "jobs.crontab.imp_lineage_edge.build_program_physical_dag",
+                wraps=imp_lineage_edge.build_program_physical_dag,
+            ) as builder:
+                result, output = run_with_output(
+                    imp_lineage_edge.main,
+                    [FixtureProvider([program_source])],
+                    db_path=db_path,
+                    batch_id="batch-force-2",
+                    observed_at=OBSERVED_AT.replace(day=2),
+                    coverage_report_path=None,
+                    force_rebuild=True,
+                )
+
+        self.assertEqual(result, 0)
+        builder.assert_called_once()
+        self.assertIn("unchanged=0", output)
+        self.assertIn("rebuild=1", output)
+
     def test_second_run_reports_unchanged_and_zero_rebuild_workload(self):
         sources = [source(f"PROGRAM_DEMO_UNCHANGED_{index}") for index in range(3)]
         with TemporaryDirectory() as directory:
@@ -134,6 +167,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
                 db_path=db_path,
                 batch_id="batch-unchanged-1",
                 observed_at=OBSERVED_AT,
+                coverage_report_path=None,
             )
             _, output = run_with_output(
                 imp_lineage_edge.main,
@@ -141,6 +175,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
                 db_path=db_path,
                 batch_id="batch-unchanged-2",
                 observed_at=OBSERVED_AT.replace(day=2),
+                coverage_report_path=None,
             )
 
         self.assertIn(
@@ -173,6 +208,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
                     db_path=Path(directory) / "lineage.db",
                     batch_id="batch-failure-1",
                     observed_at=OBSERVED_AT,
+                    coverage_report_path=None,
                 )
 
         logs = output.getvalue()
@@ -205,6 +241,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
                     db_path=Path(directory) / "lineage.db",
                     batch_id="batch-publish-failure",
                     observed_at=OBSERVED_AT,
+                    coverage_report_path=None,
                 )
 
         logs = output.getvalue()

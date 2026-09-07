@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from typing import cast
 
 from shared.lineage.domain import PhysicalNodeKind, ProgramSource
 from shared.lineage.lineage_builder import normalize_table_name
 from shared.lineage.physical_dag import (  # pyright: ignore[reportMissingImports]
+    SQLExtractionReason,
     build_program_physical_dag,
     extract_sql_steps,
 )
@@ -316,10 +318,11 @@ class PhysicalDAGTests(unittest.TestCase):
             {normalize_table_name("DWM.DEMO_A"), normalize_table_name("DWM.DEMO_B")},
         )
         self.assertEqual(len(dag.edges), 1)
-        evidence = dag.edges[0].evidence
+        evidence = cast(dict[str, object], dag.edges[0].evidence)
         self.assertIsInstance(evidence, dict)
         self.assertEqual(evidence["statement_indices"], [0, 1, 2])
-        self.assertEqual(len(evidence["occurrences"]), 3)
+        occurrences = cast(list[object], evidence["occurrences"])
+        self.assertEqual(len(occurrences), 3)
 
     def test_unqualified_asset_names_are_supported_without_alias_nodes(self):
         dag = build_program_physical_dag(
@@ -369,6 +372,70 @@ class PhysicalDAGTests(unittest.TestCase):
             PhysicalNodeKind.TEMPORARY_ASSET,
         )
 
+    def test_profiled_db_wrappers_and_fixture_return_are_supported(self):
+        fixture_path = (
+            ROOT_DIR
+            / "tests"
+            / "fixtures"
+            / "demo_workspace"
+            / "WORKSPACE"
+            / "DWM"
+            / "DWM.M_DEMO_ACCT"
+            / "demo_job.py"
+        )
+        fixture_dag = build_program_physical_dag(
+            program(fixture_path.read_text(encoding="utf-8"))
+        )
+        wrapper_dag = build_program_physical_dag(
+            program(
+                """
+                from shared.db.gaussdb import fetch_all, run_sql_with_profile
+                fetch_all("demo", "SELECT * FROM ODS.DEMO_A")
+                run_sql_with_profile("demo", "INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_A")
+                """
+            )
+        )
+        legacy_wrapper_dag = build_program_physical_dag(
+            program(
+                """
+                select_sql("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_A")
+                select_mysql_sql("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_A")
+                """
+            )
+        )
+
+        self.assertEqual(fixture_dag.sql_candidate_count, 1)
+        self.assertEqual(
+            fixture_dag.sql_extraction_reason,
+            SQLExtractionReason.CANDIDATE_FOUND.value,
+        )
+        self.assertEqual(len(fixture_dag.steps), 2)
+        self.assertEqual(wrapper_dag.sql_candidate_count, 2)
+        self.assertEqual(len(wrapper_dag.steps), 2)
+        self.assertEqual(legacy_wrapper_dag.sql_candidate_count, 2)
+        self.assertEqual(
+            edge_pairs(legacy_wrapper_dag),
+            {("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT"))},
+        )
+        self.assertEqual(
+            edge_pairs(wrapper_dag),
+            {("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT"))},
+        )
+
+    def test_unknown_wrapper_is_reported_without_guessing(self):
+        dag = build_program_physical_dag(
+            program(
+                'execute_with_retry("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_A")'
+            )
+        )
+
+        self.assertEqual(dag.steps, ())
+        self.assertEqual(dag.edges, ())
+        self.assertEqual(
+            dag.sql_extraction_reason,
+            SQLExtractionReason.SQL_CALL_NOT_RECOGNIZED.value,
+        )
+
     def test_dynamic_sql_without_static_values_is_not_guessed(self):
         dag = build_program_physical_dag(
             program(
@@ -383,6 +450,10 @@ class PhysicalDAGTests(unittest.TestCase):
         self.assertEqual(dag.steps, ())
         self.assertEqual(dag.nodes, ())
         self.assertEqual(dag.edges, ())
+        self.assertEqual(
+            dag.sql_extraction_reason,
+            SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value,
+        )
 
     def test_static_f_string_values_can_be_resolved(self):
         dag = build_program_physical_dag(

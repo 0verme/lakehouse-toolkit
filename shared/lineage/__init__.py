@@ -9,6 +9,15 @@ from .audit import (  # pyright: ignore[reportMissingImports]
     compute_lineage_issue_stable_key,
     issue_severity,
 )
+from .coverage import (  # pyright: ignore[reportMissingImports]
+    CoverageReason,
+    DEFAULT_COVERAGE_REPORT_PATH,
+    LineageCoverageAccumulator,
+    LineageCoverageReport,
+    ProfileCoverage,
+    primary_failure_reason,
+    write_json_report as write_coverage_json_report,
+)
 from .domain import (
     DEFAULT_TEMPORARY_ASSET_RULES,
     IssueType,
@@ -67,6 +76,7 @@ from .physical_dag import (  # pyright: ignore[reportMissingImports]
     ProgramPhysicalDAG,
     ProgramPhysicalDAGBuilder,
     ProgramSQLStep,
+    SQLExtractionReason,
     SQLStep,
     build_physical_dag,
     build_program_physical_dag,
@@ -91,6 +101,13 @@ from .query import (  # pyright: ignore[reportMissingImports]
 
 __all__ = [
     "AuditResult",
+    "CoverageReason",
+    "DEFAULT_COVERAGE_REPORT_PATH",
+    "LineageCoverageAccumulator",
+    "LineageCoverageReport",
+    "ProfileCoverage",
+    "primary_failure_reason",
+    "write_coverage_json_report",
     "DEFAULT_TEMPORARY_ASSET_RULES",
     "ISSUE_SEVERITY_POLICY",
     "IssueType",
@@ -105,6 +122,7 @@ __all__ = [
     "ProgramPhysicalDAG",
     "ProgramPhysicalDAGBuilder",
     "ProgramSQLStep",
+    "SQLExtractionReason",
     "ProgramSource",
     "ProgramState",
     "SQLStep",
