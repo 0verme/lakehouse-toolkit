@@ -63,3 +63,19 @@ mysql_process_profiles:
 production:
   environment: PROD
   source_profile: production_metadata
+
+# Local SVN working-copy inventory；真实 root_path 只写入
+# configs/lineage_providers.local.yaml，不提交真实内网 SVN 路径。
+# root_path 是当前机器可访问的本地 working copy 根目录，不是 svn:// 或 HTTP SVN URL。
+# processing 与 dwf 可以共享同一个 root；layout 决定扫描规则。
+# Windows / Linux 只需按运行 verify_svn_sources 的机器修改 root_path。
+svn_profiles:
+  - name: prod_svn_processing
+    environment: PROD
+    root_path: "E:/demo/svn/production"
+    layout: processing
+
+  - name: prod_svn_dwf
+    environment: PROD
+    root_path: "E:/demo/svn/production"
+    layout: dwf

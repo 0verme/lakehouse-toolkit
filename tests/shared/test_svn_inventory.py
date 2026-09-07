@@ -8,7 +8,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml  # pyright: ignore[reportMissingModuleSource]
+
 from shared.lineage import svn_inventory
+from shared.lineage.providers import load_mysql_process_profiles
 from shared.lineage.svn_inventory import (
     DECODE_ERROR,
     DWF_LAYOUT,
@@ -33,9 +36,10 @@ from shared.lineage.svn_inventory import (
 )
 from tools.lineage import verify_svn_sources
 
-FIXTURE_ROOT = (
-    Path(__file__).resolve().parents[1] / "fixtures" / "svn_inventory" / "production"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_ROOT = PROJECT_ROOT / "tests" / "fixtures" / "svn_inventory" / "production"
+MAIN_EXAMPLE_CONFIG = PROJECT_ROOT / "configs" / "lineage_providers.example.yaml"
+SPECIALIZED_EXAMPLE_CONFIG = PROJECT_ROOT / "configs" / "svn_inventory.example.yaml"
 
 
 class SVNInventoryPathTests(unittest.TestCase):
@@ -124,7 +128,7 @@ class SVNInventoryPathTests(unittest.TestCase):
         self.assertEqual(unsupported_result.unresolved_reason, UNSUPPORTED_LAYER)
         self.assertEqual(
             classify_svn_program_path(
-                "/tmp/not-a-python.txt", PROCESSING_LAYOUT
+                "demo/not-a-python.txt", PROCESSING_LAYOUT
             ).unresolved_reason,
             svn_inventory.NOT_PYTHON,
         )
@@ -308,6 +312,42 @@ svn_profiles:
         )
         self.assertEqual(profiles[0].layout, PROCESSING_LAYOUT)
         self.assertEqual(profiles[1].layout, DWF_LAYOUT)
+
+    def test_main_example_is_complete_for_mysql_and_svn_loaders(self):
+        with MAIN_EXAMPLE_CONFIG.open(encoding="utf-8") as stream:
+            raw_config = yaml.safe_load(stream)
+
+        mysql_profiles = load_mysql_process_profiles(MAIN_EXAMPLE_CONFIG)
+        svn_profiles = load_svn_profiles(MAIN_EXAMPLE_CONFIG)
+
+        self.assertIn("mysql_process_profiles", raw_config)
+        self.assertIn("production", raw_config)
+        self.assertIn("svn_profiles", raw_config)
+        self.assertEqual(len(mysql_profiles), 3)
+        self.assertEqual(
+            raw_config["production"],
+            {
+                "environment": "PROD",
+                "source_profile": "production_metadata",
+            },
+        )
+        self.assertEqual(
+            [profile.layout for profile in svn_profiles],
+            [PROCESSING_LAYOUT, DWF_LAYOUT],
+        )
+        self.assertEqual(
+            {profile.root_path.as_posix() for profile in svn_profiles},
+            {"E:/demo/svn/production"},
+        )
+
+    def test_specialized_example_is_optional_and_matches_main_svn_profiles(self):
+        main_profiles = load_svn_profiles(MAIN_EXAMPLE_CONFIG)
+        specialized_profiles = load_svn_profiles(SPECIALIZED_EXAMPLE_CONFIG)
+
+        self.assertEqual(
+            [(profile.layout, profile.root_path) for profile in specialized_profiles],
+            [(profile.layout, profile.root_path) for profile in main_profiles],
+        )
 
     def test_report_contains_no_path_filename_target_or_source(self):
         result = scan_svn_profile(self._profile(PROCESSING_LAYOUT))

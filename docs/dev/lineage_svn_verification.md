@@ -59,29 +59,35 @@ Python 程序，也不会写入 MySQL、SQLite、`lineage_edge` 或 materializat
 - `shared/lineage/svn_inventory.py`
 - `tools/lineage/verify_svn_sources.py`
 
-公开配置模板 `configs/svn_inventory.example.yaml` 只放虚构路径。内网执行前
-复制或合并为被忽略的 `configs/lineage_providers.local.yaml`，只填写本机路径：
+完整主配置模板 `configs/lineage_providers.example.yaml` 已包含虚构的
+`svn_profiles`。内网执行时直接复制为被忽略的
+`configs/lineage_providers.local.yaml`，然后修改 MySQL connection 和
+`svn_profiles.root_path`，无需从两个 example 手工拼接：
 
 ```yaml
+production:
+  environment: PROD
+  source_profile: production_metadata
+
 svn_profiles:
   - name: prod_svn_processing
     environment: PROD
-    root_path: "E:/svn/xxx"
+    root_path: "E:/demo/svn/production"
     layout: processing
   - name: prod_svn_dwf
     environment: PROD
-    root_path: "E:/svn/xxx"
+    root_path: "E:/demo/svn/production"
     layout: dwf
 ```
 
-同一 working copy 根目录可以被两个 profile 复用。Linux 示例：
+processing 与 dwf 可以复用同一个 working copy 根目录。`root_path` 必须是当前
+运行 verifier 的机器可访问的本地目录，不是 `svn://` 或 HTTP SVN URL。Windows
+按实际情况填写类似 `E:/svn/production`；Linux 填写类似
+`/data/svn/production`。代码使用 `pathlib`，纯路径 parser 同时接受 Windows 和
+Linux 形式。
 
-```yaml
-root_path: "/home/pytool/pytool/svn/hcyttrunk"
-```
-
-代码使用 `pathlib`，实际扫描按当前操作系统文件系统执行；纯路径 parser 同时
-接受 Windows 和 Linux 形式。
+`configs/svn_inventory.example.yaml` 保留为 SVN 专项最小示例，便于单独查看
+`svn_profiles` 字段，但不是配置 local.yaml 的必需步骤。
 
 ## SVN layouts
 
