@@ -1,0 +1,1 @@
+# Ignored SVN administrative directory.
