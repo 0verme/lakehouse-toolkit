@@ -11,6 +11,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from string import Formatter
 from textwrap import dedent
 
 from shared.lineage.domain import (
@@ -112,6 +113,8 @@ _SQL_CALL_NAMES = {
     "query",
     "read_sql",
     "read_sql_query",
+    "do",
+    "run",
     "run_query",
     "run_sql",
     "run_sql_with_profile",
@@ -340,6 +343,9 @@ def _latest_binding(
 
 
 _UNRESOLVED = object()
+_FORMATTER = Formatter()
+_FORMAT_FIELD_ROOT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_FORMAT_TYPES = (str, int, float, bool, type(None))
 
 
 def _static_value(
@@ -349,7 +355,7 @@ def _static_value(
     resolving: set[tuple[str, int, int]],
 ) -> object:
     if isinstance(expression, ast.Constant):
-        if isinstance(expression.value, (str, int, float, bool)):
+        if expression.value is None or type(expression.value) in _SAFE_FORMAT_TYPES:
             return expression.value
         return _UNRESOLVED
 
@@ -390,7 +396,7 @@ def _static_value(
                 resolving,
             )
         finally:
-            resolving.remove(binding_key)
+            resolving.discard(binding_key)
 
     if isinstance(expression, ast.Call):
         function = expression.func
@@ -399,10 +405,117 @@ def _static_value(
             function_name = function.id
         elif isinstance(function, ast.Attribute):
             function_name = function.attr
+            if function_name.lower() == "format":
+                template = _static_value(
+                    function.value,
+                    position,
+                    bindings,
+                    resolving,
+                )
+                if isinstance(template, str):
+                    return _format_static_string(
+                        template,
+                        expression,
+                        position,
+                        bindings,
+                        resolving,
+                    )
+                return _UNRESOLVED
         if function_name.lower() in {"sql", "text"} and expression.args:
             return _static_value(expression.args[0], position, bindings, resolving)
 
     return _UNRESOLVED
+
+
+def _format_placeholder(field_name: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9_$#]+", "_", field_name).strip("_")
+    return f"<SQL_DYNAMIC_{safe_name or 'VALUE'}>"
+
+
+def _safe_format_value(
+    value: object,
+    conversion: str | None,
+    format_spec: str | None,
+) -> str | None:
+    """只对内建 scalar 做 format，绝不触发用户对象的 magic method。"""
+
+    if type(value) not in _SAFE_FORMAT_TYPES:
+        return None
+    format_spec = format_spec or ""
+    if "{" in format_spec or "}" in format_spec:
+        return None
+    try:
+        if conversion == "r":
+            value = repr(value)
+        elif conversion == "s":
+            value = str(value)
+        elif conversion == "a":
+            value = ascii(value)
+        elif conversion is not None:
+            return None
+        return format(value, format_spec)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_static_string(
+    template: str,
+    call: ast.Call,
+    position: tuple[int, int],
+    bindings: Mapping[str, list[_PythonBinding]],
+    resolving: set[tuple[str, int, int]],
+) -> str | object:
+    """恢复 ``str.format`` 的 SQL 文本，不执行被分析代码。"""
+
+    positional_values: list[object] = []
+    for argument in call.args:
+        if isinstance(argument, ast.Starred):
+            positional_values.append(_UNRESOLVED)
+        else:
+            positional_values.append(
+                _static_value(argument, position, bindings, resolving)
+            )
+
+    keyword_values: dict[str, object] = {}
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            continue
+        keyword_values[keyword.arg] = _static_value(
+            keyword.value,
+            position,
+            bindings,
+            resolving,
+        )
+
+    try:
+        parsed_fields = _FORMATTER.parse(template)
+    except (TypeError, ValueError):
+        return _UNRESOLVED
+
+    parts: list[str] = []
+    automatic_index = 0
+    for literal, field_name, format_spec, conversion in parsed_fields:
+        parts.append(literal)
+        if field_name is None:
+            continue
+
+        value: object = _UNRESOLVED
+        if field_name == "":
+            if automatic_index < len(positional_values):
+                value = positional_values[automatic_index]
+            automatic_index += 1
+        elif field_name.isdecimal():
+            index = int(field_name)
+            if index < len(positional_values):
+                value = positional_values[index]
+        elif _FORMAT_FIELD_ROOT_RE.fullmatch(field_name):
+            value = keyword_values.get(field_name, _UNRESOLVED)
+
+        rendered = _safe_format_value(value, conversion, format_spec)
+        parts.append(
+            rendered if rendered is not None else _format_placeholder(field_name)
+        )
+    return "".join(parts)
 
 
 def _resolve_static_text(
@@ -492,16 +605,20 @@ def _extract_python_candidates_with_reason(
             resolved_candidate = False
             unresolved = False
             for expression in expressions:
-                text = _resolve_static_text(
+                value = _static_value(
                     expression,
                     (line_number, column_number),
                     bindings,
+                    set(),
                 )
-                if text is None:
+                if value is _UNRESOLVED:
                     unresolved = True
                     continue
-                if _looks_like_sql(text):
-                    candidates.append(_SQLCandidate(text, line_number, column_number))
+                if not isinstance(value, str) or not value.strip():
+                    non_sql_argument = True
+                    continue
+                if _looks_like_sql(value):
+                    candidates.append(_SQLCandidate(value, line_number, column_number))
                     resolved_candidate = True
                     break
                 non_sql_argument = True
@@ -532,17 +649,21 @@ def _extract_python_candidates_with_reason(
                 return_not_sql = True
             else:
                 line_number, column_number = _node_position(node)
-                text = _resolve_static_text(
+                value = _static_value(
                     node.value,
                     (line_number, column_number),
                     bindings,
+                    set(),
                 )
-                if text is None:
+                if value is _UNRESOLVED:
                     return_dynamic = True
-                elif _looks_like_sql(text):
-                    return_candidates.append(
-                        _SQLCandidate(text, line_number, column_number)
-                    )
+                elif isinstance(value, str) and value.strip():
+                    if _looks_like_sql(value):
+                        return_candidates.append(
+                            _SQLCandidate(value, line_number, column_number)
+                        )
+                    else:
+                        return_not_sql = True
                 else:
                     return_not_sql = True
         elif return_nodes:
@@ -555,16 +676,16 @@ def _extract_python_candidates_with_reason(
         reason = SQLExtractionReason.CANDIDATE_FOUND
     elif unrecognized_sql_call:
         reason = SQLExtractionReason.SQL_CALL_NOT_RECOGNIZED
-    elif return_dynamic:
-        reason = SQLExtractionReason.SQL_RETURN_DYNAMIC
-    elif return_not_sql:
-        reason = SQLExtractionReason.SQL_RETURN_NOT_SQL
     elif dynamic_argument:
         reason = SQLExtractionReason.SQL_ARGUMENT_DYNAMIC
     elif missing_argument:
         reason = SQLExtractionReason.SQL_ARGUMENT_MISSING
     elif non_sql_argument:
         reason = SQLExtractionReason.SQL_ARGUMENT_NOT_SQL
+    elif return_dynamic:
+        reason = SQLExtractionReason.SQL_RETURN_DYNAMIC
+    elif return_not_sql:
+        reason = SQLExtractionReason.SQL_RETURN_NOT_SQL
     else:
         reason = SQLExtractionReason.NO_SQL_CANDIDATE
     return _PythonCandidateExtraction(tuple(candidates), reason)

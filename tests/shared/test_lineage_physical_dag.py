@@ -422,6 +422,142 @@ class PhysicalDAGTests(unittest.TestCase):
             {("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT"))},
         )
 
+    def test_internal_do_run_wrappers_require_sql_like_static_text(self):
+        dag = build_program_physical_dag(
+            program(
+                """
+                executor.do("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_A")
+                executor.run("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_B")
+                do("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_C")
+                run("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_D")
+                """
+            )
+        )
+
+        self.assertEqual(dag.sql_candidate_count, 4)
+        self.assertEqual(len(dag.steps), 4)
+        self.assertEqual(
+            edge_pairs(dag),
+            {
+                ("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT")),
+                ("ODS.DEMO_B", normalize_table_name("DWA.DEMO_RESULT")),
+                ("ODS.DEMO_C", normalize_table_name("DWA.DEMO_RESULT")),
+                ("ODS.DEMO_D", normalize_table_name("DWA.DEMO_RESULT")),
+            },
+        )
+
+        non_sql_dag = build_program_physical_dag(
+            program(
+                """
+                executor.do("refresh cache")
+                run(0)
+                """,
+                expected_target=None,
+            )
+        )
+        self.assertEqual(non_sql_dag.sql_candidate_count, 0)
+        self.assertEqual(non_sql_dag.steps, ())
+        self.assertEqual(non_sql_dag.edges, ())
+        self.assertEqual(
+            non_sql_dag.sql_extraction_reason,
+            SQLExtractionReason.SQL_ARGUMENT_NOT_SQL.value,
+        )
+
+        dynamic_dag = build_program_physical_dag(
+            program(
+                """
+                executor.do(runtime_sql)
+                """,
+                expected_target=None,
+            )
+        )
+        self.assertEqual(dynamic_dag.sql_candidate_count, 0)
+        self.assertEqual(dynamic_dag.sql_extraction_reason, SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value)
+
+    def test_format_keeps_static_sql_structure_when_values_are_dynamic(self):
+        fixture_path = (
+            ROOT_DIR
+            / "tests"
+            / "fixtures"
+            / "lineage"
+            / "python_sql_executor_wrappers.py"
+        )
+        dag = build_program_physical_dag(
+            program(fixture_path.read_text(encoding="utf-8"), expected_target=None)
+        )
+
+        self.assertEqual(dag.sql_candidate_count, 2)
+        self.assertEqual(len(dag.steps), 2)
+        self.assertEqual(
+            dag.sql_extraction_reason,
+            SQLExtractionReason.CANDIDATE_FOUND.value,
+        )
+        self.assertIn(normalize_table_name("DWD.D_GJFK_ALGJ"), node_names(dag))
+        self.assertIn(normalize_table_name("ODS.SOURCE_A"), node_names(dag))
+        self.assertEqual(
+            edge_pairs(dag),
+            {
+                (
+                    normalize_table_name("ODS.SOURCE_A"),
+                    normalize_table_name("DWD.D_GJFK_ALGJ"),
+                )
+            },
+        )
+        self.assertEqual(len(dag.edges), 1)
+
+        static_dag = build_program_physical_dag(
+            program(
+                '''
+                do("""
+                INSERT INTO DWA.DEMO_RESULT
+                SELECT * FROM ODS.DEMO_A
+                WHERE dt = '{DATE}'
+                """.format(DATE="20240101"))
+                ''',
+                expected_target=None,
+            )
+        )
+        self.assertEqual(static_dag.sql_candidate_count, 1)
+        self.assertEqual(
+            edge_pairs(static_dag),
+            {("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT"))},
+        )
+
+    def test_non_string_returns_are_not_reported_as_dynamic(self):
+        for return_value in ("0", "1", "None"):
+            with self.subTest(return_value=return_value):
+                dag = build_program_physical_dag(
+                    program(
+                        f"""
+                        def main():
+                            return {return_value}
+                        """,
+                        expected_target=None,
+                    )
+                )
+
+                self.assertEqual(dag.sql_candidate_count, 0)
+                self.assertEqual(dag.steps, ())
+                self.assertEqual(
+                    dag.sql_extraction_reason,
+                    SQLExtractionReason.SQL_RETURN_NOT_SQL.value,
+                )
+
+        failure_dag = build_program_physical_dag(
+            program(
+                """
+                def main():
+                    execute(dynamic_sql)
+                    return 0
+                """,
+                expected_target=None,
+            )
+        )
+        self.assertEqual(
+            failure_dag.sql_extraction_reason,
+            SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value,
+        )
+
     def test_unknown_wrapper_is_reported_without_guessing(self):
         dag = build_program_physical_dag(
             program(
