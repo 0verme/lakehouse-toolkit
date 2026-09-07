@@ -40,6 +40,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_MATERIALIZATION_DB_PATH = (
     ROOT_DIR / "runtime" / "sqlite" / "lineage_materialization.db"
 )
+CURRENT_SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS lineage_batch (
@@ -143,6 +144,7 @@ CREATE TABLE IF NOT EXISTS lineage_program_state (
     source_profile TEXT NOT NULL,
     program_name TEXT NOT NULL,
     source_hash TEXT,
+    pipeline_version TEXT,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     last_changed_at TEXT,
@@ -189,8 +191,8 @@ ISSUE_ORDER_SQL = (
 )
 PROGRAM_STATE_SELECT_SQL = (
     "SELECT environment, source_profile, program_name, source_hash, "
-    "first_seen_at, last_seen_at, last_changed_at, batch_id, is_active "
-    "FROM lineage_program_state"
+    "pipeline_version, first_seen_at, last_seen_at, last_changed_at, "
+    "batch_id, is_active FROM lineage_program_state"
 )
 PROGRAM_STATE_ORDER_SQL = " ORDER BY environment, source_profile, program_name, id"
 ACTIVE_ISSUE_SELECT_SQL = """
@@ -254,6 +256,28 @@ class PublishResult:
     program_count: int = 0
 
 
+def _migrate_schema(connection: sqlite3.Connection) -> None:
+    """将旧 reference schema 升级到当前版本且不改写历史 facts。"""
+
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(lineage_program_state)"
+        ).fetchall()
+    }
+    if columns and "pipeline_version" not in columns:
+        connection.execute(
+            "ALTER TABLE lineage_program_state ADD COLUMN pipeline_version TEXT"
+        )
+
+    version_row = connection.execute("PRAGMA user_version").fetchone()
+    current_version = 0 if version_row is None else int(version_row[0])
+    if current_version < CURRENT_SCHEMA_VERSION:
+        # The version is a fixed source-code migration constant, never user input.
+        # pi-lens-ignore: python-sql-injection
+        connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
+
 def _datetime_text(value: datetime) -> str:
     if not isinstance(value, datetime):
         raise TypeError("timestamp must be a datetime")
@@ -298,11 +322,12 @@ def _program_state_from_row(row: Any) -> ProgramState:
         source_profile=str(row[1]),
         program_name=str(row[2]),
         source_hash=row[3],
-        first_seen_at=_parse_datetime(str(row[4])),
-        last_seen_at=_parse_datetime(str(row[5])),
-        last_changed_at=(None if row[6] is None else _parse_datetime(str(row[6]))),
-        batch_id=str(row[7]),
-        is_active=bool(row[8]),
+        pipeline_version=row[4],
+        first_seen_at=_parse_datetime(str(row[5])),
+        last_seen_at=_parse_datetime(str(row[6])),
+        last_changed_at=(None if row[7] is None else _parse_datetime(str(row[7]))),
+        batch_id=str(row[8]),
+        is_active=bool(row[9]),
     )
 
 
@@ -438,6 +463,7 @@ def _program_state_row(
         state.source_profile,
         state.program_name,
         state.source_hash,
+        state.pipeline_version,
         _datetime_text(state.first_seen_at),
         _datetime_text(state.last_seen_at),
         None
@@ -500,6 +526,7 @@ class SQLiteMaterializationStore:
     def initialize_schema(self) -> None:
         with self._connection_scope() as connection:
             connection.executescript(SCHEMA_SQL)
+            _migrate_schema(connection)
             connection.commit()
 
     initialize = initialize_schema
@@ -639,8 +666,9 @@ class SQLiteMaterializationStore:
             """
             INSERT INTO lineage_program_state(
                 environment, source_profile, program_name, source_hash,
-                first_seen_at, last_seen_at, last_changed_at, batch_id, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                pipeline_version, first_seen_at, last_seen_at, last_changed_at,
+                batch_id, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [_program_state_row(state, batch) for state in batch.program_states],
         )
@@ -1014,6 +1042,7 @@ def publish_materialization_batch(
 
 
 __all__ = [
+    "CURRENT_SCHEMA_VERSION",
     "DEFAULT_MATERIALIZATION_DB_PATH",
     "MaterializationSQLiteStore",
     "PublishResult",

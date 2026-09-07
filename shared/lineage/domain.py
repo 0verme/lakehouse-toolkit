@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
+from .version import LINEAGE_PIPELINE_VERSION
+
 
 class PhysicalNodeKind(str, Enum):
     """资产在程序 Physical DAG 中的边界分类。"""
@@ -310,7 +312,11 @@ class ProgramSource:
 
 @dataclass(frozen=True, slots=True)
 class ProgramState:
-    """可持久化的当前程序状态；历史 batch 通过 ``batch_id`` 保留。"""
+    """可持久化的当前程序状态；历史 batch 通过 ``batch_id`` 保留。
+
+    ``pipeline_version=None`` 表示旧 schema 或旧手工 state 没有版本信息，
+    planner 必须将其保守地视为需要 rebuild。
+    """
 
     environment: str
     source_profile: str
@@ -321,6 +327,7 @@ class ProgramState:
     last_changed_at: datetime | None = None
     batch_id: str | None = None
     is_active: bool = True
+    pipeline_version: str | None = None
 
     def __post_init__(self) -> None:
         identity = ProgramIdentity(
@@ -335,6 +342,12 @@ class ProgramState:
             not isinstance(self.source_hash, str) or not self.source_hash.strip()
         ):
             raise ValueError("source_hash must be a non-empty string or None")
+        if self.pipeline_version is not None:
+            if not isinstance(self.pipeline_version, str) or not self.pipeline_version.strip():
+                raise ValueError(
+                    "pipeline_version must be a non-empty string or None"
+                )
+            object.__setattr__(self, "pipeline_version", self.pipeline_version.strip())
         for field_name in ("first_seen_at", "last_seen_at"):
             if not isinstance(getattr(self, field_name), datetime):
                 raise TypeError(f"{field_name} must be a datetime")
@@ -365,6 +378,7 @@ class ProgramState:
         batch_id: str | None = None,
         first_seen_at: datetime | None = None,
         last_changed_at: datetime | None = None,
+        pipeline_version: str | None = LINEAGE_PIPELINE_VERSION,
     ) -> ProgramState:
         if not isinstance(source, ProgramSource):
             raise TypeError("source must be a ProgramSource")
@@ -378,6 +392,7 @@ class ProgramState:
             last_changed_at=last_changed_at,
             batch_id=batch_id,
             is_active=True,
+            pipeline_version=pipeline_version,
         )
 
 

@@ -18,6 +18,7 @@ from .coverage import (  # pyright: ignore[reportMissingImports]
     primary_failure_reason,
     write_json_report as write_coverage_json_report,
 )
+from .version import LINEAGE_PIPELINE_VERSION
 from .domain import (
     DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
     DEFAULT_TEMPORARY_ASSET_RULES,
@@ -69,6 +70,7 @@ from .materialization import (  # pyright: ignore[reportMissingImports]
     new_batch_id,
 )
 from .materialization_sqlite import (  # pyright: ignore[reportMissingImports]
+    CURRENT_SCHEMA_VERSION,
     DEFAULT_MATERIALIZATION_DB_PATH,
     MaterializationSQLiteStore,
     PublishResult,
@@ -105,6 +107,7 @@ from .query import (  # pyright: ignore[reportMissingImports]
 
 __all__ = [
     "AuditResult",
+    "LINEAGE_PIPELINE_VERSION",
     "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
     "CoverageReason",
     "DEFAULT_COVERAGE_REPORT_PATH",
@@ -145,6 +148,7 @@ __all__ = [
     "compute_lineage_issue_stable_key",
     "extract_program_sql_steps",
     "extract_sql_steps",
+    "CURRENT_SCHEMA_VERSION",
     "DEFAULT_MATERIALIZATION_DB_PATH",
     "DEFAULT_QUERY_DEPTH",
     "DEFAULT_QUERY_MAX_NODES",

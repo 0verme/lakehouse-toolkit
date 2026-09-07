@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
+from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from jobs.crontab import imp_lineage_edge
-from shared.lineage import SQLiteMaterializationStore
+from shared.lineage import LINEAGE_PIPELINE_VERSION, SQLiteMaterializationStore
 from shared.lineage.domain import ProgramIdentity, ProgramSource, ProgramState
 from shared.lineage.incremental import (  # pyright: ignore[reportMissingImports]
     IncrementalStatus,
@@ -58,6 +61,81 @@ class IncrementalPlannerTests(unittest.TestCase):
             plan.status_for(ProgramIdentity("DEV", "fixture", "PROGRAM_DEMO_NEW")),
             IncrementalStatus.NEW,
         )
+
+    def test_same_hash_and_pipeline_version_is_unchanged(self):
+        current = source("PROGRAM_DEMO_VERSION_STABLE")
+        previous = (
+            ProgramState.from_source(
+                current,
+                observed_at=OBSERVED_AT,
+                batch_id="batch-old",
+            ),
+        )
+
+        plan = plan_incremental(
+            [current],
+            previous,
+            pipeline_version=LINEAGE_PIPELINE_VERSION,
+        )
+
+        self.assertEqual(plan.unchanged, (current,))
+        self.assertEqual(plan.changed, ())
+
+    def test_source_hash_change_is_changed(self):
+        previous_source = source("PROGRAM_DEMO_HASH_CHANGED")
+        current = source(
+            "PROGRAM_DEMO_HASH_CHANGED",
+            script_code=VALID_PROGRAM.replace("DEMO_A", "DEMO_B"),
+        )
+        previous = (
+            ProgramState.from_source(
+                previous_source,
+                observed_at=OBSERVED_AT,
+                batch_id="batch-old",
+            ),
+        )
+
+        plan = plan_incremental([current], previous)
+
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
+
+    def test_pipeline_version_change_is_changed(self):
+        current = source("PROGRAM_DEMO_VERSION_CHANGED")
+        previous = (
+            ProgramState.from_source(
+                current,
+                observed_at=OBSERVED_AT,
+                batch_id="batch-old",
+            ),
+        )
+
+        plan = plan_incremental(
+            [current],
+            previous,
+            pipeline_version="lineage-pipeline-v999",
+        )
+
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
+
+    def test_legacy_state_without_pipeline_version_is_rebuild_required(self):
+        current = source("PROGRAM_DEMO_LEGACY_STATE")
+        previous = (
+            replace(
+                ProgramState.from_source(
+                    current,
+                    observed_at=OBSERVED_AT,
+                    batch_id="batch-old",
+                ),
+                pipeline_version=None,
+            ),
+        )
+
+        plan = plan_incremental([current], previous)
+
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
 
     def test_missing_hash_is_conservatively_rebuild_required(self):
         old = source("PROGRAM_DEMO_HASH")
@@ -140,6 +218,42 @@ class IncrementalExecutionTests(unittest.TestCase):
                 {edge.program_name for edge in store.read_edges(active_only=True)},
                 {"PROGRAM_DEMO_SKIP"},
             )
+
+    def test_legacy_pipeline_state_is_rebuilt_after_schema_upgrade(self):
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "lineage.db"
+            program_source = source("PROGRAM_DEMO_LEGACY_DB")
+            imp_lineage_edge.materialize_sources(
+                [program_source],
+                db_path=db_path,
+                batch_id="batch-legacy-db-1",
+                observed_at=OBSERVED_AT,
+                complete_snapshot=True,
+            )
+            initial_state = SQLiteMaterializationStore(db_path).read_program_states(
+                active_only=True
+            )[0]
+            self.assertEqual(initial_state.pipeline_version, LINEAGE_PIPELINE_VERSION)
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    "UPDATE lineage_program_state "
+                    "SET pipeline_version = NULL WHERE is_active = 1"
+                )
+                connection.commit()
+
+            with patch(
+                "jobs.crontab.imp_lineage_edge.build_program_physical_dag",
+                wraps=imp_lineage_edge.build_program_physical_dag,
+            ) as builder:
+                imp_lineage_edge.materialize_sources(
+                    [program_source],
+                    db_path=db_path,
+                    batch_id="batch-legacy-db-2",
+                    observed_at=OBSERVED_AT.replace(day=2),
+                    complete_snapshot=True,
+                )
+
+        builder.assert_called_once()
 
     def test_mixed_complete_snapshot_reuses_unchanged_and_removes_deleted(self):
         with TemporaryDirectory() as directory:

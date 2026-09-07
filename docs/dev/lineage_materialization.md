@@ -156,8 +156,10 @@ separators=(",", ":"))` 形式保存，不使用 pickle、`repr()` 或 Python `h
 只能从业务行反推 active batch。它不是历史 diff 或 Query API。
 
 Phase 7 在同一 batch contract 下新增 `lineage_program_state`，保存程序 identity、
-`source_hash`、first/last seen、last changed 与 active 状态；旧 batch 的 edge、issue
-和 program state 都保留为 historical snapshot。
+`source_hash`、`pipeline_version`、first/last seen、last changed 与 active 状态；旧
+batch 的 edge、issue 和 program state 都保留为 historical snapshot。`pipeline_version`
+来自代码中明确维护的 `LINEAGE_PIPELINE_VERSION`，不是 Git commit SHA；只有 hash
+和 pipeline version 都相同才会跳过 parser/DAG/audit。
 
 ## Atomic Batch Publish
 
@@ -198,11 +200,15 @@ ProgramSource provider
 ### 定时任务可观测性
 
 定时任务复用了已合并的 progress logging PR #25（`ccb5e60`）的低基数脱敏日志约定，在
-`source_load`、`incremental_plan`、`build`、`publish` 和 `job` 边界输出已 flush 的阶段
-状态。build progress 默认每 500 个本轮 rebuild 程序输出一次；日志只包含 count、耗时、
-受限 batch ID 与异常 class，不输出 program name、源码、SQL、表名或 connection settings。
-coverage funnel 的聚合行以 `stage=coverage` 单独输出，详见
-[`lineage_coverage.md`](lineage_coverage.md)。
+`source_load`、`replay`、`incremental_plan`、`build`、`publish` 和 `job` 边界输出已
+flush 的阶段状态。build progress 默认每 500 个本轮 rebuild 程序输出一次；日志只包含
+count、耗时、受限 batch ID、受控 profile 和异常 class，不输出 program name、源码、
+SQL、表名或 connection settings。单程序总耗时超过默认 5 秒时，才输出带稳定短 hash
+的 `stage=build_program status=SLOW`，并分别给出
+`build_program_physical_dag_ms`、`audit_program_physical_dag_ms` 和
+`single_program_total_ms`。build SUCCESS 还汇总 `processed`、`slow_programs`、
+`max_program_elapsed_ms` 和 `avg_program_elapsed_ms`。coverage funnel 的聚合行以
+`stage=coverage` 单独输出，详见 [`lineage_coverage.md`](lineage_coverage.md)。
 
 直接运行：
 
@@ -211,22 +217,51 @@ python jobs/crontab/imp_lineage_edge.py
 ```
 
 本轮只 rebuild 100 个程序时，`build total` 也只会是 100；日志不会为每个
-`ProgramSource` 输出一条记录：
+`ProgramSource` 输出一条记录。默认运行与 controlled replay 的区别如下：
+
+- 不传 `--profile`、`--limit`：保持正常全 provider、complete snapshot 运行；
+- `--profile SOURCE_PROFILE`：只选定 source profile，默认按 partial snapshot 发布，
+  不会因未选 profile 触发 DELETE；
+- `--limit N`：收集选定来源后按 `ProgramIdentity` 排序取前 N 个，只让 sample 进入
+  parser/DAG/audit，并强制 partial snapshot，sample 外程序不会判定 `DELETED`；
+- `--force-rebuild`：只对本次 replay 选中的程序绕过 hash/version reuse，不代表应该
+  对全部生产程序直接执行。
+
+例如第一阶梯可运行：
+
+```bash
+python jobs/crontab/imp_lineage_edge.py \
+  --profile mysql_dev_a_data --limit 100 \
+  --force-rebuild --progress-every 10 --slow-threshold-ms 5000
+```
+
+推荐内网验证顺序为：`100 programs → 500 programs → one profile → all profiles`。
+当前已观测 38 个 rebuild 约耗时 17 分钟；因此不建议直接对约 2 万程序 force
+rebuild，也不要为了掩盖瓶颈而盲目并发。每一级先检查 active edge diff、issue、
+耗时和 `partial_snapshot`，再进入下一阶段。
+
+日志示例：
 
 ```text
-stage=job status=STARTED providers=4
-stage=source_load status=SUCCESS sources=20470 elapsed_ms=...
-stage=incremental_plan status=SUCCESS total=20470 new=20470 changed=0 unchanged=0 deleted=0 rebuild=20470 elapsed_ms=...
-stage=build status=STARTED total=20470
-stage=build status=RUNNING processed=500 total=20470 percent=2 elapsed_ms=...
-stage=build status=SUCCESS processed=20470 edges=... issues=... elapsed_ms=...
+stage=job status=STARTED providers=4 replay_mode=normal selected_profiles=- force_rebuild=False partial_snapshot=False
+stage=source_load status=SUCCESS sources=20493 elapsed_ms=...
+stage=replay status=SELECTED replay_mode=normal selected_profiles=- source_total=20493 replay_total=20493 limit=- force_rebuild=False partial_snapshot=False
+stage=incremental_plan status=SUCCESS total=20493 new=23 changed=15 unchanged=20455 deleted=0 rebuild=38 elapsed_ms=...
+stage=build status=STARTED total=38 slow_threshold_ms=5000
+stage=build status=RUNNING processed=10 total=38 percent=26 elapsed_ms=...
+stage=build_program status=SLOW program_id=<stable-short-hash> build_program_physical_dag_ms=... audit_program_physical_dag_ms=... single_program_total_ms=...
+stage=build status=SUCCESS processed=38 slow_programs=... max_program_elapsed_ms=... avg_program_elapsed_ms=... edges=... issues=... elapsed_ms=...
 stage=publish status=SUCCESS batch_id=batch-... edges=... issues=... previous=- elapsed_ms=...
 stage=job status=SUCCESS elapsed_ms=...
 ```
 
 `stage=job status=SUCCESS` 只会在 SQLite atomic publish 完成后出现。中途的 STARTED/RUNNING
 日志只表示计算进度，不表示 snapshot 已经发布；失败时会输出
-`status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。当前实现使用
+`status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。可用
+`build_program status=SLOW` 判断长尾属于 DAG build 还是 audit：前者的
+`build_program_physical_dag_ms` 高时检查 parser/DAG 提取，后者的
+`audit_program_physical_dag_ms` 高时检查 audit 遍历和 issue 判定；用
+`max_program_elapsed_ms`/`avg_program_elapsed_ms` 区分少数长尾与整体变慢。当前实现使用
 固定 count progress；如果未来需要在单个程序长时间运行期间提供 heartbeat，可单独增加时间阈值。
 
 ## 本阶段边界

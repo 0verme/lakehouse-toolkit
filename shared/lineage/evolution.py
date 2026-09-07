@@ -24,6 +24,7 @@ from .domain import (
     ProgramState,
 )
 from .lineage_builder import normalize_table_name
+from .version import LINEAGE_PIPELINE_VERSION
 
 
 class IncrementalStatus(str, Enum):
@@ -79,6 +80,7 @@ class IncrementalPlan:
     deleted: tuple[ProgramState, ...] = ()
     complete_snapshot: bool = False
     snapshot_scopes: tuple[SnapshotScope, ...] = ()
+    pipeline_version: str = LINEAGE_PIPELINE_VERSION
 
     def __post_init__(self) -> None:
         for field_name in ("new", "unchanged", "changed"):
@@ -108,6 +110,12 @@ class IncrementalPlan:
         )
         if not isinstance(self.complete_snapshot, bool):
             raise TypeError("complete_snapshot must be a boolean")
+        if (
+            not isinstance(self.pipeline_version, str)
+            or not self.pipeline_version.strip()
+        ):
+            raise ValueError("pipeline_version must be a non-empty string")
+        object.__setattr__(self, "pipeline_version", self.pipeline_version.strip())
 
     @property
     def rebuild(self) -> tuple[ProgramSource, ...]:
@@ -146,6 +154,12 @@ class IncrementalPlan:
 
 def _source_hash_is_available(value: str | None) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _normalize_pipeline_version(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("pipeline_version must be a non-empty string")
+    return value.strip()
 
 
 def _normalize_scope_values(
@@ -198,15 +212,17 @@ def plan_incremental(
         SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]
     ]
     | None = None,
+    pipeline_version: str = LINEAGE_PIPELINE_VERSION,
 ) -> IncrementalPlan:
     """根据当前 ProgramSource metadata 生成纯逻辑增量计划。
 
-    ``source_hash`` 是唯一的 unchanged 依据。当前 hash 缺失或为空时永远
-    不会返回 ``UNCHANGED``，即使旧 state 也没有 hash；这是保守的 rebuild
-    策略。``DELETED`` 只在 ``complete_snapshot=True`` 且 identity 属于明确
+    只有当前非空 ``source_hash`` 与 active state 的 hash、pipeline version
+    同时相等时才返回 ``UNCHANGED``。任一值缺失或不同时都保守地进入
+    rebuild。``DELETED`` 只在 ``complete_snapshot=True`` 且 identity 属于明确
     snapshot scope 时计算。
     """
 
+    resolved_pipeline_version = _normalize_pipeline_version(pipeline_version)
     sources = tuple(current_sources)
     if any(not isinstance(source, ProgramSource) for source in sources):
         raise TypeError("current_sources must contain ProgramSource values")
@@ -255,6 +271,7 @@ def plan_incremental(
         if (
             _source_hash_is_available(source.source_hash)
             and source.source_hash == previous_state.source_hash
+            and previous_state.pipeline_version == resolved_pipeline_version
         ):
             unchanged.append(source)
         else:
@@ -275,6 +292,7 @@ def plan_incremental(
         deleted=tuple(deleted),
         complete_snapshot=complete_snapshot,
         snapshot_scopes=scopes,
+        pipeline_version=resolved_pipeline_version,
     )
 
 
@@ -294,6 +312,7 @@ def build_program_states(
     previous = _active_state_map(tuple(previous_states))
     current = {source.identity: source for source in plan.current}
     scopes = {scope.key for scope in plan.snapshot_scopes}
+    pipeline_version = plan.pipeline_version
     result: dict[ProgramIdentity, ProgramState] = {}
 
     for identity, state in previous.items():
@@ -304,6 +323,7 @@ def build_program_states(
                     batch_id=batch_id,
                     last_seen_at=observed_at,
                     is_active=True,
+                    pipeline_version=pipeline_version,
                 )
             continue
         if not plan.complete_snapshot or identity.scope not in scopes:
@@ -324,6 +344,7 @@ def build_program_states(
                 batch_id=batch_id,
                 last_seen_at=observed_at,
                 is_active=True,
+                pipeline_version=pipeline_version,
             )
             continue
         result[identity] = ProgramState.from_source(
@@ -336,6 +357,7 @@ def build_program_states(
                 else observed_at
             ),
             last_changed_at=observed_at,
+            pipeline_version=pipeline_version,
         )
 
     return tuple(sorted(result.values(), key=lambda state: state.identity.key))

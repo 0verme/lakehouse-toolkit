@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `ProgramIdentity` | 程序实例的稳定 identity | `environment/source_profile/program_name` 三元组；不把没有稳定来源的 `job_key` 猜测加入。 |
 | `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示 Provider 无法提供预期结果表；`source_hash=None` 表示尚未提供 hash。 |
-| `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、first/last seen、last changed、batch 与 active 标记，不保存完整源码。 |
+| `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、`pipeline_version`、first/last seen、last changed、batch 与 active 标记；旧 state 缺少版本时按需 rebuild，不保存完整源码。 |
 | `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |
 | `PhysicalEdge` | 程序内部有向边 | `source` 是上游，`target` 是下游；允许指向 TMP，也不在此阶段吞掉自引用。 |
 | `LineageEdge` | 正式业务血缘的 direct fact | `program_name`/`job_key`、`source_hash`、`batch_id`、时间字段和不含源码的结构化 `evidence` 可由后续采集/发布阶段补齐。 |
