@@ -64,7 +64,9 @@ production:
 # configs/lineage_providers.local.yaml，不提交真实内网 SVN 路径。
 # root_path 是当前机器可访问的本地 working copy 根目录，不是 svn:// 或 HTTP SVN URL。
 # processing 与 dwf 可以共享同一个 root；layout 决定扫描规则。
-# Windows / Linux 只需按运行 verify_svn_sources 的机器修改 root_path。
+# Windows / Linux 只需按运行 verify_svn_sources 或 imp_lineage_edge 的机器修改
+# root_path；imp_lineage_edge 的 generic loader 会将每个 profile 独立实例化为
+# SVNProgramSourceProvider。
 svn_profiles:
   - name: prod_svn_processing
     environment: PROD

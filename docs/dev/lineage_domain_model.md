@@ -9,7 +9,7 @@
 | 对象 | 作用 | 关键 optional 语义 |
 | --- | --- | --- |
 | `DatasetIdentity` | 正式 physical Dataset 的稳定 identity | `environment/canonical_schema/canonical_table` 三元组；不含 `source_profile`、platform 或 catalog。 |
-| `ProgramIdentity` | 程序实例的稳定 identity | `environment/source_profile/program_name` 三元组；不把没有稳定来源的 `job_key` 猜测加入。 |
+| `ProgramIdentity` | static Program / Job definition 的稳定 identity | `environment/source_profile/program_name` 三元组；字段只 trim surrounding whitespace；不把没有稳定来源的 `job_key` 猜测加入。完整语义见 [`lineage_program_identity.md`](lineage_program_identity.md)。 |
 | `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示没有 explicit/provider target；`logical_target` 可由固定 `005` program_name grammar 恢复；`source_hash=None` 表示尚未提供 hash。 |
 | `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、`pipeline_version`、first/last seen、last changed、batch 与 active 标记；旧 state 缺少版本时按需 rebuild，不保存完整源码。 |
 | `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |

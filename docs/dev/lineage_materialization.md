@@ -9,7 +9,9 @@ DAG，也不替换现有生产入口。
 [`lineage_dataset_identity.md`](lineage_dataset_identity.md)：只有
 `environment + schema + table` 能形成 DatasetIdentity；缺少 schema 的引用不会被
 猜测成正式 edge。`source_profile`、program 和 job 仍保留在 lineage fact identity
-中，不能与 Dataset identity 混为一谈。
+中，不能与 Dataset identity 混为一谈。ProgramIdentity / ProgramState 与
+`Batch != Runtime Run` 的完整边界见
+[`lineage_program_identity.md`](lineage_program_identity.md)。
 
 ## Physical DAG 与 Business Lineage
 
@@ -135,6 +137,23 @@ Windows native crash 根因；`0xC0000005` 仍需结合生产 dump/driver 证据
 python benchmarks/lineage_materialization_benchmark.py
 ```
 
+### Evidence 与 SQLite Publish Scaling
+
+`benchmarks/lineage_serialization_benchmark.py` 使用完全虚构的 `DEMO` edge
+candidates，固定运行 `1_000`、`10_000`、`100_000` 条输入，报告 batch build、SQLite
+publish 分段耗时、evidence canonicalization/`json.dumps` 次数、prepare/validate
+row count 以及 serialization 次数。它同时断言每条 edge 只准备并校验一次，作为
+Issue #55 的回归基线；耗时只用于观察 scaling，不设置机器相关的 CI threshold。
+
+```bash
+python benchmarks/lineage_serialization_benchmark.py
+```
+
+publish 的 `prepare` 阶段生成不可变的 row payload，`insert` 直接绑定这些 payload，
+`validate` 复用同一份 candidate snapshot；因此 `lineage_edge` 与 `lineage_issue` 的
+canonical JSON 不会在 insert/validation 之间重复序列化。任何阶段失败仍由同一个
+SQLite transaction rollback，active batch 切换语义不变。
+
 ## Audit 结果与 orphan
 
 已知 `expected_target` 时，materialization 只使用 Audit 已计算的
@@ -195,10 +214,10 @@ repository 可以复用 `MaterializationBatch`，不必绑定 SQLite。
 | --- | --- |
 | `environment` / `source_profile` | 来源环境和 profile |
 | `source_table` / `target_table` | 正式上游、正式下游 |
-| `program_name` / `job_key` | 程序和可选作业身份 |
+| `program_name` / `job_key` | 程序名称和可选作业 provenance；不等于 runtime Job identity |
 | `evidence_type` / `evidence` | provenance 类型和 deterministic JSON |
-| `source_hash` | Provider 提供的原值；本阶段不用于增量 rebuild |
-| `batch_id` | materialization snapshot |
+| `source_hash` | Provider 提供的 source/content version 原值；增量语义见 [`lineage_program_identity.md`](lineage_program_identity.md) |
+| `batch_id` | materialization/replay snapshot；不是 runtime Run |
 | `observed_at` / `updated_at` | 本批次统一观察/更新时间 |
 | `is_active` | 是否属于当前 active snapshot |
 
@@ -297,8 +316,9 @@ python jobs/crontab/imp_lineage_edge.py
 `ProgramSource` 输出一条记录。默认运行与 controlled replay 的区别如下：
 
 - 不传 `--profile`、`--limit`：保持正常全 provider、complete snapshot 运行；
-- `--profile SOURCE_PROFILE`：只选定 source profile，默认按 partial snapshot 发布，
-  不会因未选 profile 触发 DELETE；
+- `--profile SOURCE_PROFILE`：只选定 source profile；不带 `--limit` 时，只有该
+  profile 完整成功扫描才允许其 scope 内的 disappearance / DELETE；其它 profile
+  不会受影响；
 - `--limit N`：收集选定来源后按 `ProgramIdentity` 排序取前 N 个，只让 sample 进入
   parser/DAG/audit，并强制 partial snapshot，sample 外程序不会判定 `DELETED`；
 - `--force-rebuild`：只对本次 replay 选中的程序绕过 hash/version reuse，不代表应该
@@ -313,9 +333,11 @@ python jobs/crontab/imp_lineage_edge.py \
 ```
 
 推荐内网验证顺序为：`100 programs → 500 programs → one profile → all profiles`。
-当前已观测 38 个 rebuild 约耗时 17 分钟；因此不建议直接对约 2 万程序 force
-rebuild，也不要为了掩盖瓶颈而盲目并发。每一级先检查 active edge diff、issue、
-耗时和 `partial_snapshot`，再进入下一阶段。
+其中 sample 阶段必须带 `--limit` 并保持 partial snapshot；单 profile full 阶段不带
+`--limit`，由 provider 的完整扫描状态决定是否开放 scoped disappearance。当前已观测
+38 个 rebuild 约耗时 17 分钟；因此不建议直接对约 2 万程序 force rebuild，也不要
+为了掩盖瓶颈而盲目并发。每一级先检查 active edge diff、issue、耗时和
+`partial_snapshot`，再进入下一阶段。
 
 日志示例：
 
@@ -334,7 +356,12 @@ stage=job status=SUCCESS elapsed_ms=...
 
 `stage=job status=SUCCESS` 只会在 SQLite atomic publish 完成后出现。中途的 STARTED/RUNNING
 日志只表示计算进度，不表示 snapshot 已经发布；失败时会输出
-`status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。可用
+`status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。`build`
+成功摘要还包括 `program_computation_ms`、`program_materialization_ms`、
+`batch_finalize_ms`、`candidate_finalize_ms`、canonicalization/serialization 次数；
+`publish` 成功或失败摘要包括 `prepare_ms`、`insert_ms`、`validate_ms`、
+`active_switch_ms`、`commit_ms` 及 prepared/validated row count，用于区分计算、
+finalize 与 SQLite 写入阶段。可用
 `build_program status=SLOW` 判断长尾属于 DAG build、audit 还是 materialization：
 `dag_ms` 高时检查 parser/Physical DAG 提取，`audit_ms` 高时检查 audit 遍历和 issue
 判定，`materialization_ms` 高时检查 path collapse/evidence finalize；用

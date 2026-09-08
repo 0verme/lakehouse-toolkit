@@ -119,6 +119,24 @@ class IncrementalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.unchanged, ())
         self.assertEqual(plan.changed, (current,))
 
+    def test_python_parser_recovery_version_bump_rebuilds_v1_state(self):
+        current = source("PROGRAM_DEMO_PARSER_RECOVERY")
+        previous = (
+            replace(
+                ProgramState.from_source(
+                    current,
+                    observed_at=OBSERVED_AT,
+                    batch_id="batch-old",
+                ),
+                pipeline_version="lineage-pipeline-v1",
+            ),
+        )
+
+        plan = plan_incremental([current], previous)
+
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
+
     def test_legacy_state_without_pipeline_version_is_rebuild_required(self):
         current = source("PROGRAM_DEMO_LEGACY_STATE")
         previous = (

@@ -59,6 +59,25 @@ class LineageJobObservabilityTests(unittest.TestCase):
             "stage=publish status=SUCCESS batch_id=batch-observability-1",
             output,
         )
+        for field in (
+            "program_computation_ms=",
+            "program_materialization_ms=",
+            "batch_finalize_ms=",
+            "candidate_finalize_ms=",
+            "canonicalization_calls=",
+            "serialization_calls=",
+        ):
+            self.assertIn(field, output)
+        for field in (
+            "prepare_ms=",
+            "insert_ms=",
+            "validate_ms=",
+            "active_switch_ms=",
+            "commit_ms=",
+            "prepared_edges=",
+            "validated_edges=",
+        ):
+            self.assertIn(field, output)
         self.assertIn("stage=coverage environment=DEV source_profile=fixture", output)
         self.assertIn("stage=job status=SUCCESS", output)
 

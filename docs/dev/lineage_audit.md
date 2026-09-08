@@ -34,9 +34,12 @@ Audit 不会改变 `dag.nodes`、`dag.edges`、`dag.steps` 或 `dag.sinks`。所
 adjacency 都是调用期间建立的内部索引，PhysicalEdge 的方向仍然是
 `source=upstream`、`target=downstream`。
 
-## 六类 Issue
+## 当前 IssueType
 
-Phase 4 只使用 Phase 1 冻结的六类 `IssueType`：
+当前 `IssueType` 枚举共有七类。`ProgramLineageAuditor` 直接生成前六类；
+`LINEAGE_BRANCH_BROKEN` 是现有 evolution/history transition 在旧分支曾到达
+expected target、当前变成 orphan 时生成的派生 issue，不是本次 Audit detector 新增的
+规则：
 
 | IssueType | 触发语义 | Severity |
 | --- | --- | --- |
@@ -46,6 +49,7 @@ Phase 4 只使用 Phase 1 冻结的六类 `IssueType`：
 | `TARGET_MISMATCH` | expected target 未成为最终 sink，或存在其它明确正式 sink 替代它 | `HIGH` |
 | `CYCLE_DETECTED` | 一个多节点 strongly connected component（SCC） | `HIGH` |
 | `SELF_REFERENCE` | 存在 `A → A` 的 PhysicalEdge | `HIGH` |
+| `LINEAGE_BRANCH_BROKEN` | 既有有效 target 分支在后续 snapshot 中断裂，由 evolution/history 派生 | `HIGH` |
 
 Severity 由 `ISSUE_SEVERITY_POLICY` 集中定义，并通过 `issue_severity()` 查询；
 同一 `IssueType` 不会由不同 detector 随意赋予不同等级。

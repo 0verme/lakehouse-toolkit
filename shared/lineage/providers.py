@@ -20,6 +20,15 @@ from shared.lineage.domain import (
     normalize_program_name,
     parse_declared_primary_target,
 )
+from .svn_provider import (
+    ProductionSVNProvider,
+    SVNProgramSourceProvider,
+    SVNProviderAccounting,
+    SVNProviderDiagnostic,
+    SVNProviderError,
+    load_svn_program_source_profiles,
+    load_svn_program_source_providers,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT_DIR / "configs" / "lineage_providers.local.yaml"
@@ -904,6 +913,28 @@ def load_mysql_process_profiles(
     return profiles
 
 
+def load_program_source_providers(
+    config_path: str | Path | None = None,
+) -> tuple[ProgramSourceProvider, ...]:
+    """Load configured MySQL and local-SVN ProgramSource providers.
+
+    The legacy ``ProductionProvider`` is intentionally not replaced or
+    implicitly added here; it remains an independently injectable metadata
+    adapter.  This loader only combines the existing MySQL profiles with the
+    new local working-copy SVN profiles.
+    """
+
+    selected_path = (
+        Path(config_path).expanduser()
+        if config_path is not None
+        else (CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_CONFIG_PATH)
+    )
+    mysql_profiles = load_mysql_process_profiles(selected_path)
+    mysql_providers = tuple(MySQLProcessProvider(profile) for profile in mysql_profiles)
+    svn_providers = load_svn_program_source_providers(selected_path)
+    return (*mysql_providers, *svn_providers)
+
+
 __all__ = [
     "ConnectionFactory",
     "ExpectedTargetGetter",
@@ -915,9 +946,17 @@ __all__ = [
     "MySQLProcessProfile",
     "MySQLProcessProvider",
     "ProductionProvider",
+    "ProductionSVNProvider",
     "ProgramSourceProvider",
     "ProviderError",
+    "SVNProgramSourceProvider",
+    "SVNProviderAccounting",
+    "SVNProviderDiagnostic",
+    "SVNProviderError",
     "default_mysql_connection_factory",
     "iter_program_sources",
     "load_mysql_process_profiles",
+    "load_program_source_providers",
+    "load_svn_program_source_profiles",
+    "load_svn_program_source_providers",
 ]

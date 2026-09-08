@@ -7,7 +7,9 @@ Issue 检测、TMP collapse 或递归 lineage materialization。
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -124,6 +126,23 @@ _SQL_CALL_NAMES = {
     "sql",
 }
 _SQL_ARGUMENT_KEYWORDS = {"command", "query", "sql", "sql_str", "statement"}
+_LEGACY_SQL_WRAPPER_NAMES = {"do", "run"}
+_LEGACY_ASSIGNMENT_OPERATORS = {
+    "=",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "//=",
+    "**=",
+    "&=",
+    "|=",
+    "^=",
+    "<<=",
+    ">>=",
+    "@=",
+}
 
 
 class SQLExtractionReason(str, Enum):
@@ -133,6 +152,7 @@ class SQLExtractionReason(str, Enum):
     RAW_SQL = "RAW_SQL"
     EMPTY_SCRIPT = "EMPTY_SCRIPT"
     PYTHON_PARSE_FAILED = "PYTHON_PARSE_FAILED"
+    PYTHON_PARSE_RECOVERED = "PYTHON_PARSE_RECOVERED"
     NO_SQL_CANDIDATE = "NO_SQL_CANDIDATE"
     SQL_CALL_NOT_RECOGNIZED = "SQL_CALL_NOT_RECOGNIZED"
     SQL_ARGUMENT_DYNAMIC = "SQL_ARGUMENT_DYNAMIC"
@@ -228,6 +248,12 @@ class _PythonBinding:
     expression: ast.AST | None
     line_number: int
     column_number: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyBinding:
+    token_index: int
+    text: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,6 +593,124 @@ def _looks_like_sql(text: str) -> bool:
     return bool(_SQL_LEADING_RE.match(without_comments))
 
 
+def _legacy_triple_quoted_text(token: tokenize.TokenInfo) -> str | None:
+    if token.type != tokenize.STRING:
+        return None
+
+    token_text = token.string
+    prefix = ""
+    quote = ""
+    if token_text.startswith(('"""', "'''")):
+        quote = token_text[:3]
+    elif len(token_text) >= 4 and token_text[0].lower() in {"r", "u"}:
+        prefix = token_text[0]
+        if token_text[1:].startswith(('"""', "'''")):
+            quote = token_text[1:4]
+    if not quote or prefix.lower() not in {"", "r", "u"}:
+        return None
+    if not token_text.endswith(quote):
+        return None
+    return token_text[len(prefix) + len(quote) : -len(quote)]
+
+
+def _legacy_statement_boundary(
+    tokens: tuple[tokenize.TokenInfo, ...],
+    index: int,
+) -> bool:
+    while index < len(tokens) and tokens[index].type == tokenize.COMMENT:
+        index += 1
+    if index >= len(tokens):
+        return True
+    token = tokens[index]
+    return (
+        token.type
+        in {
+            tokenize.DEDENT,
+            tokenize.ENDMARKER,
+            tokenize.NEWLINE,
+        }
+        or token.string == ";"
+    )
+
+
+def _recover_legacy_sql_candidates(script_code: str) -> tuple[_SQLCandidate, ...]:
+    """从失败的 Python source 中恢复极小范围的静态 ``do/run`` literal。
+
+    ``tokenize`` 只读取 token，不解码 Python string，也不执行 source，因此可以
+    观察包含 malformed escape 的完整 triple-quoted token。恢复边界刻意限制为
+    单名直接赋值、独立 triple-quoted literal，以及紧随其后的 ``do(name)`` /
+    ``run(name)`` 调用；任何重复赋值、动态表达式或不完整 token stream 都拒绝。
+    """
+
+    try:
+        tokens = tuple(tokenize.generate_tokens(io.StringIO(script_code).readline))
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        return ()
+    if any(token.type == tokenize.ERRORTOKEN for token in tokens):
+        return ()
+
+    bindings: dict[str, list[_LegacyBinding]] = {}
+    for index, token in enumerate(tokens[:-2]):
+        if token.type != tokenize.NAME:
+            continue
+        operator = tokens[index + 1]
+        if (
+            operator.type != tokenize.OP
+            or operator.string not in _LEGACY_ASSIGNMENT_OPERATORS
+        ):
+            continue
+        literal = None
+        literal_token = tokens[index + 2]
+        if literal_token.type == tokenize.STRING and _legacy_statement_boundary(
+            tokens, index + 3
+        ):
+            literal = _legacy_triple_quoted_text(literal_token)
+        bindings.setdefault(token.string, []).append(_LegacyBinding(index, literal))
+
+    if not bindings:
+        return ()
+
+    candidates: list[_SQLCandidate] = []
+    for index, token in enumerate(tokens[:-4]):
+        if token.type != tokenize.NAME:
+            continue
+        if token.string.lower() not in _LEGACY_SQL_WRAPPER_NAMES:
+            continue
+        if (
+            tokens[index + 1].string != "("
+            or tokens[index + 2].type != tokenize.NAME
+            or tokens[index + 3].string != ")"
+            or not _legacy_statement_boundary(tokens, index + 4)
+        ):
+            continue
+
+        previous = tokens[index - 1] if index else None
+        if previous is not None and previous.type == tokenize.NAME:
+            if previous.string.lower() in {"class", "def"}:
+                continue
+        if previous is not None and previous.string == ".":
+            if index < 2 or tokens[index - 2].type != tokenize.NAME:
+                continue
+
+        binding = bindings.get(tokens[index + 2].string, ())
+        if len(binding) != 1:
+            continue
+        literal = binding[0]
+        if literal.token_index >= index or literal.text is None:
+            continue
+        if not _looks_like_sql(literal.text):
+            continue
+        call_start = (
+            tokens[index - 2]
+            if previous is not None and previous.string == "."
+            else token
+        )
+        candidates.append(
+            _SQLCandidate(literal.text, call_start.start[0], call_start.start[1])
+        )
+    return tuple(candidates)
+
+
 def _extract_python_candidates_with_reason(
     script_code: str,
 ) -> _PythonCandidateExtraction:
@@ -577,6 +721,12 @@ def _extract_python_candidates_with_reason(
     try:
         tree = ast.parse(python_code)
     except (SyntaxError, ValueError, TypeError):
+        recovered_candidates = _recover_legacy_sql_candidates(python_code)
+        if recovered_candidates:
+            return _PythonCandidateExtraction(
+                recovered_candidates,
+                SQLExtractionReason.PYTHON_PARSE_RECOVERED,
+            )
         if _looks_like_sql(script_code):
             return _PythonCandidateExtraction(
                 (_SQLCandidate(script_code, 1, 0),),

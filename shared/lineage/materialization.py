@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -53,6 +55,54 @@ MAX_EVIDENCE_COLLECTION_SIZE = 10_000
 # 只限制含 TMP cycle 时无法用 DAG DP 计算的 explicit simple-path fallback。
 MAX_COLLAPSED_PATHS = 100_000
 MAX_COLLAPSED_TRAVERSAL_STATES = 1_000_000
+
+
+@dataclass(slots=True)
+class _MaterializationMetrics:
+    """Optional aggregate counters for batch-finalize diagnostics."""
+
+    json_safe_calls: int = 0
+    json_safe_value_calls: int = 0
+    canonical_json_calls: int = 0
+    canonical_json_safe_calls: int = 0
+    json_dumps_calls: int = 0
+    bounded_fast_key_calls: int = 0
+    bounded_add_safe_calls: int = 0
+    bounded_sort_calls: int = 0
+    path_evidence_calls: int = 0
+    accumulator_add_path_calls: int = 0
+    accumulator_add_evidence_calls: int = 0
+    batch_finalize_ms: int = 0
+
+
+_ACTIVE_METRICS: ContextVar[_MaterializationMetrics | None] = ContextVar(
+    "lineage_materialization_metrics",
+    default=None,
+)
+
+
+@contextmanager
+def _capture_metrics(metrics: _MaterializationMetrics | None) -> Iterator[None]:
+    if metrics is None:
+        yield
+        return
+    token = _ACTIVE_METRICS.set(metrics)
+    try:
+        yield
+    finally:
+        _ACTIVE_METRICS.reset(token)
+
+
+def _record_metric(name: str, amount: int = 1) -> None:
+    metrics = _ACTIVE_METRICS.get()
+    if metrics is not None:
+        setattr(metrics, name, getattr(metrics, name) + amount)
+
+
+def _record_elapsed(name: str, started_at: float) -> None:
+    metrics = _ACTIVE_METRICS.get()
+    if metrics is not None:
+        setattr(metrics, name, int((perf_counter() - started_at) * 1000))
 
 
 class LineageEvidenceError(ValueError):
@@ -121,6 +171,7 @@ def _resolve_observed_at(observed_at: datetime | None) -> datetime:
 def _json_safe(value: object) -> object:
     """把 evidence 转为 deterministic JSON-safe 结构并拒绝 pathological object。"""
 
+    _record_metric("json_safe_calls")
     return _json_safe_value(value, depth=0, active_ids=set())
 
 
@@ -130,6 +181,7 @@ def _json_safe_value(
     depth: int,
     active_ids: set[int],
 ) -> object:
+    _record_metric("json_safe_value_calls")
     if depth > MAX_EVIDENCE_DEPTH:
         raise LineageEvidenceError(
             f"evidence exceeds maximum nesting depth ({MAX_EVIDENCE_DEPTH})"
@@ -181,7 +233,35 @@ def _json_safe_value(
         active_ids.discard(object_id)
 
 
+def _simple_canonical_json(value: object) -> str | None:
+    """Return exact canonical JSON for the small values used by bounded sets."""
+
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is int:
+        return str(value)
+    if type(value) is str:
+        return json.encoder.encode_basestring(value)
+    if type(value) in (list, tuple) and all(
+        item is None or type(item) is bool or type(item) is int or type(item) is str
+        for item in value
+    ):
+        return (
+            "["
+            + ",".join(_simple_canonical_json(item) or "null" for item in value)
+            + "]"
+        )
+    return None
+
+
 def _canonical_json_safe(value: object) -> str:
+    _record_metric("canonical_json_safe_calls")
+    simple_value = _simple_canonical_json(value)
+    if simple_value is not None:
+        return simple_value
+    _record_metric("json_dumps_calls")
     try:
         return json.dumps(
             value,
@@ -196,6 +276,7 @@ def _canonical_json_safe(value: object) -> str:
 
 
 def _canonical_json(value: object) -> str:
+    _record_metric("canonical_json_calls")
     try:
         return _canonical_json_safe(_json_safe(value))
     except RecursionError as exc:
@@ -217,6 +298,14 @@ def _as_items(value: object) -> list[object]:
     return []
 
 
+def _bounded_value_key(value: object) -> str:
+    simple_value = _simple_canonical_json(value)
+    if simple_value is not None:
+        _record_metric("bounded_fast_key_calls")
+        return simple_value
+    return _canonical_json_safe(value)
+
+
 @dataclass(slots=True)
 class _BoundedValues:
     cap: int
@@ -226,8 +315,9 @@ class _BoundedValues:
     def add(self, value: object) -> None:
         self.add_safe(_json_safe(value))
 
-    def add_safe(self, value: object) -> None:
-        key = _canonical_json_safe(value)
+    def add_safe(self, value: object, *, key: str | None = None) -> None:
+        _record_metric("bounded_add_safe_calls")
+        key = _bounded_value_key(value) if key is None else key
         if key in self.values:
             return
         if len(self.values) < self.cap:
@@ -244,7 +334,10 @@ class _BoundedValues:
         *,
         key: Callable[[object], Any] | None = None,
     ) -> list[object]:
-        return sorted(self.values.values(), key=key or _canonical_json_safe)
+        _record_metric("bounded_sort_calls")
+        if key is None:
+            return [value for _, value in sorted(self.values.items())]
+        return sorted(self.values.values(), key=key)
 
 
 @dataclass(slots=True)
@@ -280,6 +373,7 @@ class _EdgeEvidenceAccumulator:
         *,
         count: bool = True,
     ) -> None:
+        _record_metric("accumulator_add_path_calls")
         if count:
             self.path_count += 1
         self._add_safe_path_record(
@@ -310,12 +404,21 @@ class _EdgeEvidenceAccumulator:
             self.collapsed_tmp_nodes.add_safe(node)
 
     def add_evidence(self, evidence: Mapping[str, object] | str | None) -> None:
+        _record_metric("accumulator_add_evidence_calls")
         if not isinstance(evidence, Mapping):
             return
         safe_value = _json_safe(evidence)
         if not isinstance(safe_value, dict):
             return
+        self._add_safe_evidence(safe_value)
 
+    def add_safe_evidence(self, evidence: Mapping[str, object] | str | None) -> None:
+        """Merge evidence already produced by this module without re-normalizing it."""
+
+        if isinstance(evidence, Mapping):
+            self._add_safe_evidence(evidence)
+
+    def _add_safe_evidence(self, safe_value: Mapping[str, object]) -> None:
         path_values = [
             item
             for item in _as_items(safe_value.get("physical_paths", []))
@@ -328,11 +431,13 @@ class _EdgeEvidenceAccumulator:
         duplicate_count = 0
         accepted_count = 0
         for path_record in path_values:
-            path_key = _canonical_json_safe(path_record)
+            path_key = (
+                None if source_paths_truncated else _canonical_json_safe(path_record)
+            )
             if not source_paths_truncated and path_key in self.physical_paths.values:
                 duplicate_count += 1
                 continue
-            self._add_safe_path_record(path_record)
+            self._add_safe_path_record(path_record, physical_path_key=path_key)
             accepted_count += 1
         if source_paths_truncated:
             self.paths_truncated = True
@@ -368,8 +473,13 @@ class _EdgeEvidenceAccumulator:
             return
         self._add_safe_path_record(safe_value)
 
-    def _add_safe_path_record(self, value: Mapping[str, object]) -> None:
-        self.physical_paths.add_safe(value)
+    def _add_safe_path_record(
+        self,
+        value: Mapping[str, object],
+        *,
+        physical_path_key: str | None = None,
+    ) -> None:
+        self.physical_paths.add_safe(value, key=physical_path_key)
         for pair in _as_items(value.get("physical_edge_pairs")):
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
                 self.physical_edge_pairs.add_safe((str(pair[0]), str(pair[1])))
@@ -895,7 +1005,7 @@ def _collapse_acyclic_dag_to_edges(
                 _edge_identity(edge),
                 edge.source_hash or "",
                 edge.evidence_type,
-                _canonical_json(edge.evidence),
+                _canonical_json_safe(edge.evidence),
             ),
         )
     )
@@ -918,6 +1028,7 @@ def _path_evidence(
     *,
     edge_summary_cache: dict[int, dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    _record_metric("path_evidence_calls")
     edge_records = []
     for edge in physical_edges:
         if edge_summary_cache is None:
@@ -1048,7 +1159,7 @@ def _collapse_paths_to_edges(
                 _edge_identity(edge),
                 edge.source_hash or "",
                 edge.evidence_type,
-                _canonical_json(edge.evidence),
+                _canonical_json_safe(edge.evidence),
             ),
         )
     )
@@ -1071,38 +1182,46 @@ def _prepare_issues(
     *,
     batch_id: str,
     observed_at: datetime,
+    assume_safe_evidence: bool = False,
 ) -> tuple[LineageIssue, ...]:
-    prepared: list[LineageIssue] = []
+    prepared: list[tuple[LineageIssue, str]] = []
     for issue in issues:
         if not isinstance(issue, LineageIssue):
             raise TypeError("issues must contain LineageIssue values")
-        prepared.append(
-            replace(
-                issue,
-                batch_id=batch_id,
-                first_seen_at=issue.first_seen_at or observed_at,
-                last_seen_at=observed_at,
-                is_active=True,
-            )
+        evidence = issue.evidence
+        if isinstance(evidence, Mapping) and not assume_safe_evidence:
+            evidence = _json_safe(evidence)
+        prepared_issue = replace(
+            issue,
+            batch_id=batch_id,
+            first_seen_at=issue.first_seen_at or observed_at,
+            last_seen_at=observed_at,
+            is_active=True,
+            evidence=evidence,
         )
+        prepared.append((prepared_issue, _canonical_json_safe(evidence)))
 
-    grouped: dict[tuple[str, str, str, str, str, str, str], LineageIssue] = {}
-    for issue in sorted(
-        prepared,
+    prepared.sort(
         key=lambda item: (
-            _issue_identity(item),
-            _canonical_json(item.evidence),
-            item.message,
-        ),
-    ):
-        grouped.setdefault(_issue_identity(issue), issue)
+            _issue_identity(item[0]),
+            item[1],
+            item[0].message,
+        )
+    )
+    grouped: dict[
+        tuple[str, str, str, str, str, str, str],
+        tuple[LineageIssue, str],
+    ] = {}
+    for item in prepared:
+        grouped.setdefault(_issue_identity(item[0]), item)
     return tuple(
-        sorted(
+        item[0]
+        for item in sorted(
             grouped.values(),
             key=lambda item: (
-                _issue_identity(item),
-                _canonical_json(item.evidence),
-                item.message,
+                _issue_identity(item[0]),
+                item[1],
+                item[0].message,
             ),
         )
     )
@@ -1273,18 +1392,20 @@ def materialize_batch(
         all_edges.extend(result.edges)
         all_issues.extend(result.issues)
 
+    finalize_started_at = perf_counter()
     edge_groups: dict[
         tuple[str, str, str, str, str, str],
         tuple[LineageEdge, _EdgeEvidenceAccumulator],
     ] = {}
-    for edge in sorted(
-        all_edges,
+    ordered_edges = sorted(
+        ((edge, _canonical_json_safe(edge.evidence)) for edge in all_edges),
         key=lambda item: (
-            _edge_identity(item),
-            item.source_hash or "",
-            _canonical_json(item.evidence),
+            _edge_identity(item[0]),
+            item[0].source_hash or "",
+            item[1],
         ),
-    ):
+    )
+    for edge, _ in ordered_edges:
         identity = _edge_identity(edge)
         entry = edge_groups.get(identity)
         if entry is None:
@@ -1292,13 +1413,13 @@ def materialize_batch(
             edge_groups[identity] = (edge, accumulator)
         else:
             accumulator = entry[1]
-        accumulator.add_evidence(edge.evidence)
+        accumulator.add_safe_evidence(edge.evidence)
 
     materialized_edges = [
         replace(edge, evidence=accumulator.finalize())
         for edge, accumulator in edge_groups.values()
     ]
-    return MaterializationBatch(
+    result = MaterializationBatch(
         batch_id=resolved_batch_id,
         observed_at=resolved_observed_at,
         edges=tuple(
@@ -1307,7 +1428,7 @@ def materialize_batch(
                 key=lambda item: (
                     _edge_identity(item),
                     item.source_hash or "",
-                    _canonical_json(item.evidence),
+                    _canonical_json_safe(item.evidence),
                 ),
             )
         ),
@@ -1315,8 +1436,11 @@ def materialize_batch(
             all_issues,
             batch_id=resolved_batch_id,
             observed_at=resolved_observed_at,
+            assume_safe_evidence=True,
         ),
     )
+    _record_elapsed("batch_finalize_ms", finalize_started_at)
+    return result
 
 
 build_materialization_batch = materialize_batch

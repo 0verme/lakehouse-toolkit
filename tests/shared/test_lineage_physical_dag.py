@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ast
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
+import shared.lineage.physical_dag as physical_dag_module
 from shared.lineage.domain import PhysicalNodeKind, ProgramSource
+from shared.lineage.materialization import materialize_program
 from shared.lineage.lineage_builder import normalize_table_name
 from shared.lineage.physical_dag import (  # pyright: ignore[reportMissingImports]
     SQLExtractionReason,
@@ -383,6 +387,185 @@ class PhysicalDAGTests(unittest.TestCase):
             dag.node_map["SESSION_STAGE"].kind,
             PhysicalNodeKind.TEMPORARY_ASSET,
         )
+
+    def test_malformed_python_literal_recovers_sql_dag_and_lineage(self):
+        malformed_path = (
+            ROOT_DIR
+            / "tests"
+            / "fixtures"
+            / "lineage"
+            / "python_sql_ast_parse_recovery.py"
+        )
+        success_path = (
+            ROOT_DIR / "tests" / "fixtures" / "lineage" / "python_sql_ast_success.py"
+        )
+        malformed_script = malformed_path.read_text(encoding="utf-8")
+        with self.assertRaises(SyntaxError):
+            ast.parse(malformed_script)
+
+        expected_target = normalize_table_name("DEMO_DWM.RESULT_A")
+        recovered_dag = build_program_physical_dag(
+            program(malformed_script, expected_target=expected_target)
+        )
+        self.assertEqual(
+            recovered_dag.sql_extraction_reason,
+            SQLExtractionReason.PYTHON_PARSE_RECOVERED.value,
+        )
+        self.assertEqual(recovered_dag.sql_candidate_count, 1)
+        self.assertEqual(len(recovered_dag.steps), 1)
+        step = recovered_dag.steps[0]
+        self.assertEqual(step.statement_type, "insert")
+        self.assertEqual(step.target, expected_target)
+        self.assertEqual(step.sources, ("DEMO_DWF.SOURCE_A",))
+        self.assertEqual(
+            edge_pairs(recovered_dag),
+            {("DEMO_DWF.SOURCE_A", expected_target)},
+        )
+
+        materialization = materialize_program(recovered_dag)
+        self.assertEqual(len(materialization.edges), 1)
+        self.assertEqual(materialization.edges[0].source_table, "DEMO_DWF.SOURCE_A")
+        self.assertEqual(materialization.edges[0].target_table, expected_target)
+
+        success_dag = build_program_physical_dag(
+            program(
+                success_path.read_text(encoding="utf-8"),
+                expected_target=expected_target,
+            )
+        )
+        self.assertEqual(
+            success_dag.sql_extraction_reason,
+            SQLExtractionReason.CANDIDATE_FOUND.value,
+        )
+        self.assertEqual(
+            success_dag.sql_candidate_count, recovered_dag.sql_candidate_count
+        )
+        self.assertEqual(success_dag.steps, recovered_dag.steps)
+        self.assertEqual(success_dag.edge_pairs, recovered_dag.edge_pairs)
+
+    def test_legacy_recovery_preserves_do_and_run_wrappers(self):
+        script = r'''sql = """
+-- legacy comment contains \N
+insert into DEMO_DWM.RESULT_A
+select *
+from DEMO_DWF.SOURCE_A
+"""
+executor.do(sql)
+executor.run(sql)
+'''
+        with self.assertRaises(SyntaxError):
+            ast.parse(script)
+
+        dag = build_program_physical_dag(
+            program(script, expected_target="DEMO_DWM.RESULT_A")
+        )
+
+        self.assertEqual(
+            dag.sql_extraction_reason,
+            SQLExtractionReason.PYTHON_PARSE_RECOVERED.value,
+        )
+        self.assertEqual(dag.sql_candidate_count, 2)
+        self.assertEqual(len(dag.steps), 2)
+        self.assertEqual(dag.edge_pairs, {("DEMO_DWF.SOURCE_A", "DEMO_DWM.RESULT_A")})
+
+    def test_legacy_recovery_rejects_plain_text_and_dynamic_literals(self):
+        plain_text = r'''notes = """
+plain text contains \N but is not SQL
+"""
+executor.do(notes)
+'''
+        plain_dag = build_program_physical_dag(
+            program(plain_text, expected_target=None)
+        )
+        self.assertEqual(plain_dag.steps, ())
+        self.assertEqual(plain_dag.edges, ())
+        self.assertEqual(
+            plain_dag.sql_extraction_reason,
+            SQLExtractionReason.PYTHON_PARSE_FAILED.value,
+        )
+
+        dynamic = r'''sql = """
+-- legacy comment contains \N
+insert into DEMO_DWM.RESULT_A
+select *
+from DEMO_DWF.SOURCE_A
+"""
+sql = runtime_sql
+executor.do(sql)
+'''
+        dynamic_dag = build_program_physical_dag(program(dynamic, expected_target=None))
+        self.assertEqual(dynamic_dag.steps, ())
+        self.assertEqual(dynamic_dag.edges, ())
+        self.assertEqual(
+            dynamic_dag.sql_extraction_reason,
+            SQLExtractionReason.PYTHON_PARSE_FAILED.value,
+        )
+
+        f_string = r'''sql = f"""
+-- legacy comment contains \N
+insert into {runtime_target}
+select *
+from DEMO_DWF.SOURCE_A
+"""
+executor.do(sql)
+'''
+        f_string_dag = build_program_physical_dag(
+            program(f_string, expected_target=None)
+        )
+        self.assertEqual(f_string_dag.steps, ())
+        self.assertEqual(f_string_dag.edges, ())
+        self.assertEqual(
+            f_string_dag.sql_extraction_reason,
+            SQLExtractionReason.PYTHON_PARSE_FAILED.value,
+        )
+
+    def test_broken_legacy_quote_is_rejected_without_crashing(self):
+        script = r'''sql = """
+-- legacy comment contains \N
+insert into DEMO_DWM.RESULT_A
+select *
+from DEMO_DWF.SOURCE_A
+executor.do(sql)
+'''
+        dag = build_program_physical_dag(program(script, expected_target=None))
+        self.assertEqual(dag.steps, ())
+        self.assertEqual(dag.edges, ())
+        self.assertEqual(
+            dag.sql_extraction_reason,
+            SQLExtractionReason.PYTHON_PARSE_FAILED.value,
+        )
+
+    def test_legacy_recovery_runs_only_after_python_parse_failure(self):
+        success_path = (
+            ROOT_DIR / "tests" / "fixtures" / "lineage" / "python_sql_ast_success.py"
+        )
+        success_script = success_path.read_text(encoding="utf-8")
+        with patch.object(
+            physical_dag_module, "_recover_legacy_sql_candidates"
+        ) as recover:
+            dag = build_program_physical_dag(program(success_script))
+            recover.assert_not_called()
+        self.assertEqual(
+            dag.sql_extraction_reason,
+            SQLExtractionReason.CANDIDATE_FOUND.value,
+        )
+
+        malformed_path = (
+            ROOT_DIR
+            / "tests"
+            / "fixtures"
+            / "lineage"
+            / "python_sql_ast_parse_recovery.py"
+        )
+        with patch.object(
+            physical_dag_module,
+            "_recover_legacy_sql_candidates",
+            wraps=physical_dag_module._recover_legacy_sql_candidates,
+        ) as recover:
+            build_program_physical_dag(
+                program(malformed_path.read_text(encoding="utf-8"))
+            )
+            recover.assert_called_once()
 
     def test_profiled_db_wrappers_and_fixture_return_are_supported(self):
         fixture_path = (

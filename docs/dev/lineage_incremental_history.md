@@ -2,7 +2,9 @@
 
 Phase 7 在 Phase 1～6 的 Provider → Physical DAG → Audit → TMP collapse →
 materialization → Query 主链上增加演进能力。它不改变 `LineageEdge` 的方向，
-也不向 Viewer JSON 增加历史字段。
+也不向 Viewer JSON 增加历史字段。ProgramIdentity、ProgramState、rename/delete/
+restore、Batch 与 runtime boundary 的完整 V1 contract 见
+[`lineage_program_identity.md`](lineage_program_identity.md)。
 
 ## Program identity 与 source hash
 
@@ -11,6 +13,9 @@ materialization → Query 主链上增加演进能力。它不改变 `LineageEdg
 ```text
 environment / source_profile / program_name
 ```
+
+identity boundary 只 trim surrounding whitespace，保留现有字段大小写；不要把
+`source_hash`、`pipeline_version`、`batch_id` 或不稳定 `job_key` 加入 identity。
 
 例如 `DEV/mysql_dev_a/PROGRAM_DEMO_A` 和
 `PROD/production_metadata/PROGRAM_DEMO_A` 是两个程序实例。当前
@@ -23,10 +28,12 @@ environment / source_profile / program_name
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v2-program-name`。它不是 Git commit SHA。凡是会改变 parser/DAG/audit/
-materialization 结果的规则升级，都必须在同一变更中把这个 constant bump 到新的
-语义版本，并在本文记录原因。本次 v2 固化了固定 `005` program_name 的 logical
-target、step sequence、opaque suffix 与 target-first recovery 语义。
+`lineage-pipeline-v3-program-name-sql-recovery`。它不是 Git commit SHA。凡是会改变
+parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
+bump 到新的语义版本，并在本文记录原因。本次 v3 同时固化固定 `005` program_name
+的 logical target、step sequence、opaque suffix、target-first recovery，以及 Python
+AST 失败后的保守 legacy SQL literal recovery；相同 source hash 的旧 v1/v2 facts
+也必须 rebuild。
 
 ## Incremental planner
 
@@ -216,10 +223,10 @@ program_name）排序取前 N 个，只有这 N 个进入 parser/DAG/audit。日
 `replay_mode`、`selected_profiles`、`source_total`、`replay_total`、
 `force_rebuild` 和 `partial_snapshot`，不输出源码、SQL、表名或连接凭据。
 
-任何 controlled replay（包括只指定 profile）都按 partial snapshot 发布；尤其是
-使用 `--limit` 时，sample 外的程序不能被判定为 `DELETED`。因此 replay 不会因
-未读取的程序触发 complete snapshot DELETE，但它也不用于宣称某个 profile 已经
-完整同步。推荐内网验证阶梯：
+带 `--limit` 的 controlled replay 始终按 partial snapshot 发布；sample 外的程序
+不能被判定为 `DELETED`。只指定 profile 且不带 `--limit` 时，若该 profile 成功完成
+全量 inventory/read，则允许仅在该 profile scope 内进行 disappearance 判断；provider
+失败或 diagnostics 存在时仍自动降级为 partial。推荐内网验证阶梯：
 
 ```text
 100 programs
