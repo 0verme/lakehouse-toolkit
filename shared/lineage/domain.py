@@ -239,6 +239,127 @@ def compute_source_hash(
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _canonicalize_dataset_part(value: object, field_name: str) -> str:
+    text = decode_code(value).strip()
+    text = (
+        text.replace("`", "")
+        .replace('"', "")
+        .replace("'", "")
+        .replace("[", "")
+        .replace("]", "")
+        .strip()
+    )
+    if not text or "." in text:
+        raise ValueError(f"{field_name} must be a non-empty identifier part")
+    return text.upper()
+
+
+def canonicalize_schema(value: object) -> str:
+    """规范 DatasetIdentity 的 schema 值；只做 trim + upper。"""
+
+    return _canonicalize_dataset_part(value, "schema")
+
+
+def canonicalize_table(value: object) -> str:
+    """规范 DatasetIdentity 的 table 值；只做 trim + upper。"""
+
+    return _canonicalize_dataset_part(value, "table")
+
+
+def _dataset_name_parts(value: object) -> tuple[str, str] | None:
+    text = decode_code(value).strip()
+    if not text:
+        return None
+    parts = tuple(part.strip() for part in text.split("."))
+    if len(parts) != 2 or not all(parts):
+        return None
+    try:
+        return canonicalize_schema(parts[0]), canonicalize_table(parts[1])
+    except ValueError:
+        return None
+
+
+def canonicalize_dataset_name(value: object) -> str | None:
+    """规范 ``schema.table``；缺失或多余 namespace 时返回 ``None``。"""
+
+    parts = _dataset_name_parts(value)
+    return None if parts is None else ".".join(parts)
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetIdentity:
+    """Dataset Identity Contract V1 的 physical dataset value object。
+
+    Identity 只有 ``environment + canonical_schema + canonical_table``；不含
+    ``source_profile``、platform、catalog 或其它数据库层级。TMP 和缺失
+    schema 的引用不能构成此对象。
+    """
+
+    environment: str
+    canonical_schema: str
+    canonical_table: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.environment, "environment")
+        schema = canonicalize_schema(self.canonical_schema)
+        table = canonicalize_table(self.canonical_table)
+        canonical_name = f"{schema}.{table}"
+        if is_temporary_asset(canonical_name):
+            raise ValueError("temporary assets cannot be DatasetIdentity values")
+        object.__setattr__(self, "environment", self.environment.strip())
+        object.__setattr__(self, "canonical_schema", schema)
+        object.__setattr__(self, "canonical_table", table)
+
+    @classmethod
+    def from_name(
+        cls,
+        environment: str,
+        dataset_name: object,
+    ) -> DatasetIdentity | None:
+        """从明确的 ``schema.table`` 创建 identity；无法解析时不猜 namespace。"""
+
+        parts = _dataset_name_parts(dataset_name)
+        if parts is None:
+            return None
+        try:
+            return cls(environment, *parts)
+        except ValueError:
+            return None
+
+    @classmethod
+    def from_table_name(
+        cls,
+        environment: str,
+        table_name: object,
+    ) -> DatasetIdentity | None:
+        """``from_name`` 的语义别名，便于调用方表达 table namespace。"""
+
+        return cls.from_name(environment, table_name)
+
+    @property
+    def schema(self) -> str:
+        return self.canonical_schema
+
+    @property
+    def table(self) -> str:
+        return self.canonical_table
+
+    @property
+    def canonical_name(self) -> str:
+        return f"{self.canonical_schema}.{self.canonical_table}"
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.environment, self.canonical_schema, self.canonical_table)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "environment": self.environment,
+            "canonical_schema": self.canonical_schema,
+            "canonical_table": self.canonical_table,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramIdentity:
     """一个程序实例的稳定 identity。
@@ -343,10 +464,11 @@ class ProgramState:
         ):
             raise ValueError("source_hash must be a non-empty string or None")
         if self.pipeline_version is not None:
-            if not isinstance(self.pipeline_version, str) or not self.pipeline_version.strip():
-                raise ValueError(
-                    "pipeline_version must be a non-empty string or None"
-                )
+            if (
+                not isinstance(self.pipeline_version, str)
+                or not self.pipeline_version.strip()
+            ):
+                raise ValueError("pipeline_version must be a non-empty string or None")
             object.__setattr__(self, "pipeline_version", self.pipeline_version.strip())
         for field_name in ("first_seen_at", "last_seen_at"):
             if not isinstance(getattr(self, field_name), datetime):
@@ -451,8 +573,9 @@ class LineageEdge:
 
     一条 ``LineageEdge`` 表示某环境下，一个正式上游资产到一个正式下游
     资产的直接业务血缘事实。它不是全量递归祖先关系；TMP 只在 Physical
-    DAG 阶段保留，默认不能作为正式业务资产进入此对象。``evidence`` 可携带
-    不含完整源码的结构化 provenance，供 materialization adapter 序列化。
+    DAG 阶段保留，默认不能作为正式业务资产进入此对象。source/target 必须是
+    可解析的 ``schema.table`` DatasetIdentity；``evidence`` 可携带不含完整源码
+    的结构化 provenance，供 materialization adapter 序列化。
     """
 
     environment: str
@@ -483,10 +606,33 @@ class LineageEdge:
             raise ValueError(
                 "LineageEdge endpoints must be formal assets; keep TMP in Physical DAG"
             )
+        source_identity = DatasetIdentity.from_name(self.environment, self.source_table)
+        target_identity = DatasetIdentity.from_name(self.environment, self.target_table)
+        if source_identity is None or target_identity is None:
+            raise ValueError(
+                "LineageEdge endpoints must be qualified schema.table dataset references"
+            )
+        object.__setattr__(self, "environment", source_identity.environment)
+        object.__setattr__(self, "source_table", source_identity.canonical_name)
+        object.__setattr__(self, "target_table", target_identity.canonical_name)
         if self.program_name is not None:
             _require_text(self.program_name, "program_name")
         if self.job_key is not None:
             _require_text(self.job_key, "job_key")
+
+    @property
+    def source_dataset_identity(self) -> DatasetIdentity:
+        identity = DatasetIdentity.from_name(self.environment, self.source_table)
+        if identity is None:
+            raise RuntimeError("LineageEdge source endpoint lost DatasetIdentity")
+        return identity
+
+    @property
+    def target_dataset_identity(self) -> DatasetIdentity:
+        identity = DatasetIdentity.from_name(self.environment, self.target_table)
+        if identity is None:
+            raise RuntimeError("LineageEdge target endpoint lost DatasetIdentity")
+        return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,8 +683,12 @@ class LineageIssue:
 __all__ = [
     "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
     "DEFAULT_TEMPORARY_ASSET_RULES",
+    "canonicalize_dataset_name",
+    "canonicalize_schema",
+    "canonicalize_table",
     "compute_source_hash",
     "decode_code",
+    "DatasetIdentity",
     "IssueType",
     "LineageEdge",
     "LineageIssue",

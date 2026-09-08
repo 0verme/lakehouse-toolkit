@@ -5,6 +5,12 @@ Phase 5 消费 Phase 3 的 `ProgramPhysicalDAG` 和 Phase 4 的
 materialization、issue 落库和完整批次发布。它不重新解析程序、不修改 Physical
 DAG，也不替换现有生产入口。
 
+正式 `LineageEdge` 的 endpoint 遵循
+[`lineage_dataset_identity.md`](lineage_dataset_identity.md)：只有
+`environment + schema + table` 能形成 DatasetIdentity；缺少 schema 的引用不会被
+猜测成正式 edge。`source_profile`、program 和 job 仍保留在 lineage fact identity
+中，不能与 Dataset identity 混为一谈。
+
 ## Physical DAG 与 Business Lineage
 
 Physical DAG 记录程序内部真实执行关系，TMP 节点必须保留：

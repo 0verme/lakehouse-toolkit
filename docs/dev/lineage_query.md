@@ -28,8 +28,10 @@ target = downstream
 - 查询 `DWM.DEMO_B` 的 upstream 返回 `ODS.DEMO_A`；
 - 查询 `DWM.DEMO_B` 的 downstream 返回 `DWA.DEMO_C`。
 
-查询必须显式提供 `environment`。它是 graph boundary，因此 `DEV` 查询不会
-看到 `PROD` edge。`source_profile` 是 optional provenance/filter dimension：
+查询必须显式提供 `environment`。它是 DatasetIdentity 和 graph 的硬 boundary，
+因此 `DEV` 查询不会看到 `PROD` edge；table 参数在查询入口按
+`schema.table` 的 trim + upper contract 规范化。`source_profile` 是 optional
+provenance/filter dimension：
 省略时，environment 内不同 profile 的正式 edge 可以连接同一张业务图；提供时，
 只投影该 profile 的 edge。它不是默认的业务图 boundary。
 
