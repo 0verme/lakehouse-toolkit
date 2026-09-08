@@ -9,7 +9,12 @@ from functools import lru_cache
 
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
-from shared.lineage.domain import decode_code, parse_declared_primary_target
+from shared.lineage.domain import (
+    PROGRAM_NAME_LEGACY_MARKER,
+    decode_code,
+    parse_declared_primary_target,
+    parse_program_name,
+)
 
 DB_CONFIG = {
     "host": os.getenv("PYTOOLS_LINEAGE_MYSQL_HOST", "localhost"),
@@ -327,21 +332,30 @@ def is_valid_table_name(value: str) -> bool:
 
 @lru_cache(maxsize=32768)
 def process_task_name(process_name: str) -> str:
-    parts = str(process_name or "").split(":")
-    if len(parts) > 1:
-        name = parts[1].upper()
+    parsed = parse_program_name(process_name)
+    if parsed.legacy_marker == PROGRAM_NAME_LEGACY_MARKER:
+        target_name = parsed.logical_target
+        if target_name is None:
+            return ""
     else:
-        name = str(process_name or "").upper()
-    if "." in name:
-        name = name.split(".", 1)[1]
-    return name[4:] if name.startswith("DWS_") else name
+        parts = str(process_name or "").split(":")
+        target_name = (
+            parts[1].upper() if len(parts) > 1 else str(process_name or "").upper()
+        )
+
+    if "." in target_name:
+        target_name = target_name.split(".", 1)[1]
+    return target_name[4:] if target_name.startswith("DWS_") else target_name
 
 
 @lru_cache(maxsize=32768)
 def process_target_name(process_name: str) -> str:
     declared_target = parse_declared_primary_target(process_name)
+    parsed = parse_program_name(process_name)
     if declared_target is not None:
         return normalize_table_name(declared_target)
+    if parsed.legacy_marker == PROGRAM_NAME_LEGACY_MARKER:
+        return ""
 
     parts = str(process_name or "").split(":")
     if len(parts) > 1:

@@ -161,9 +161,9 @@ class LineageAuditTests(unittest.TestCase):
         source = ProgramSource(
             environment="DEV",
             source_profile="fixture",
-            program_name="005:DEMO_DWM.RESULT_A:1:00",
+            program_name="005:DWM.RESULT_A:1:00",
             script_code=PROGRAM_NAME_DECLARED_PRIMARY_MULTI_SINK_PROGRAM,
-            expected_target=parse_declared_primary_target("005:DEMO_DWM.RESULT_A:1:00"),
+            expected_target=parse_declared_primary_target("005:DWM.RESULT_A:1:00"),
         )
         dag = build_program_physical_dag(source)
         result = audit_program_physical_dag(dag)

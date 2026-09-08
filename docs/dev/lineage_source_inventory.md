@@ -189,18 +189,16 @@ WHERE script_code IS NOT NULL
 
 旧 builder 的 target 处理是另外一层：
 
-- `process_target_name()` 对高置信的 `NNN:<program-target>:<revision>:<clock>`
-  格式先复用 `parse_declared_primary_target()`，再转换为旧 graph 的
-  `DWS_<schema>.table` identity；
-- 其它 legacy 名称仍按既有 `:` 后半段兼容逻辑处理；
-- `process_task_name()` 从同一命名格式推导任务名；
-- `build_target_map()` 使用这个推导结果构建旧 graph。
+- `process_target_name()` 对固定 `005:<logical_target>:<step_seq>:<opaque_suffix>`
+  格式复用 target-first parser，再转换为旧 graph 的 schema identity；
+- 固定 marker 格式的 target 无法安全识别时不再从第二段盲猜；
+- 其它非 canonical legacy 名称仍按既有兼容逻辑处理；
+- `process_task_name()` 与 `build_target_map()` 只使用已经安全恢复的 target。
 
-`parse_declared_primary_target()` 的结果是 declared primary result hint，不是
-唯一 sink。它只在 Provider profile 显式配置
-`primary_target_strategy: program_name` 和 `program_name_target_prefix` 时进入
-`ProgramSource.expected_target`；否则 V1 adapter 在没有明确 target 列/getter 时
-仍保持 `expected_target=None`，不把程序名或 SQL 最后一个表猜成 target。
+`parse_declared_primary_target()` 的结果是 declared logical target hint，不是唯一
+sink。Provider 的 authority 顺序是 explicit/provider target → program-name target →
+existing Physical evidence；`005`、step 和 suffix 不进入 Dataset Identity。完整
+语义见 [`lineage_program_name.md`](lineage_program_name.md)。
 
 ### 3.3 Duplicated Historical Readers
 

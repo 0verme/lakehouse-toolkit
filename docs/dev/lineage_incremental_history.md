@@ -23,9 +23,10 @@ environment / source_profile / program_name
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v1`。它不是 Git commit SHA。凡是会改变 parser/DAG/audit/
+`lineage-pipeline-v2-program-name`。它不是 Git commit SHA。凡是会改变 parser/DAG/audit/
 materialization 结果的规则升级，都必须在同一变更中把这个 constant bump 到新的
-语义版本，并在本文记录原因。
+语义版本，并在本文记录原因。本次 v2 固化了固定 `005` program_name 的 logical
+target、step sequence、opaque suffix 与 target-first recovery 语义。
 
 ## Incremental planner
 

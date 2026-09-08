@@ -7,6 +7,7 @@ names, or provider connection settings.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
 from collections.abc import Iterable
@@ -15,7 +16,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from .domain import LineageEdge, ProgramIdentity, ProgramSource
+from .domain import (
+    LineageEdge,
+    ProgramIdentity,
+    ProgramNameDiagnostic,
+    ProgramSource,
+)
 from .physical_dag import ProgramPhysicalDAG
 
 DEFAULT_COVERAGE_REPORT_PATH = Path("artifacts/lineage_coverage/report.json")
@@ -75,6 +81,14 @@ class _ProfileCoverageAccumulator:
     lineage_edge_count: int = 0
     lineage_programs: set[ProgramIdentity] = field(default_factory=set)
     physical_edge_programs: set[ProgramIdentity] = field(default_factory=set)
+    program_name_programs: set[ProgramIdentity] = field(default_factory=set)
+    logical_target_steps: dict[str, set[int]] = field(default_factory=dict)
+    target_resolved: int = 0
+    target_unresolved: int = 0
+    step_resolved: int = 0
+    step_missing: int = 0
+    step_invalid: int = 0
+    custom_suffix: int = 0
     failure_reasons: Counter[str] = field(default_factory=Counter)
     lineage_failure_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -99,6 +113,15 @@ class ProfileCoverage:
     physical_node_count: int
     physical_edge_count: int
     lineage_edge_count: int
+    target_resolved: int
+    target_unresolved: int
+    step_resolved: int
+    step_missing: int
+    step_invalid: int
+    custom_suffix: int
+    multi_step_target_count: int
+    max_steps_per_target: int
+    non_contiguous_step_groups: int
     failure_reasons: dict[str, int]
     lineage_failure_reasons: dict[str, int]
 
@@ -114,9 +137,7 @@ class ProfileCoverage:
             "sql_candidate_program_ratio": _ratio(
                 self.programs_with_sql_candidates, denominator
             ),
-            "sql_step_program_ratio": _ratio(
-                self.programs_with_sql_steps, denominator
-            ),
+            "sql_step_program_ratio": _ratio(self.programs_with_sql_steps, denominator),
             "write_target_program_ratio": _ratio(
                 self.programs_with_write_target, denominator
             ),
@@ -152,6 +173,15 @@ class ProfileCoverage:
             "physical_node_count": self.physical_node_count,
             "physical_edge_count": self.physical_edge_count,
             "lineage_edge_count": self.lineage_edge_count,
+            "target_resolved": self.target_resolved,
+            "target_unresolved": self.target_unresolved,
+            "step_resolved": self.step_resolved,
+            "step_missing": self.step_missing,
+            "step_invalid": self.step_invalid,
+            "custom_suffix": self.custom_suffix,
+            "multi_step_target_count": self.multi_step_target_count,
+            "max_steps_per_target": self.max_steps_per_target,
+            "non_contiguous_step_groups": self.non_contiguous_step_groups,
             "ratios": self.ratios(),
             "failure_reasons": dict(self.failure_reasons),
             "lineage_failure_reasons": dict(self.lineage_failure_reasons),
@@ -203,6 +233,15 @@ class LineageCoverageReport:
                 f"programs_with_physical_edges={profile.programs_with_physical_edges} "
                 f"lineage_edges={profile.lineage_edge_count} "
                 f"programs_with_lineage_edges={profile.programs_with_lineage_edges} "
+                f"target_resolved={profile.target_resolved} "
+                f"target_unresolved={profile.target_unresolved} "
+                f"step_resolved={profile.step_resolved} "
+                f"step_missing={profile.step_missing} "
+                f"step_invalid={profile.step_invalid} "
+                f"custom_suffix={profile.custom_suffix} "
+                f"multi_step_target_count={profile.multi_step_target_count} "
+                f"max_steps_per_target={profile.max_steps_per_target} "
+                f"non_contiguous_step_groups={profile.non_contiguous_step_groups} "
                 f"failure_reasons={reasons} "
                 f"lineage_failure_reasons={lineage_reasons}"
             )
@@ -221,7 +260,9 @@ class LineageCoverageAccumulator:
 
         self._finalized_lineage_failures = False
         for source in sources:
-            self._profile(source.environment, source.source_profile).total_programs += 1
+            profile = self._profile(source.environment, source.source_profile)
+            profile.total_programs += 1
+            self._observe_program_name(profile, source)
 
     def observe_dag(
         self,
@@ -237,6 +278,7 @@ class LineageCoverageAccumulator:
         source = dag.program_source
         profile = self._profile(source.environment, source.source_profile)
         identity = source.identity
+        self._observe_program_name(profile, source)
         if count_program:
             profile.total_programs += 1
         profile.parsed_programs += 1
@@ -260,6 +302,39 @@ class LineageCoverageAccumulator:
         else:
             reason = primary_failure_reason(dag)
             profile.failure_reasons[reason.value] += 1
+
+    @staticmethod
+    def _observe_program_name(
+        profile: _ProfileCoverageAccumulator,
+        source: ProgramSource,
+    ) -> None:
+        identity = source.identity
+        if identity in profile.program_name_programs:
+            return
+        profile.program_name_programs.add(identity)
+        semantics = source.program_name_semantics
+        if semantics.logical_target is None:
+            profile.target_unresolved += 1
+        else:
+            profile.target_resolved += 1
+            if semantics.step_seq is not None:
+                target_fingerprint = hashlib.sha256(
+                    semantics.logical_target.encode("utf-8")
+                ).hexdigest()
+                profile.logical_target_steps.setdefault(target_fingerprint, set()).add(
+                    semantics.step_seq
+                )
+        if semantics.step_seq is not None:
+            profile.step_resolved += 1
+        elif ProgramNameDiagnostic.PROGRAM_NAME_STEP_INVALID in semantics.diagnostics:
+            profile.step_invalid += 1
+        else:
+            profile.step_missing += 1
+        if (
+            ProgramNameDiagnostic.PROGRAM_NAME_SUFFIX_NONSTANDARD
+            in semantics.diagnostics
+        ):
+            profile.custom_suffix += 1
 
     def observe_materialized_edges(self, edges: Iterable[LineageEdge]) -> None:
         """Count formal edges already produced by materialization."""
@@ -296,7 +371,9 @@ class LineageCoverageAccumulator:
         )
         total_programs = sum(profile.total_programs for profile in profiles)
         parsed_programs = sum(profile.parsed_programs for profile in profiles)
-        scope = "ALL_PROGRAMS" if total_programs == parsed_programs else "REBUILT_PROGRAMS"
+        scope = (
+            "ALL_PROGRAMS" if total_programs == parsed_programs else "REBUILT_PROGRAMS"
+        )
         return LineageCoverageReport(
             generated_at=generated_at or datetime.now(timezone.utc).isoformat(),
             coverage_scope=scope,
@@ -312,9 +389,9 @@ class LineageCoverageAccumulator:
             profile.lineage_failure_reasons.clear()
             missing = profile.physical_edge_programs - profile.lineage_programs
             if missing:
-                profile.lineage_failure_reasons[CoverageReason.NO_LINEAGE_EDGE.value] = len(
-                    missing
-                )
+                profile.lineage_failure_reasons[
+                    CoverageReason.NO_LINEAGE_EDGE.value
+                ] = len(missing)
         self._finalized_lineage_failures = True
 
     def _profile(
@@ -376,6 +453,16 @@ def write_json_report(
 
 
 def _snapshot_profile(profile: _ProfileCoverageAccumulator) -> ProfileCoverage:
+    step_counts = tuple(len(steps) for steps in profile.logical_target_steps.values())
+    multi_step_target_count = sum(count >= 2 for count in step_counts)
+    non_contiguous_step_groups = 0
+    for steps in profile.logical_target_steps.values():
+        ordered_steps = sorted(steps)
+        if len(ordered_steps) >= 2 and any(
+            ordered_steps[index + 1] - ordered_steps[index] != 1
+            for index in range(len(ordered_steps) - 1)
+        ):
+            non_contiguous_step_groups += 1
     return ProfileCoverage(
         environment=profile.environment,
         source_profile=profile.source_profile,
@@ -393,6 +480,15 @@ def _snapshot_profile(profile: _ProfileCoverageAccumulator) -> ProfileCoverage:
         physical_node_count=profile.physical_node_count,
         physical_edge_count=profile.physical_edge_count,
         lineage_edge_count=profile.lineage_edge_count,
+        target_resolved=profile.target_resolved,
+        target_unresolved=profile.target_unresolved,
+        step_resolved=profile.step_resolved,
+        step_missing=profile.step_missing,
+        step_invalid=profile.step_invalid,
+        custom_suffix=profile.custom_suffix,
+        multi_step_target_count=multi_step_target_count,
+        max_steps_per_target=max(step_counts, default=0),
+        non_contiguous_step_groups=non_contiguous_step_groups,
         failure_reasons={
             reason.value: profile.failure_reasons.get(reason.value, 0)
             for reason in _FAILURE_REASONS

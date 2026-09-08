@@ -139,13 +139,13 @@ class LineageProviderTests(unittest.TestCase):
             }
         )
 
-        with patch.dict(
-            os.environ, environment_for(legacy_profile), clear=False
-        ):
+        with patch.dict(os.environ, environment_for(legacy_profile), clear=False):
             legacy_settings = legacy_profile.resolve_connection_settings()
             env_settings = connection_env_profile.resolve_connection_settings()
 
-        self.assertIsInstance(direct_profile.resolve_connection_settings(), MySQLConnectionSettings)
+        self.assertIsInstance(
+            direct_profile.resolve_connection_settings(), MySQLConnectionSettings
+        )
         self.assertEqual(direct_profile.resolve_connection_settings(), legacy_settings)
         self.assertEqual(env_settings, legacy_settings)
         self.assertNotIn("DEMO_PASSWORD_VALUE", repr(direct_profile))
@@ -174,7 +174,9 @@ class LineageProviderTests(unittest.TestCase):
 
         incomplete_connection = dict(connection)
         del incomplete_connection["database"]
-        with self.assertRaisesRegex(ValueError, "connection missing required field: database"):
+        with self.assertRaisesRegex(
+            ValueError, "connection missing required field: database"
+        ):
             MySQLProcessProfile(
                 name="mysql_incomplete",
                 environment="DEV",
@@ -343,11 +345,10 @@ class LineageProviderTests(unittest.TestCase):
 
         self.assertIsNone(source.expected_target)
 
-    def test_program_name_strategy_maps_declared_primary_target_hint(self):
+    def test_program_name_target_fallback_maps_fixed_legacy_target(self):
         profile = make_profile(
             expected_target_column=None,
             primary_target_strategy="program_name",
-            program_name_target_prefix="DEMO_",
         )
         cursor = FakeCursor(
             [("005:DEMO_DWM.RESULT_A:1:00", "insert into DWM.RESULT_A select 1")]
@@ -362,20 +363,20 @@ class LineageProviderTests(unittest.TestCase):
                 ).iter_program_sources()
             )
 
-        self.assertEqual(source.expected_target, "DWM.RESULT_A")
+        self.assertEqual(source.expected_target, "DEMO_DWM.RESULT_A")
+        self.assertEqual(source.logical_target, "DEMO_DWM.RESULT_A")
 
-    def test_customize_profile_maps_dws_program_name_with_configured_prefix(self):
+    def test_program_name_custom_suffix_does_not_block_target(self):
         profile = make_profile(
             "mysql_dev_a_customize",
             expected_target_column=None,
             primary_target_strategy="program_name",
-            program_name_target_prefix="DWS_",
         )
         cursor = FakeCursor(
             [
                 (
-                    "005:DWS_DWD.D_GJFK_ALGJ:1:00",
-                    "insert into DWD.D_GJFK_ALGJ select 1",
+                    "005:DEMO_DWD.TABLE_B:1:ABCD",
+                    "insert into DWD.TABLE_B select 1",
                 )
             ]
         )
@@ -389,14 +390,15 @@ class LineageProviderTests(unittest.TestCase):
                 ).iter_program_sources()
             )
 
-        self.assertEqual(source.expected_target, "DWD.D_GJFK_ALGJ")
+        self.assertEqual(source.expected_target, "DEMO_DWD.TABLE_B")
+        self.assertEqual(source.opaque_suffix, "ABCD")
 
-    def test_program_name_strategy_requires_explicit_prefix(self):
-        with self.assertRaisesRegex(ValueError, "program_name_target_prefix"):
-            make_profile(
-                expected_target_column=None,
-                primary_target_strategy="program_name",
-            )
+    def test_program_name_strategy_needs_no_prefix_configuration(self):
+        profile = make_profile(
+            expected_target_column=None,
+            primary_target_strategy="program_name",
+        )
+        self.assertIsNone(profile.program_name_target_prefix)
 
     def test_invalid_identifier_is_rejected_before_query(self):
         placeholder_key = "DEMO_AUTH_ENV"
@@ -522,10 +524,9 @@ class LineageProviderTests(unittest.TestCase):
                 }
             ],
             primary_target_strategy="program_name",
-            program_name_target_prefix="DEMO_",
         )
         declared_source = next(declared_provider.iter_program_sources())
-        self.assertEqual(declared_source.expected_target, "DWD.TABLE_B")
+        self.assertEqual(declared_source.expected_target, "DEMO_DWD.TABLE_B")
 
     def test_production_loader_error_has_context(self):
         def loader():
@@ -577,7 +578,6 @@ mysql_process_profiles:
     script_code_column: script_code
     expected_target_column: expected_target
     primary_target_strategy: program_name
-    program_name_target_prefix: DWS_
     batch_size: 7
 """
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -591,7 +591,7 @@ mysql_process_profiles:
         self.assertEqual(profiles[0].batch_size, 7)
         self.assertEqual(profiles[0].expected_target_column, "expected_target")
         self.assertEqual(profiles[0].primary_target_strategy, "program_name")
-        self.assertEqual(profiles[0].program_name_target_prefix, "DWS_")
+        self.assertIsNone(profiles[0].program_name_target_prefix)
 
     def test_load_mysql_process_profiles_supports_all_connection_shapes(self):
         config = """

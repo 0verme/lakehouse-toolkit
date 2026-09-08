@@ -14,11 +14,11 @@ from shared.lineage.coverage import (
     LineageCoverageAccumulator,
     write_json_report,
 )
+from shared.lineage.domain import ProgramSource
 from shared.lineage.evolution import SnapshotScope
 from shared.lineage.materialization import materialize_program
 from shared.lineage.physical_dag import build_program_physical_dag
 from tests.fixtures.lineage.phase8_coverage_profiles import COVERAGE_PROFILE_SOURCES
-
 
 OBSERVED_AT = datetime(2026, 1, 5, 10, 11, 12, tzinfo=timezone.utc)
 
@@ -98,6 +98,38 @@ class LineageCoverageTests(unittest.TestCase):
             read_only.failure_reasons[CoverageReason.READ_ONLY_SQL.value],
             1,
         )
+
+    def test_program_name_contract_counters_are_aggregate_only(self):
+        sources = tuple(
+            ProgramSource(
+                environment="ENV_SYNTHETIC",
+                source_profile="profile_program_name",
+                program_name=program_name,
+                script_code="select 1",
+            )
+            for program_name in (
+                "005:DEMO_DWM.RESULT_A:3:00",
+                "005:DEMO_DWM.RESULT_A:5:XYZ",
+                "005:DEMO_DWM.RESULT_A",
+                "005:DEMO_DWM.RESULT_B:0:00",
+                "005::1:00",
+            )
+        )
+        coverage = LineageCoverageAccumulator()
+        coverage.observe_sources(sources)
+
+        profile = coverage.report(generated_at="2026-01-05T10:11:12+00:00").profiles[0]
+        self.assertEqual(profile.target_resolved, 4)
+        self.assertEqual(profile.target_unresolved, 1)
+        self.assertEqual(profile.step_resolved, 3)
+        self.assertEqual(profile.step_missing, 1)
+        self.assertEqual(profile.step_invalid, 1)
+        self.assertEqual(profile.custom_suffix, 1)
+        self.assertEqual(profile.multi_step_target_count, 1)
+        self.assertEqual(profile.max_steps_per_target, 2)
+        self.assertEqual(profile.non_contiguous_step_groups, 1)
+        serialized = json.dumps(profile.to_dict(), ensure_ascii=False)
+        self.assertNotIn("DEMO_DWM.RESULT_A", serialized)
 
     def test_incremental_scope_does_not_double_count_sources_and_dags(self):
         sources = COVERAGE_PROFILE_SOURCES[:2]

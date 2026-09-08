@@ -94,9 +94,9 @@ class dataLineageTests(unittest.TestCase):
         program_name = "005:DEMO_DWM.RESULT_A:1:00"
         self.assertEqual(
             parse_declared_primary_target(program_name),
-            "DWM.RESULT_A",
+            "DEMO_DWM.RESULT_A",
         )
-        self.assertEqual(process_target_name(program_name), "DWS_DWM.RESULT_A")
+        self.assertEqual(process_target_name(program_name), "DEMO_DWM.RESULT_A")
 
     def test_build_lineage_graph_uses_script_code_edges(self):
         process_infos = [

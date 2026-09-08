@@ -10,18 +10,21 @@ from .audit import (  # pyright: ignore[reportMissingImports]
     issue_severity,
 )
 from .coverage import (  # pyright: ignore[reportMissingImports]
-    CoverageReason,
     DEFAULT_COVERAGE_REPORT_PATH,
+    CoverageReason,
     LineageCoverageAccumulator,
     LineageCoverageReport,
     ProfileCoverage,
     primary_failure_reason,
+)
+from .coverage import (
     write_json_report as write_coverage_json_report,
 )
-from .version import LINEAGE_PIPELINE_VERSION
 from .domain import (
     DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
     DEFAULT_TEMPORARY_ASSET_RULES,
+    PROGRAM_NAME_DEFAULT_SUFFIX,
+    PROGRAM_NAME_LEGACY_MARKER,
     DatasetIdentity,
     IssueType,
     LineageEdge,
@@ -30,18 +33,24 @@ from .domain import (
     PhysicalNode,
     PhysicalNodeKind,
     ProgramIdentity,
+    ProgramNameDiagnostic,
+    ProgramNameSemantics,
     ProgramSource,
     ProgramState,
     TemporaryAssetRule,
     canonicalize_dataset_name,
     canonicalize_schema,
     canonicalize_table,
+    expected_processing_order,
     extract_program_declared_target_token,
+    group_program_sources_by_logical_target,
+    group_program_steps,
     is_formal_asset,
     is_temporary_asset,
     normalize_asset_name,
     normalize_declared_target_from_program_name,
     parse_declared_primary_target,
+    parse_program_name,
 )
 from .evolution import (  # pyright: ignore[reportMissingImports]
     BatchMetadata,
@@ -110,11 +119,16 @@ from .query import (  # pyright: ignore[reportMissingImports]
     query_lineage,
     query_upstream,
 )
+from .version import LINEAGE_PIPELINE_VERSION
 
 __all__ = [
     "AuditResult",
     "LINEAGE_PIPELINE_VERSION",
     "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
+    "PROGRAM_NAME_DEFAULT_SUFFIX",
+    "PROGRAM_NAME_LEGACY_MARKER",
+    "ProgramNameDiagnostic",
+    "ProgramNameSemantics",
     "CoverageReason",
     "DEFAULT_COVERAGE_REPORT_PATH",
     "LineageCoverageAccumulator",
@@ -146,12 +160,16 @@ __all__ = [
     "canonicalize_schema",
     "canonicalize_table",
     "extract_program_declared_target_token",
+    "expected_processing_order",
+    "group_program_sources_by_logical_target",
+    "group_program_steps",
     "is_formal_asset",
     "is_temporary_asset",
     "issue_severity",
     "normalize_asset_name",
     "normalize_declared_target_from_program_name",
     "parse_declared_primary_target",
+    "parse_program_name",
     "audit_program_physical_dag",
     "build_physical_dag",
     "build_program_physical_dag",

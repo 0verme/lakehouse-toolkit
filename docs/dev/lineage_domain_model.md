@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `DatasetIdentity` | 正式 physical Dataset 的稳定 identity | `environment/canonical_schema/canonical_table` 三元组；不含 `source_profile`、platform 或 catalog。 |
 | `ProgramIdentity` | 程序实例的稳定 identity | `environment/source_profile/program_name` 三元组；不把没有稳定来源的 `job_key` 猜测加入。 |
-| `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示 Provider 无法提供预期结果表；`source_hash=None` 表示尚未提供 hash。 |
+| `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示没有 explicit/provider target；`logical_target` 可由固定 `005` program_name grammar 恢复；`source_hash=None` 表示尚未提供 hash。 |
 | `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、`pipeline_version`、first/last seen、last changed、batch 与 active 标记；旧 state 缺少版本时按需 rebuild，不保存完整源码。 |
 | `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |
 | `PhysicalEdge` | 程序内部有向边 | `source` 是上游，`target` 是下游；允许指向 TMP，也不在此阶段吞掉自引用。 |
@@ -18,7 +18,10 @@
 | `LineageIssue` | Physical DAG 审计事实 | `node_key`、`branch_sink` 与 `stable_key` 可按 issue 类型选择；生命周期时间字段可在首次发现时补齐。 |
 
 Dataset Identity 的完整 V1 contract、canonicalization、missing schema 和 TMP 边界见
-[`lineage_dataset_identity.md`](lineage_dataset_identity.md)。
+[`lineage_dataset_identity.md`](lineage_dataset_identity.md)；ProgramIdentity、ProgramState
+和 static Job / Batch 边界见 [`lineage_program_identity.md`](lineage_program_identity.md)。
+固定 legacy `program_name` 的 target/step/suffix 语义见
+[`lineage_program_name.md`](lineage_program_name.md)。
 
 ### `ProgramSource`
 
@@ -35,6 +38,16 @@ script_code
 通过它推断连接方式。`script_code` 在领域层是 `str`；MySQL 大字段的 `bytes`
 解码属于后续 Provider 边界。Phase 1 不计算 `source_hash`，只保证 provider 提供
 的 hash 原样保留。
+
+### `program_name` 语义边界
+
+`ProgramSource.program_name` 的固定 legacy marker 是 `005`。第二段是 declared
+logical target；第三段是无固定上限、可不连续的 positive-integer `step_seq`；第四段
+是 opaque suffix。解析采用 target-first recovery：target 明确时，缺失 step/suffix
+只产生 diagnostic，不把 lineage 置为 `TARGET_NOT_FOUND`。多个 raw ProgramSource
+可以共享 logical target，但必须保留各自 ProgramIdentity 与 provenance；升序 step
+只形成 expected processing order evidence，不是 scheduler dependency。详见
+[`lineage_program_name.md`](lineage_program_name.md)。
 
 ### Physical DAG
 
