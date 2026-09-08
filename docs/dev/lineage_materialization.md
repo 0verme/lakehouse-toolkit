@@ -66,10 +66,11 @@ DWM.B → DWA.C
 ### Bounded Evidence Contract
 
 `evidence.path_count` 是该 formal edge 发现的完整 collapsed physical path 数量，
-不是 sample 的长度。为避免一个 edge 携带无限 JSON，`physical_paths` 只保留按
-canonical JSON 排序后的前 `100` 条 deterministic sample，并用
-`physical_paths_truncated` 标识是否还有未保存的 path。`source`、`target`、程序身份、
-`path_count` 和 statement evidence summary 不因 sample 截断而丢失。
+不是 sample 的长度。为避免一个 edge 携带无限 JSON，`physical_paths` 只保留最多 `100`
+条按稳定 traversal 顺序取得的 deterministic representative sample，并用
+`physical_paths_truncated` 标识是否还有未保存的 path；explicit fallback 仍会按 bounded
+accumulator 保留 canonical 最小 sample。`source`、`target`、程序身份、`path_count` 和
+statement evidence summary 不因 sample 截断而丢失。
 
 聚合摘要也有固定边界：`physical_edge_pairs`、`collapsed_tmp_nodes` 和
 `statement_indices` 默认各保留最多 `200` 个 canonical 值，并分别用
@@ -78,25 +79,48 @@ canonical JSON 排序后的前 `100` 条 deterministic sample，并用
 因此没有额外的表迁移；consumer 必须使用 `path_count` 判断完整规模，不能用
 `len(physical_paths)` 代替。
 
-Materialization 先收集每条 formal edge 的 path、计数和 bounded summaries，最后只做
-一次 normalize/dedupe/sort/finalize，不在每次新增 path 时重建全部历史 JSON。若一个
-Physical DAG 需要枚举超过 `100000` 条 collapsed path，会抛出
-`LineagePathEnumerationError`，由 job 记录为 `PATHOLOGICAL` 并以 controlled Python
-failure 结束，而不是继续拖死 batch。枚举 traversal state 另有 `1000000` 上限，避免
-尚未到达 formal endpoint 的 diamond branch 先耗尽内存。`_json_safe` 同时拒绝
-recursive cycle、超过 `64` 层的 nesting 和超过 `10000` 项的单个 collection，并抛出
+Materialization 对无环 TMP 子图使用 deterministic DAG dynamic programming：formal
+boundary 的 exact `path_count`、能参与该 boundary 的 physical edge/node summary 都由
+reachability 和拓扑计数得到，不显式保存或遍历全部 collapsed path；随后只用 bounded
+representative traversal 生成最多 `100` 条 sample path。每个 formal edge 只创建一次
+`_EdgeEvidenceAccumulator` 和一次最终 `LineageEdge`，不会执行
+`path → temporary LineageEdge → merge`。
+
+含 TMP cycle 的图无法直接把 simple-path 数量替换为普通 DAG DP，因此保留 explicit
+simple-path fallback。只有该 fallback 受 `MAX_COLLAPSED_PATHS=100000` 和
+`MAX_COLLAPSED_TRAVERSAL_STATES=1000000` 限制，超限抛出 `LineagePathEnumerationError`
+并由 job 记录为 `PATHOLOGICAL`；无环 dense graph 不通过降低上限处理，而是保留 exact
+`path_count` 并只采 bounded evidence。`_json_safe` 同时拒绝 recursive cycle、超过
+`64` 层的 nesting 和超过 `10000` 项的单个 collection，并抛出
 `LineageEvidenceError`；它不使用对象 `repr()` 代替 evidence。
 
 ### Scaling 验证
 
 `benchmarks/lineage_materialization_benchmark.py` 使用 fictional `DEMO` Physical DAG，
-通过 instrumentation 统计 `_canonical_json` 调用次数，并验证完整 `path_count`、sample
-上限和 JSON 输出大小；它不读取数据库，也不是依赖机器速度的 CI timing gate。修复前
-在基线 `56844a7` 上，同一 synthetic DAG 的 canonicalization 次数为 `10 → 273`、
-`100 → 16248`、`500 → 381248`（500 paths 本地约 103 秒）；当前实现为
-`10 → 311`、`100 → 3101`、`500 → 14001`、`1000 → 27501`，并且 500/1000 paths
-的 `physical_paths` 都保持 100 条 sample。该差异证明 hot spot 是 merge 阶段反复
-canonicalize 累积历史 paths 的 superlinear 工作，而不是把 `_json_safe` 单独认定为
+通过 instrumentation 统计 explicit path yield、`_path_evidence`、
+`_edge_evidence`、`_lineage_edge_from_path`、temporary `LineageEdge`、accumulator 调用、
+canonicalization、sample 和 peak in-flight retained path count，并验证 exact `path_count`、sample 上限、
+summary 截断和 JSON 输出大小。结构型 fixture 覆盖 linear chain、diamond chain、high
+fan-out、high fan-in、约 `150` 节点/`350` 边/约 `20k` paths 的 mixed graph，以及
+`43` 节点/`407` 边、`max_out_degree=36`、`max_in_degree=39`、
+`branch_nodes=35`、`merge_nodes=36` 的 dense graph；它不读取数据库，也不是依赖机器速度的
+CI timing gate。
+
+上一轮真实 blocker 的 baseline 仍是：`program_id=602c19ac3a23` 的
+`collapsed_paths=24566`、path enumeration 约 `47945ms`、materialization 约 `307692ms`。
+新增匿名 dense samples 为 A/B 两个开发环境 profile（匿名样本标识
+`program_id=bd531e7bb184`）：`PROGRAM_NAME_SAME=True`、`SCRIPT_IDENTICAL=False`；
+A 为 `1847` lines / `101801` chars，B 为 `1829` lines / `101103` chars，源码
+SHA256 不同。两者仍生成完全一致的 `43` nodes、`407` edges、
+`max_out_degree=36`、`max_in_degree=39`、`branch_nodes=35`、`merge_nodes=36`、
+`edge_pairs=407`、`duplicate_edge_count=0` topology，并都触发旧实现的
+`LineagePathEnumerationError: collapsed physical path count exceeds maximum (100000)`。
+这表明同一逻辑程序在两套开发环境的不同源码版本中稳定重现该 failure mode，具有
+cross-profile 和 cross-version reproducibility，而非单脚本偶发问题。本轮 benchmark
+用同等 small dense / high fan-in / high fan-out fixture 覆盖该结构，重点验证 full path
+count 不再驱动 path object/evidence/LineageEdge 数量；无环 dense graph 即使 exact
+count 超过 `MAX_COLLAPSED_PATHS` 也不再依赖显式枚举。该差异支持 hot spot 是
+per-path materialization 与全量 path enumeration，而不是把 `_json_safe` 单独认定为
 Windows native crash 根因；`0xC0000005` 仍需结合生产 dump/driver 证据进一步定位。
 
 运行：

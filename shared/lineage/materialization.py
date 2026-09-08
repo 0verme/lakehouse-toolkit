@@ -8,11 +8,13 @@ orphan 事实；materialization 只沿 TMP 穿透到下一个正式资产，并�
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from heapq import heapify, heappop, heappush
 from time import perf_counter
+from typing import Any
 from uuid import uuid4
 
 from shared.lineage.audit import (
@@ -47,6 +49,7 @@ MAX_COLLAPSED_TMP_NODES = 200
 MAX_STATEMENT_INDICES = 200
 MAX_EVIDENCE_DEPTH = 64
 MAX_EVIDENCE_COLLECTION_SIZE = 10_000
+# 只限制含 TMP cycle 时无法用 DAG DP 计算的 explicit simple-path fallback。
 MAX_COLLAPSED_PATHS = 100_000
 MAX_COLLAPSED_TRAVERSAL_STATES = 1_000_000
 
@@ -56,7 +59,7 @@ class LineageEvidenceError(ValueError):
 
 
 class LineagePathEnumerationError(ValueError):
-    """Physical DAG 的 collapsed path 数量超过受控枚举边界。"""
+    """显式 simple-path fallback 超过受控枚举边界。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,14 +180,23 @@ def _json_safe_value(
         active_ids.discard(object_id)
 
 
-def _canonical_json(value: object) -> str:
+def _canonical_json_safe(value: object) -> str:
     try:
         return json.dumps(
-            _json_safe(value),
+            value,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
+    except RecursionError as exc:
+        raise LineageEvidenceError(
+            "evidence exceeded the safe JSON serialization recursion limit"
+        ) from exc
+
+
+def _canonical_json(value: object) -> str:
+    try:
+        return _canonical_json_safe(_json_safe(value))
     except RecursionError as exc:
         raise LineageEvidenceError(
             "evidence exceeded the safe JSON serialization recursion limit"
@@ -211,7 +223,10 @@ class _BoundedValues:
     truncated: bool = False
 
     def add(self, value: object) -> None:
-        key = _canonical_json(value)
+        self.add_safe(_json_safe(value))
+
+    def add_safe(self, value: object) -> None:
+        key = _canonical_json_safe(value)
         if key in self.values:
             return
         if len(self.values) < self.cap:
@@ -226,9 +241,9 @@ class _BoundedValues:
     def sorted_values(
         self,
         *,
-        key: Callable[[object], object] | None = None,
+        key: Callable[[object], Any] | None = None,
     ) -> list[object]:
-        return sorted(self.values.values(), key=key or _canonical_json)
+        return sorted(self.values.values(), key=key or _canonical_json_safe)
 
 
 @dataclass(slots=True)
@@ -252,14 +267,46 @@ class _EdgeEvidenceAccumulator:
     physical_edge_pairs_truncated: bool = False
     collapsed_tmp_nodes_truncated: bool = False
     statement_indices_truncated: bool = False
+    physical_edge_summaries: dict[int, dict[str, object]] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def add_path(
         self,
         path: tuple[str, ...],
         physical_edges: tuple[PhysicalEdge, ...],
+        *,
+        count: bool = True,
     ) -> None:
-        self.path_count += 1
-        self._add_path_record(_path_evidence(path, physical_edges))
+        if count:
+            self.path_count += 1
+        self._add_safe_path_record(
+            _path_evidence(
+                path,
+                physical_edges,
+                edge_summary_cache=self.physical_edge_summaries,
+            )
+        )
+
+    def add_graph_summary(
+        self,
+        physical_edges: Iterable[PhysicalEdge],
+        collapsed_tmp_nodes: Iterable[str],
+    ) -> None:
+        """只聚合 exact graph summaries，不为每条 path 构造 evidence。"""
+
+        for edge in physical_edges:
+            edge_record = _cached_physical_edge_summary(
+                edge,
+                self.physical_edge_summaries,
+            )
+            self.physical_edge_pairs.add_safe((edge.source, edge.target))
+            for index in _as_items(edge_record.get("statement_indices")):
+                if isinstance(index, (int, str)) and not isinstance(index, bool):
+                    self.statement_indices.add_safe(index)
+        for node in collapsed_tmp_nodes:
+            self.collapsed_tmp_nodes.add_safe(node)
 
     def add_evidence(self, evidence: Mapping[str, object] | str | None) -> None:
         if not isinstance(evidence, Mapping):
@@ -280,11 +327,11 @@ class _EdgeEvidenceAccumulator:
         duplicate_count = 0
         accepted_count = 0
         for path_record in path_values:
-            path_key = _canonical_json(path_record)
+            path_key = _canonical_json_safe(path_record)
             if not source_paths_truncated and path_key in self.physical_paths.values:
                 duplicate_count += 1
                 continue
-            self._add_path_record(path_record)
+            self._add_safe_path_record(path_record)
             accepted_count += 1
         if source_paths_truncated:
             self.paths_truncated = True
@@ -297,12 +344,12 @@ class _EdgeEvidenceAccumulator:
 
         for pair in _as_items(safe_value.get("physical_edge_pairs")):
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                self.physical_edge_pairs.add((str(pair[0]), str(pair[1])))
+                self.physical_edge_pairs.add_safe((str(pair[0]), str(pair[1])))
         for node in _as_items(safe_value.get("collapsed_tmp_nodes")):
-            self.collapsed_tmp_nodes.add(str(node))
+            self.collapsed_tmp_nodes.add_safe(str(node))
         for index in _as_items(safe_value.get("statement_indices")):
             if isinstance(index, (int, str)) and not isinstance(index, bool):
-                self.statement_indices.add(index)
+                self.statement_indices.add_safe(index)
 
         self.physical_edge_pairs_truncated |= bool(
             safe_value.get("physical_edge_pairs_truncated")
@@ -318,30 +365,35 @@ class _EdgeEvidenceAccumulator:
         safe_value = _json_safe(value)
         if not isinstance(safe_value, dict):
             return
-        self.physical_paths.add(safe_value)
-        for pair in _as_items(safe_value.get("physical_edge_pairs")):
+        self._add_safe_path_record(safe_value)
+
+    def _add_safe_path_record(self, value: Mapping[str, object]) -> None:
+        self.physical_paths.add_safe(value)
+        for pair in _as_items(value.get("physical_edge_pairs")):
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                self.physical_edge_pairs.add((str(pair[0]), str(pair[1])))
-        for node in _as_items(safe_value.get("collapsed_tmp_nodes")):
-            self.collapsed_tmp_nodes.add(str(node))
-        for edge in _as_items(safe_value.get("physical_edges")):
+                self.physical_edge_pairs.add_safe((str(pair[0]), str(pair[1])))
+        for node in _as_items(value.get("collapsed_tmp_nodes")):
+            self.collapsed_tmp_nodes.add_safe(str(node))
+        for edge in _as_items(value.get("physical_edges")):
             if not isinstance(edge, Mapping):
                 continue
             for index in _as_items(edge.get("statement_indices")):
                 if isinstance(index, (int, str)) and not isinstance(index, bool):
-                    self.statement_indices.add(index)
+                    self.statement_indices.add_safe(index)
 
     def finalize(self) -> dict[str, object]:
         physical_paths = self.physical_paths.sorted_values()
+        physical_edge_pairs = []
+        for pair in self.physical_edge_pairs.sorted_values():
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                physical_edge_pairs.append(list(pair))
         return {
             "collapse": "tmp_until_formal_boundary",
             "collapsed_tmp_nodes": self.collapsed_tmp_nodes.sorted_values(),
             "collapsed_tmp_nodes_truncated": (
                 self.collapsed_tmp_nodes_truncated or self.collapsed_tmp_nodes.truncated
             ),
-            "physical_edge_pairs": [
-                list(pair) for pair in self.physical_edge_pairs.sorted_values()
-            ],
+            "physical_edge_pairs": physical_edge_pairs,
             "physical_edge_pairs_truncated": (
                 self.physical_edge_pairs_truncated or self.physical_edge_pairs.truncated
             ),
@@ -391,7 +443,7 @@ def _physical_edge_sort_key(edge: PhysicalEdge) -> tuple[str, str, str, str]:
         edge.source,
         edge.target,
         edge.evidence_type,
-        _canonical_json(_selected_physical_evidence(edge.evidence)),
+        _canonical_json_safe(_selected_physical_evidence(edge.evidence)),
     )
 
 
@@ -406,6 +458,18 @@ def _physical_edge_summary(edge: PhysicalEdge) -> dict[str, object]:
     if details:
         record["evidence"] = details
     return record
+
+
+def _cached_physical_edge_summary(
+    edge: PhysicalEdge,
+    cache: dict[int, dict[str, object]],
+) -> dict[str, object]:
+    cache_key = id(edge)
+    edge_record = cache.get(cache_key)
+    if edge_record is None:
+        edge_record = _physical_edge_summary(edge)
+        cache[cache_key] = edge_record
+    return edge_record
 
 
 def _graph_nodes(dag: ProgramPhysicalDAG) -> set[str]:
@@ -428,14 +492,30 @@ def _is_temporary(node_key: str, node_map: Mapping[str, PhysicalNode]) -> bool:
 
 def _build_adjacency(
     edges: Iterable[PhysicalEdge],
+    node_map: Mapping[str, PhysicalNode],
 ) -> dict[str, tuple[PhysicalEdge, ...]]:
     adjacency: dict[str, list[PhysicalEdge]] = {}
     for edge in edges:
         adjacency.setdefault(edge.source, []).append(edge)
-    return {
-        source: tuple(sorted(items, key=_physical_edge_sort_key))
-        for source, items in adjacency.items()
-    }
+
+    normalized: dict[str, tuple[PhysicalEdge, ...]] = {}
+    for source, items in adjacency.items():
+        # Collapse defines a path by node sequence.  Keep the same deterministic
+        # representative that the old sorted traversal selected when duplicate
+        # physical edge pairs were present, without retaining duplicate states.
+        selected_by_target: dict[str, PhysicalEdge] = {}
+        for edge in sorted(items, key=_physical_edge_sort_key):
+            if edge.target not in selected_by_target:
+                selected_by_target[edge.target] = edge
+                continue
+            if _is_temporary(edge.target, node_map):
+                # TMP states are pushed onto a LIFO stack, so the last sorted
+                # duplicate was the first one to reach a later boundary.
+                selected_by_target[edge.target] = edge
+        normalized[source] = tuple(
+            sorted(selected_by_target.values(), key=_physical_edge_sort_key)
+        )
+    return normalized
 
 
 def _included_nodes(audit: LineageAuditResult) -> set[str]:
@@ -451,16 +531,16 @@ def _included_nodes(audit: LineageAuditResult) -> set[str]:
 def _collapsed_paths(
     dag: ProgramPhysicalDAG,
     included_nodes: set[str],
-) -> tuple[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]], ...]:
-    """沿 TMP 穿透，到达第一个 formal 节点后停止。"""
+) -> Iterator[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]]]:
+    """显式遍历 TMP 路径；acyclic materialization 优先使用 DAG DP。"""
 
     node_map = _node_map(dag)
-    adjacency = _build_adjacency(dag.edges)
+    adjacency = _build_adjacency(dag.edges, node_map)
     formal_starts = sorted(
         node for node in included_nodes if not _is_temporary(node, node_map)
     )
-    paths: dict[tuple[str, ...], tuple[PhysicalEdge, ...]] = {}
     traversed_states = 0
+    collapsed_path_count = 0
 
     for start in formal_starts:
         pending: list[tuple[str, tuple[str, ...], tuple[PhysicalEdge, ...]]] = [
@@ -489,22 +569,317 @@ def _collapsed_paths(
 
                 # Formal endpoint 是一条新的业务资产边界。即使它等于 start，
                 # 也只输出一次 self edge，不再沿它继续展开。
-                completed_path = path + (next_node,)
-                if completed_path in paths:
-                    continue
-                if len(paths) >= MAX_COLLAPSED_PATHS:
+                if collapsed_path_count >= MAX_COLLAPSED_PATHS:
                     raise LineagePathEnumerationError(
                         "collapsed physical path count exceeds maximum "
                         f"({MAX_COLLAPSED_PATHS})"
                     )
-                paths[completed_path] = path_edges + (edge,)
+                collapsed_path_count += 1
+                yield path + (next_node,), path_edges + (edge,)
 
+
+def _temporary_topological_order(
+    included_nodes: set[str],
+    node_map: Mapping[str, PhysicalNode],
+    adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+) -> tuple[str, ...] | None:
+    """Return a deterministic TMP topological order, or ``None`` for a cycle."""
+
+    temporary_nodes = {node for node in included_nodes if _is_temporary(node, node_map)}
+    indegree = {node: 0 for node in temporary_nodes}
+    for source in sorted(temporary_nodes):
+        for edge in adjacency.get(source, ()):
+            if edge.target in temporary_nodes:
+                indegree[edge.target] += 1
+
+    ready = [node for node, count in indegree.items() if count == 0]
+    heapify(ready)
+    ordered: list[str] = []
+    while ready:
+        current = heappop(ready)
+        ordered.append(current)
+        for edge in adjacency.get(current, ()):
+            if edge.target not in indegree:
+                continue
+            indegree[edge.target] -= 1
+            if indegree[edge.target] == 0:
+                heappush(ready, edge.target)
+    if len(ordered) != len(temporary_nodes):
+        return None
+    return tuple(ordered)
+
+
+def _reachable_temporary_nodes(
+    start: str,
+    included_nodes: set[str],
+    node_map: Mapping[str, PhysicalNode],
+    adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+) -> set[str]:
+    reachable: set[str] = set()
+    pending = [
+        edge.target
+        for edge in adjacency.get(start, ())
+        if edge.target in included_nodes and _is_temporary(edge.target, node_map)
+    ]
+    while pending:
+        current = pending.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        pending.extend(
+            edge.target
+            for edge in adjacency.get(current, ())
+            if edge.target in included_nodes
+            and _is_temporary(edge.target, node_map)
+            and edge.target not in reachable
+        )
+    return reachable
+
+
+def _reverse_reachable_temporary_nodes(
+    target: str,
+    included_nodes: set[str],
+    node_map: Mapping[str, PhysicalNode],
+    reverse_adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+) -> set[str]:
+    reachable: set[str] = set()
+    pending = [
+        edge.source
+        for edge in reverse_adjacency.get(target, ())
+        if edge.source in included_nodes and _is_temporary(edge.source, node_map)
+    ]
+    while pending:
+        current = pending.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        pending.extend(
+            edge.source
+            for edge in reverse_adjacency.get(current, ())
+            if edge.source in included_nodes
+            and _is_temporary(edge.source, node_map)
+            and edge.source not in reachable
+        )
+    return reachable
+
+
+def _acyclic_path_counts(
+    formal_starts: Iterable[str],
+    included_nodes: set[str],
+    node_map: Mapping[str, PhysicalNode],
+    adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+    topological_order: tuple[str, ...],
+) -> dict[tuple[str, str], int]:
+    counts: dict[tuple[str, str], int] = {}
+    for start in formal_starts:
+        temporary_counts: dict[str, int] = {}
+        for edge in adjacency.get(start, ()):
+            if edge.target not in included_nodes:
+                continue
+            if _is_temporary(edge.target, node_map):
+                temporary_counts[edge.target] = temporary_counts.get(edge.target, 0) + 1
+            else:
+                identity = (start, edge.target)
+                counts[identity] = counts.get(identity, 0) + 1
+
+        for current in topological_order:
+            current_count = temporary_counts.get(current, 0)
+            if current_count == 0:
+                continue
+            for edge in adjacency.get(current, ()):
+                if edge.target not in included_nodes:
+                    continue
+                if _is_temporary(edge.target, node_map):
+                    temporary_counts[edge.target] = (
+                        temporary_counts.get(edge.target, 0) + current_count
+                    )
+                    continue
+                identity = (start, edge.target)
+                counts[identity] = counts.get(identity, 0) + current_count
+    return counts
+
+
+def _sample_acyclic_paths(
+    start: str,
+    target: str,
+    relevant_temporary_nodes: set[str],
+    included_nodes: set[str],
+    node_map: Mapping[str, PhysicalNode],
+    adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+    max_paths: int,
+) -> Iterator[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]]]:
+    """Yield a deterministic bounded sample without traversing every path."""
+
+    pending: list[tuple[str, tuple[str, ...], tuple[PhysicalEdge, ...]]] = [
+        (start, (start,), ())
+    ]
+    emitted = 0
+    while pending and emitted < max_paths:
+        current, path, path_edges = pending.pop()
+        for edge in reversed(adjacency.get(current, ())):
+            next_node = edge.target
+            if next_node not in included_nodes:
+                continue
+            if _is_temporary(next_node, node_map):
+                if next_node not in relevant_temporary_nodes or next_node in path:
+                    continue
+                pending.append((next_node, path + (next_node,), path_edges + (edge,)))
+                continue
+            if next_node != target:
+                continue
+            emitted += 1
+            yield path + (next_node,), path_edges + (edge,)
+            if emitted >= max_paths:
+                return
+
+
+def _reverse_adjacency(
+    adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+) -> dict[str, tuple[PhysicalEdge, ...]]:
+    reverse: dict[str, list[PhysicalEdge]] = {}
+    for outgoing in adjacency.values():
+        for edge in outgoing:
+            reverse.setdefault(edge.target, []).append(edge)
+    return {
+        target: tuple(sorted(edges, key=_physical_edge_sort_key))
+        for target, edges in reverse.items()
+    }
+
+
+def _collapse_acyclic_dag_to_edges(
+    dag: ProgramPhysicalDAG,
+    included_nodes: set[str],
+    *,
+    batch_id: str,
+    observed_at: datetime,
+    job_key: str | None,
+) -> tuple[LineageEdge, ...] | None:
+    """Collapse an acyclic TMP graph with exact DP counts and bounded samples.
+
+    ``None`` means the TMP subgraph contains a cycle; callers must use the
+    simple-path fallback because exact cyclic path counts need different
+    semantics.
+    """
+
+    node_map = _node_map(dag)
+    adjacency = _build_adjacency(dag.edges, node_map)
+    topological_order = _temporary_topological_order(
+        included_nodes,
+        node_map,
+        adjacency,
+    )
+    if topological_order is None:
+        return None
+
+    formal_starts = sorted(
+        node for node in included_nodes if not _is_temporary(node, node_map)
+    )
+    path_counts = _acyclic_path_counts(
+        formal_starts,
+        included_nodes,
+        node_map,
+        adjacency,
+        topological_order,
+    )
+    if not path_counts:
+        return ()
+
+    reverse_adjacency = _reverse_adjacency(adjacency)
+    forward_cache: dict[str, set[str]] = {}
+    backward_cache: dict[str, set[str]] = {}
+    shared_edge_summary_cache: dict[int, dict[str, object]] = {}
+    source = dag.program_source
+    grouped: dict[
+        tuple[str, str, str, str, str, str],
+        _EdgeEvidenceAccumulator,
+    ] = {}
+
+    for (source_table, target_table), path_count in sorted(path_counts.items()):
+        identity = (
+            source.environment,
+            source.source_profile,
+            source_table,
+            target_table,
+            source.program_name,
+            job_key or "",
+        )
+        accumulator = _EdgeEvidenceAccumulator(
+            path_count=path_count,
+            physical_edge_summaries=shared_edge_summary_cache,
+        )
+        forward_nodes = forward_cache.get(source_table)
+        if forward_nodes is None:
+            forward_nodes = _reachable_temporary_nodes(
+                source_table,
+                included_nodes,
+                node_map,
+                adjacency,
+            )
+            forward_cache[source_table] = forward_nodes
+        backward_nodes = backward_cache.get(target_table)
+        if backward_nodes is None:
+            backward_nodes = _reverse_reachable_temporary_nodes(
+                target_table,
+                included_nodes,
+                node_map,
+                reverse_adjacency,
+            )
+            backward_cache[target_table] = backward_nodes
+        relevant_temporary_nodes = forward_nodes & backward_nodes
+
+        relevant_edges: list[PhysicalEdge] = []
+        for edge in adjacency.get(source_table, ()):
+            if edge.target == target_table or edge.target in relevant_temporary_nodes:
+                relevant_edges.append(edge)
+        for node in sorted(relevant_temporary_nodes):
+            for edge in adjacency.get(node, ()):
+                if (
+                    edge.target == target_table
+                    or edge.target in relevant_temporary_nodes
+                ):
+                    relevant_edges.append(edge)
+        accumulator.add_graph_summary(relevant_edges, relevant_temporary_nodes)
+
+        for path, physical_edges in _sample_acyclic_paths(
+            source_table,
+            target_table,
+            relevant_temporary_nodes,
+            included_nodes,
+            node_map,
+            adjacency,
+            MAX_PHYSICAL_PATHS,
+        ):
+            accumulator.add_path(path, physical_edges, count=False)
+        grouped[identity] = accumulator
+
+    materialized_edges = []
+    for identity, accumulator in grouped.items():
+        _, _, source_table, target_table, _, _ = identity
+        materialized_edges.append(
+            LineageEdge(
+                environment=source.environment,
+                source_profile=source.source_profile,
+                source_table=source_table,
+                target_table=target_table,
+                program_name=source.program_name,
+                job_key=job_key,
+                evidence_type="physical_dag",
+                source_hash=source.source_hash,
+                batch_id=batch_id,
+                observed_at=observed_at,
+                updated_at=observed_at,
+                is_active=True,
+                evidence=accumulator.finalize(),
+            )
+        )
     return tuple(
         sorted(
-            paths.items(),
-            key=lambda item: (
-                _canonical_json(item[0]),
-                tuple(_physical_edge_sort_key(edge) for edge in item[1]),
+            materialized_edges,
+            key=lambda edge: (
+                _edge_identity(edge),
+                edge.source_hash or "",
+                edge.evidence_type,
+                _canonical_json(edge.evidence),
             ),
         )
     )
@@ -524,8 +899,15 @@ def _edge_identity(edge: LineageEdge) -> tuple[str, str, str, str, str, str]:
 def _path_evidence(
     path: tuple[str, ...],
     physical_edges: tuple[PhysicalEdge, ...],
+    *,
+    edge_summary_cache: dict[int, dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    edge_records = [_physical_edge_summary(edge) for edge in physical_edges]
+    edge_records = []
+    for edge in physical_edges:
+        if edge_summary_cache is None:
+            edge_records.append(_physical_edge_summary(edge))
+            continue
+        edge_records.append(_cached_physical_edge_summary(edge, edge_summary_cache))
     # path[1:-1] 只包含 traversal 中实际穿透的 temporary 节点，
     # 也涵盖通过 CREATE TEMP 标记但名称不是 TMP 的节点。
     tmp_nodes = sorted(set(path[1:-1]))
@@ -598,32 +980,46 @@ def _collapse_paths_to_edges(
     observed_at: datetime,
     job_key: str | None,
 ) -> tuple[LineageEdge, ...]:
+    source = dag.program_source
     grouped: dict[
         tuple[str, str, str, str, str, str],
-        tuple[LineageEdge, _EdgeEvidenceAccumulator],
+        _EdgeEvidenceAccumulator,
     ] = {}
     for path, physical_edges in paths:
-        edge = _lineage_edge_from_path(
-            dag,
-            path,
-            physical_edges,
-            batch_id=batch_id,
-            observed_at=observed_at,
-            job_key=job_key,
+        identity = (
+            source.environment,
+            source.source_profile,
+            path[0],
+            path[-1],
+            source.program_name,
+            job_key or "",
         )
-        identity = _edge_identity(edge)
-        entry = grouped.get(identity)
-        if entry is None:
+        accumulator = grouped.get(identity)
+        if accumulator is None:
             accumulator = _EdgeEvidenceAccumulator()
-            grouped[identity] = (edge, accumulator)
-        else:
-            accumulator = entry[1]
-        accumulator.add_evidence(edge.evidence)
+            grouped[identity] = accumulator
+        accumulator.add_path(path, physical_edges)
 
-    materialized_edges = [
-        replace(edge, evidence=accumulator.finalize())
-        for edge, accumulator in grouped.values()
-    ]
+    materialized_edges = []
+    for identity, accumulator in grouped.items():
+        _, _, source_table, target_table, _, _ = identity
+        materialized_edges.append(
+            LineageEdge(
+                environment=source.environment,
+                source_profile=source.source_profile,
+                source_table=source_table,
+                target_table=target_table,
+                program_name=source.program_name,
+                job_key=job_key,
+                evidence_type="physical_dag",
+                source_hash=source.source_hash,
+                batch_id=batch_id,
+                observed_at=observed_at,
+                updated_at=observed_at,
+                is_active=True,
+                evidence=accumulator.finalize(),
+            )
+        )
     return tuple(
         sorted(
             materialized_edges,
@@ -704,7 +1100,9 @@ def materialize_program(
 
     ``audit_result`` 未提供时只调用既有 Phase 4 auditor，不在这里复制 detector。
     已知 expected target 时只使用 ``target_reachable_nodes``；未知 target 时不猜 sink，
-    仅 materialize 图中已有的 formal-to-formal boundary。
+    仅 materialize 图中已有的 formal-to-formal boundary。TMP 子图无环时使用
+    exact DAG path-count DP 加 bounded representative sample；TMP 有环时保留
+    explicit simple-path fallback 及其 controlled limits。
     """
 
     if not isinstance(dag, ProgramPhysicalDAG):
@@ -727,14 +1125,24 @@ def materialize_program(
     normalized_job_key = job_key.strip() if isinstance(job_key, str) else None
     selected_issues = audit.issues if issues is None else issues
     included_nodes = _included_nodes(audit)
-    paths = _collapsed_paths(dag, included_nodes)
-    edges = _collapse_paths_to_edges(
+    acyclic_edges = _collapse_acyclic_dag_to_edges(
         dag,
-        paths,
+        included_nodes,
         batch_id=resolved_batch_id,
         observed_at=resolved_observed_at,
         job_key=normalized_job_key,
     )
+    if acyclic_edges is None:
+        paths = _collapsed_paths(dag, included_nodes)
+        edges = _collapse_paths_to_edges(
+            dag,
+            paths,
+            batch_id=resolved_batch_id,
+            observed_at=resolved_observed_at,
+            job_key=normalized_job_key,
+        )
+    else:
+        edges = acyclic_edges
     prepared_issues = _prepare_issues(
         selected_issues,
         batch_id=resolved_batch_id,
@@ -825,9 +1233,14 @@ def materialize_batch(
                     error,
                 )
             raise
-        materialization_elapsed_ms = int(
-            (perf_counter() - materialization_started_at) * 1000
-        )
+        try:
+            materialization_elapsed_ms = int(
+                (perf_counter() - materialization_started_at) * 1000
+            )
+        except (OverflowError, ValueError) as error:
+            raise RuntimeError(
+                "failed to calculate materialization elapsed time"
+            ) from error
         if program_observer is not None:
             program_observer(
                 audit,
