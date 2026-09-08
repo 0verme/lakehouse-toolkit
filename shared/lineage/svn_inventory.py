@@ -675,7 +675,7 @@ class SVNScanResult:
 def _initial_layer_counts(layout: str) -> dict[str, int]:
     if layout == DWF_LAYOUT:
         return {DWF_LAYER: 0}
-    return {layer: 0 for layer in PROCESSING_LAYERS}
+    return dict.fromkeys(PROCESSING_LAYERS, 0)
 
 
 def _initial_reason_counts() -> dict[str, int]:
