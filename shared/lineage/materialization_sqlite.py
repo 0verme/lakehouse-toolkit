@@ -21,6 +21,7 @@ from shared.lineage.domain import (
     LineageEdge,
     LineageIssue,
     ProgramState,
+    canonicalize_dataset_name,
 )
 
 from .evolution import (  # pyright: ignore[reportMissingImports]
@@ -859,7 +860,10 @@ class SQLiteMaterializationStore:
         else:
             query_sql = EDGE_INCOMING_PROFILE_NEIGHBOR_SQL
 
-        params: list[object] = [environment.strip(), table.strip()]
+        canonical_table = canonicalize_dataset_name(table)
+        if canonical_table is None:
+            raise ValueError("table must be a qualified schema.table dataset reference")
+        params: list[object] = [environment.strip(), canonical_table]
         if source_profile is not None:
             params.append(source_profile.strip())
 

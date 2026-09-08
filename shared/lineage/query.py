@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from .domain import LineageEdge, normalize_asset_name
+from .domain import LineageEdge, canonicalize_dataset_name
 
 DEFAULT_QUERY_DEPTH = 7
 DEFAULT_QUERY_MAX_NODES = 300
@@ -508,9 +508,9 @@ def _build_scope(environment: str, source_profile: str | None) -> _QueryScope:
 
 def _normalize_table(table: str) -> str:
     text = _required_text(table, "table")
-    normalized = normalize_asset_name(text)
-    if not normalized:
-        raise ValueError("table must contain a non-empty asset name")
+    normalized = canonicalize_dataset_name(text)
+    if normalized is None:
+        raise ValueError("table must be a qualified schema.table dataset reference")
     return normalized
 
 

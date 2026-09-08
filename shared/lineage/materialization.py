@@ -31,6 +31,7 @@ from shared.lineage.audit import (
     _value_sort_key as _audit_value_sort_key,
 )
 from shared.lineage.domain import (
+    DatasetIdentity,
     IssueType,
     LineageEdge,
     LineageIssue,
@@ -490,6 +491,10 @@ def _is_temporary(node_key: str, node_map: Mapping[str, PhysicalNode]) -> bool:
     return is_temporary_asset(node_key)
 
 
+def _has_dataset_identity(environment: str, node_key: str) -> bool:
+    return DatasetIdentity.from_name(environment, node_key) is not None
+
+
 def _build_adjacency(
     edges: Iterable[PhysicalEdge],
     node_map: Mapping[str, PhysicalNode],
@@ -537,7 +542,10 @@ def _collapsed_paths(
     node_map = _node_map(dag)
     adjacency = _build_adjacency(dag.edges, node_map)
     formal_starts = sorted(
-        node for node in included_nodes if not _is_temporary(node, node_map)
+        node
+        for node in included_nodes
+        if not _is_temporary(node, node_map)
+        and _has_dataset_identity(dag.program_source.environment, node)
     )
     traversed_states = 0
     collapsed_path_count = 0
@@ -565,6 +573,9 @@ def _collapsed_paths(
                     pending.append(
                         (next_node, path + (next_node,), path_edges + (edge,))
                     )
+                    continue
+                if not _has_dataset_identity(dag.program_source.environment, next_node):
+                    # 缺少 schema 的引用保持 unresolved，不猜测 namespace。
                     continue
 
                 # Formal endpoint 是一条新的业务资产边界。即使它等于 start，
@@ -772,7 +783,10 @@ def _collapse_acyclic_dag_to_edges(
         return None
 
     formal_starts = sorted(
-        node for node in included_nodes if not _is_temporary(node, node_map)
+        node
+        for node in included_nodes
+        if not _is_temporary(node, node_map)
+        and _has_dataset_identity(dag.program_source.environment, node)
     )
     path_counts = _acyclic_path_counts(
         formal_starts,
@@ -795,6 +809,8 @@ def _collapse_acyclic_dag_to_edges(
     ] = {}
 
     for (source_table, target_table), path_count in sorted(path_counts.items()):
+        if not _has_dataset_identity(source.environment, target_table):
+            continue
         identity = (
             source.environment,
             source.source_profile,
@@ -986,6 +1002,11 @@ def _collapse_paths_to_edges(
         _EdgeEvidenceAccumulator,
     ] = {}
     for path, physical_edges in paths:
+        if not (
+            _has_dataset_identity(source.environment, path[0])
+            and _has_dataset_identity(source.environment, path[-1])
+        ):
+            continue
         identity = (
             source.environment,
             source.source_profile,
