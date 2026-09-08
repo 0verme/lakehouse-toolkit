@@ -81,6 +81,7 @@ from .materialization_sqlite import (  # pyright: ignore[reportMissingImports]
     MaterializationSQLiteStore,
     PublishResult,
     SQLiteMaterializationStore,
+    SQLitePublishMetrics,
     initialize_materialization_schema,
     publish_materialization_batch,
 )
@@ -176,6 +177,7 @@ __all__ = [
     "ProgramMaterialization",
     "PublishResult",
     "SQLiteMaterializationStore",
+    "SQLitePublishMetrics",
     "build_materialization_batch",
     "collapse_tmp_edges",
     "initialize_materialization_schema",

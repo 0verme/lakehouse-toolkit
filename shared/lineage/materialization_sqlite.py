@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from shared.lineage.domain import (
@@ -257,6 +258,32 @@ class PublishResult:
     program_count: int = 0
 
 
+@dataclass(slots=True)
+class SQLitePublishMetrics:
+    """Optional aggregate timings and row counts for SQLite publish diagnostics."""
+
+    prepare_ms: int = 0
+    insert_ms: int = 0
+    validate_ms: int = 0
+    active_switch_ms: int = 0
+    commit_ms: int = 0
+    prepared_edge_rows: int = 0
+    prepared_issue_rows: int = 0
+    prepared_program_rows: int = 0
+    validated_edge_rows: int = 0
+    validated_issue_rows: int = 0
+    validated_program_rows: int = 0
+    evidence_serialization_calls: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCandidate:
+    batch: MaterializationBatch
+    edge_rows: tuple[tuple[object, ...], ...]
+    issue_rows: tuple[tuple[object, ...], ...]
+    program_state_rows: tuple[tuple[object, ...], ...]
+
+
 def _migrate_schema(connection: sqlite3.Connection) -> None:
     """将旧 reference schema 升级到当前版本且不改写历史 facts。"""
 
@@ -475,6 +502,32 @@ def _program_state_row(
     )
 
 
+def _prepare_candidate(
+    batch: MaterializationBatch,
+    instrumentation: SQLitePublishMetrics | None = None,
+) -> _PreparedCandidate:
+    prepared_batch = _prepare_batch(batch)
+    edge_rows = tuple(_edge_row(edge, prepared_batch) for edge in prepared_batch.edges)
+    issue_rows = tuple(
+        _issue_row(issue, prepared_batch) for issue in prepared_batch.issues
+    )
+    program_state_rows = tuple(
+        _program_state_row(state, prepared_batch)
+        for state in prepared_batch.program_states
+    )
+    if instrumentation is not None:
+        instrumentation.prepared_edge_rows = len(edge_rows)
+        instrumentation.prepared_issue_rows = len(issue_rows)
+        instrumentation.prepared_program_rows = len(program_state_rows)
+        instrumentation.evidence_serialization_calls = len(edge_rows) + len(issue_rows)
+    return _PreparedCandidate(
+        batch=prepared_batch,
+        edge_rows=edge_rows,
+        issue_rows=issue_rows,
+        program_state_rows=program_state_rows,
+    )
+
+
 class SQLiteMaterializationStore:
     """保存 candidate 并以单个 SQLite transaction 切换 active batch。"""
 
@@ -564,16 +617,16 @@ class SQLiteMaterializationStore:
     def _validate_candidate_in_transaction(
         self,
         connection: sqlite3.Connection,
-        batch: MaterializationBatch,
+        candidate: _PreparedCandidate,
+        instrumentation: SQLitePublishMetrics | None = None,
     ) -> None:
+        batch = candidate.batch
         edge_identities: set[tuple[str, str, str, str, str, str]] = set()
         for edge in batch.edges:
             identity = _edge_identity(edge)
             if identity in edge_identities:
                 raise ValueError("candidate batch contains duplicate LineageEdge facts")
             edge_identities.add(identity)
-            # Serialization is deliberately attempted before active switch.
-            _canonical_json(edge.evidence)
 
         issue_identities: set[tuple[str, str, str, str, str, str, str]] = set()
         for issue in batch.issues:
@@ -583,7 +636,6 @@ class SQLiteMaterializationStore:
                     "candidate batch contains duplicate LineageIssue facts"
                 )
             issue_identities.add(identity)
-            _canonical_json(issue.evidence)
 
         program_identities: set[tuple[str, str, str]] = set()
         for state in batch.program_states:
@@ -597,6 +649,11 @@ class SQLiteMaterializationStore:
                     "candidate batch contains duplicate ProgramState facts"
                 )
             program_identities.add(identity)
+
+        if instrumentation is not None:
+            instrumentation.validated_edge_rows = len(batch.edges)
+            instrumentation.validated_issue_rows = len(batch.issues)
+            instrumentation.validated_program_rows = len(batch.program_states)
 
         stored_edge_count, stored_issue_count, stored_program_count = (
             self._candidate_counts(connection, batch.batch_id)
@@ -628,8 +685,9 @@ class SQLiteMaterializationStore:
     def _insert_candidate(
         self,
         connection: sqlite3.Connection,
-        batch: MaterializationBatch,
+        candidate: _PreparedCandidate,
     ) -> None:
+        batch = candidate.batch
         connection.execute(
             """
             INSERT INTO lineage_batch(
@@ -651,7 +709,7 @@ class SQLiteMaterializationStore:
                 batch_id, observed_at, updated_at, is_active
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [_edge_row(edge, batch) for edge in batch.edges],
+            candidate.edge_rows,
         )
         connection.executemany(
             """
@@ -661,7 +719,7 @@ class SQLiteMaterializationStore:
                 first_seen_at, last_seen_at, is_active
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [_issue_row(issue, batch) for issue in batch.issues],
+            candidate.issue_rows,
         )
         connection.executemany(
             """
@@ -671,7 +729,7 @@ class SQLiteMaterializationStore:
                 batch_id, is_active
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [_program_state_row(state, batch) for state in batch.program_states],
+            candidate.program_state_rows,
         )
 
     @staticmethod
@@ -694,19 +752,28 @@ class SQLiteMaterializationStore:
         batch: MaterializationBatch,
         *,
         stage_hook: Callable[[str], Any] | None = None,
+        instrumentation: SQLitePublishMetrics | None = None,
     ) -> PublishResult:
-        """在一个 transaction 内完成 candidate、validation 和 active switch。
+        """在一个 transaction 内完成 prepare、insert、validation 和 active switch。
 
         ``stage_hook`` 仅用于公开测试/demo 注入故障；任何异常都会 rollback，
-        因此旧 active batch 不会被切成空表或半成品。
+        因此旧 active batch 不会被切成空表或半成品。candidate row payload 在
+        prepare 阶段只生成一次，insert 与 validation 复用同一份 canonical JSON。
         """
 
         if not isinstance(batch, MaterializationBatch):
             raise TypeError("batch must be a MaterializationBatch")
+        if instrumentation is not None and not isinstance(
+            instrumentation, SQLitePublishMetrics
+        ):
+            raise TypeError("instrumentation must be SQLitePublishMetrics or None")
         with self._connection_scope() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 previous_batch_id = self._active_batch_id(connection)
+                prepare_started_at = (
+                    perf_counter() if instrumentation is not None else None
+                )
                 # SQL is selected from a fixed module constant.
                 # pi-lens-ignore: python-sql-injection
                 previous_issue_rows = connection.execute(
@@ -720,14 +787,42 @@ class SQLiteMaterializationStore:
                     batch.issues,
                     observed_at=batch.observed_at,
                 )
-                prepared = _prepare_batch(
-                    replace(batch, issues=reconciled.current_issues)
+                prepared = _prepare_candidate(
+                    replace(batch, issues=reconciled.current_issues),
+                    instrumentation,
+                )
+                if instrumentation is not None and prepare_started_at is not None:
+                    instrumentation.prepare_ms = int(
+                        (perf_counter() - prepare_started_at) * 1000
+                    )
+
+                insert_started_at = (
+                    perf_counter() if instrumentation is not None else None
                 )
                 self._insert_candidate(connection, prepared)
+                if instrumentation is not None and insert_started_at is not None:
+                    instrumentation.insert_ms = int(
+                        (perf_counter() - insert_started_at) * 1000
+                    )
                 self._call_stage_hook(stage_hook, "after_candidate_insert")
-                self._validate_candidate_in_transaction(connection, prepared)
+
+                validate_started_at = (
+                    perf_counter() if instrumentation is not None else None
+                )
+                self._validate_candidate_in_transaction(
+                    connection,
+                    prepared,
+                    instrumentation,
+                )
+                if instrumentation is not None and validate_started_at is not None:
+                    instrumentation.validate_ms = int(
+                        (perf_counter() - validate_started_at) * 1000
+                    )
                 self._call_stage_hook(stage_hook, "after_validate")
 
+                active_switch_started_at = (
+                    perf_counter() if instrumentation is not None else None
+                )
                 connection.execute(
                     "UPDATE lineage_edge SET is_active = 0 WHERE is_active = 1"
                 )
@@ -746,32 +841,48 @@ class SQLiteMaterializationStore:
                     SET is_active = 1, published_at = ?
                     WHERE batch_id = ?
                     """,
-                    (_datetime_text(prepared.observed_at), prepared.batch_id),
+                    (
+                        _datetime_text(prepared.batch.observed_at),
+                        prepared.batch.batch_id,
+                    ),
                 )
                 connection.execute(
                     "UPDATE lineage_edge SET is_active = 1 WHERE batch_id = ?",
-                    (prepared.batch_id,),
+                    (prepared.batch.batch_id,),
                 )
                 connection.execute(
                     "UPDATE lineage_issue SET is_active = 1 WHERE batch_id = ?",
-                    (prepared.batch_id,),
+                    (prepared.batch.batch_id,),
                 )
                 connection.execute(
                     "UPDATE lineage_program_state SET is_active = 1 WHERE batch_id = ?",
-                    (prepared.batch_id,),
+                    (prepared.batch.batch_id,),
                 )
+                if instrumentation is not None and active_switch_started_at is not None:
+                    instrumentation.active_switch_ms = int(
+                        (perf_counter() - active_switch_started_at) * 1000
+                    )
                 self._call_stage_hook(stage_hook, "after_active_switch")
+
+                commit_started_at = (
+                    perf_counter() if instrumentation is not None else None
+                )
                 connection.commit()
+                if instrumentation is not None and commit_started_at is not None:
+                    instrumentation.commit_ms = int(
+                        (perf_counter() - commit_started_at) * 1000
+                    )
             except Exception:
                 connection.rollback()
                 raise
 
+        prepared_batch = prepared.batch
         return PublishResult(
-            batch_id=prepared.batch_id,
-            edge_count=len(prepared.edges),
-            issue_count=len(prepared.issues),
+            batch_id=prepared_batch.batch_id,
+            edge_count=len(prepared_batch.edges),
+            issue_count=len(prepared_batch.issues),
             previous_batch_id=previous_batch_id,
-            program_count=len(prepared.program_states),
+            program_count=len(prepared_batch.program_states),
         )
 
     publish_batch = publish
@@ -796,12 +907,14 @@ class SQLiteMaterializationStore:
             )
             self._validate_candidate_in_transaction(
                 connection,
-                MaterializationBatch(
-                    batch_id=candidate_id,
-                    observed_at=_parse_datetime(str(row[0])),
-                    edges=edges,
-                    issues=issues,
-                    program_states=program_states,
+                _prepare_candidate(
+                    MaterializationBatch(
+                        batch_id=candidate_id,
+                        observed_at=_parse_datetime(str(row[0])),
+                        edges=edges,
+                        issues=issues,
+                        program_states=program_states,
+                    )
                 ),
             )
 
@@ -1036,12 +1149,14 @@ def publish_materialization_batch(
     db_path: str | Path | sqlite3.Connection = DEFAULT_MATERIALIZATION_DB_PATH,
     *,
     stage_hook: Callable[[str], Any] | None = None,
+    instrumentation: SQLitePublishMetrics | None = None,
 ) -> PublishResult:
     """函数式 publish facade，供 crontab 入口和 demo 使用。"""
 
     return SQLiteMaterializationStore(db_path).publish(
         batch,
         stage_hook=stage_hook,
+        instrumentation=instrumentation,
     )
 
 
@@ -1052,6 +1167,7 @@ __all__ = [
     "PublishResult",
     "SCHEMA_SQL",
     "SQLiteMaterializationStore",
+    "SQLitePublishMetrics",
     "initialize_materialization_schema",
     "publish_materialization_batch",
 ]
