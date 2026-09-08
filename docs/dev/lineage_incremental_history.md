@@ -2,7 +2,9 @@
 
 Phase 7 在 Phase 1～6 的 Provider → Physical DAG → Audit → TMP collapse →
 materialization → Query 主链上增加演进能力。它不改变 `LineageEdge` 的方向，
-也不向 Viewer JSON 增加历史字段。
+也不向 Viewer JSON 增加历史字段。ProgramIdentity、ProgramState、rename/delete/
+restore、Batch 与 runtime boundary 的完整 V1 contract 见
+[`lineage_program_identity.md`](lineage_program_identity.md)。
 
 ## Program identity 与 source hash
 
@@ -11,6 +13,9 @@ materialization → Query 主链上增加演进能力。它不改变 `LineageEdg
 ```text
 environment / source_profile / program_name
 ```
+
+identity boundary 只 trim surrounding whitespace，保留现有字段大小写；不要把
+`source_hash`、`pipeline_version`、`batch_id` 或不稳定 `job_key` 加入 identity。
 
 例如 `DEV/mysql_dev_a/PROGRAM_DEMO_A` 和
 `PROD/production_metadata/PROGRAM_DEMO_A` 是两个程序实例。当前

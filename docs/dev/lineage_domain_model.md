@@ -9,7 +9,7 @@
 | 对象 | 作用 | 关键 optional 语义 |
 | --- | --- | --- |
 | `DatasetIdentity` | 正式 physical Dataset 的稳定 identity | `environment/canonical_schema/canonical_table` 三元组；不含 `source_profile`、platform 或 catalog。 |
-| `ProgramIdentity` | 程序实例的稳定 identity | `environment/source_profile/program_name` 三元组；不把没有稳定来源的 `job_key` 猜测加入。 |
+| `ProgramIdentity` | static Program / Job definition 的稳定 identity | `environment/source_profile/program_name` 三元组；字段只 trim surrounding whitespace；不把没有稳定来源的 `job_key` 猜测加入。完整语义见 [`lineage_program_identity.md`](lineage_program_identity.md)。 |
 | `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示 Provider 无法提供预期结果表；`source_hash=None` 表示尚未提供 hash。 |
 | `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、`pipeline_version`、first/last seen、last changed、batch 与 active 标记；旧 state 缺少版本时按需 rebuild，不保存完整源码。 |
 | `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |
@@ -18,7 +18,8 @@
 | `LineageIssue` | Physical DAG 审计事实 | `node_key`、`branch_sink` 与 `stable_key` 可按 issue 类型选择；生命周期时间字段可在首次发现时补齐。 |
 
 Dataset Identity 的完整 V1 contract、canonicalization、missing schema 和 TMP 边界见
-[`lineage_dataset_identity.md`](lineage_dataset_identity.md)。
+[`lineage_dataset_identity.md`](lineage_dataset_identity.md)；ProgramIdentity、ProgramState
+和 static Job / Batch 边界见 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
 ### `ProgramSource`
 

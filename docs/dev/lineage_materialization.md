@@ -9,7 +9,9 @@ DAG，也不替换现有生产入口。
 [`lineage_dataset_identity.md`](lineage_dataset_identity.md)：只有
 `environment + schema + table` 能形成 DatasetIdentity；缺少 schema 的引用不会被
 猜测成正式 edge。`source_profile`、program 和 job 仍保留在 lineage fact identity
-中，不能与 Dataset identity 混为一谈。
+中，不能与 Dataset identity 混为一谈。ProgramIdentity / ProgramState 与
+`Batch != Runtime Run` 的完整边界见
+[`lineage_program_identity.md`](lineage_program_identity.md)。
 
 ## Physical DAG 与 Business Lineage
 
@@ -195,10 +197,10 @@ repository 可以复用 `MaterializationBatch`，不必绑定 SQLite。
 | --- | --- |
 | `environment` / `source_profile` | 来源环境和 profile |
 | `source_table` / `target_table` | 正式上游、正式下游 |
-| `program_name` / `job_key` | 程序和可选作业身份 |
+| `program_name` / `job_key` | 程序名称和可选作业 provenance；不等于 runtime Job identity |
 | `evidence_type` / `evidence` | provenance 类型和 deterministic JSON |
-| `source_hash` | Provider 提供的原值；本阶段不用于增量 rebuild |
-| `batch_id` | materialization snapshot |
+| `source_hash` | Provider 提供的 source/content version 原值；增量语义见 [`lineage_program_identity.md`](lineage_program_identity.md) |
+| `batch_id` | materialization/replay snapshot；不是 runtime Run |
 | `observed_at` / `updated_at` | 本批次统一观察/更新时间 |
 | `is_active` | 是否属于当前 active snapshot |
 
