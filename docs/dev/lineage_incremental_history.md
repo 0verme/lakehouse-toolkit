@@ -220,10 +220,10 @@ program_name）排序取前 N 个，只有这 N 个进入 parser/DAG/audit。日
 `replay_mode`、`selected_profiles`、`source_total`、`replay_total`、
 `force_rebuild` 和 `partial_snapshot`，不输出源码、SQL、表名或连接凭据。
 
-任何 controlled replay（包括只指定 profile）都按 partial snapshot 发布；尤其是
-使用 `--limit` 时，sample 外的程序不能被判定为 `DELETED`。因此 replay 不会因
-未读取的程序触发 complete snapshot DELETE，但它也不用于宣称某个 profile 已经
-完整同步。推荐内网验证阶梯：
+带 `--limit` 的 controlled replay 始终按 partial snapshot 发布；sample 外的程序
+不能被判定为 `DELETED`。只指定 profile 且不带 `--limit` 时，若该 profile 成功完成
+全量 inventory/read，则允许仅在该 profile scope 内进行 disappearance 判断；provider
+失败或 diagnostics 存在时仍自动降级为 partial。推荐内网验证阶梯：
 
 ```text
 100 programs

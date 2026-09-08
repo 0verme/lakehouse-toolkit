@@ -4,9 +4,9 @@ Phase 2 把不同 metadata 来源统一成 Phase 1 冻结的 `ProgramSource`。P
 负责“获取程序”，不负责解释程序内容：
 
 ```text
-MySQL / legacy metadata
-          ↓
-       Provider
+MySQL / legacy metadata       local SVN working copy
+          ↓                              ↓
+       Provider ← validated inventory ───┘
           ↓
     ProgramSource
           ↓
@@ -28,6 +28,46 @@ streaming 聚合器，不会把所有程序先转换成 `list`。
 
 Provider 不做 SQL parsing、表名提取、TMP 判断、sink/audit、Physical DAG、TMP
 collapse 或 lineage materialization；`script_code` 到达 `ProgramSource` 后即停止。
+
+## Production SVN profiles
+
+`SVNProgramSourceProvider`（别名 `ProductionSVNProvider`）只消费已经 checkout
+的 local working copy。它不执行 `svn checkout`、`svn update`，不访问 SVN URL，也
+不读取 credentials。`load_program_source_providers()` 会在保留 MySQL profiles 的
+同时加载 `svn_profiles`；旧的 `ProductionProvider` 仍是独立的 legacy metadata
+adapter，不会被替换成 SVN backend。
+
+公开配置保留两个独立的 production profile，即使它们共享同一个 local root：
+
+```yaml
+svn_profiles:
+  - name: prod_svn_processing
+    environment: PROD
+    root_path: "E:/demo/svn/production"
+    layout: processing
+  - name: prod_svn_dwf
+    environment: PROD
+    root_path: "E:/demo/svn/production"
+    layout: dwf
+```
+
+inventory 先按 `processing` / `dwf` 的 directory contract 验证
+`matched_program_file` 和 `declared_primary_target`。Provider 只读取 matched 文件，
+复用 `read_python_source()` 的 coding-cookie / decode 规则，并将
+`declared_primary_target` 原样作为 `ProgramSource.expected_target`；不从文件名、
+SQL 最后一个写入或 fuzzy match 猜 target。源码不会写回 inventory report。
+
+SVN 的兼容 `program_name` 是 `SVN/<case-folded repository-relative locator>`，
+locator 同时包含 directory layout 和 filename，并统一为 `/` 分隔符。它不包含
+absolute root、drive letter 或 SVN URL，因此不同机器的同一相对文件得到相同
+`ProgramIdentity` 和 `source_hash`。不同相对文件如果因规范化发生 collision，
+provider 会拒绝这些文件并记录 `IDENTITY_COLLISION`，不会覆盖。
+
+每次 provider 迭代都保留安全 accounting：`OUT_OF_SCOPE` 只计数、不进入
+`ProgramSource`；malformed candidate、read/decode failure 和 identity collision
+会记录固定 reason 与 anonymous `program_id`，不输出 path、filename、program_name、
+SQL 或源码。只要 profile 不是成功完整扫描，job 就把 snapshot 降级为 partial，
+不会获得 disappearance / `DELETED` authority。
 
 ## DEV MySQL profiles
 
@@ -155,10 +195,36 @@ metadata 字段时可以注入 `expected_target_getter`。若已核验历史
 复制一套 legacy SQL，也没有修改旧工具入口。旧调用方继续使用原来的 loader；新
 调用方可以单独使用 Provider contract。
 
+## 内网验收命令
+
+以下命令只适用于已配置 local root 和凭据的内网机器；本地开发环境不要伪造
+full replay 结果。`--limit` 始终是 partial replay；不带 `--limit` 的单 profile
+命令只有在 provider 完整成功时才允许该 profile scope 内的 disappearance 判断。
+
+```bash
+# processing sample
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 20 --force-rebuild
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 100 --force-rebuild
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 500 --force-rebuild
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --force-rebuild
+
+# DWF sample
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 20 --force-rebuild
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 100 --force-rebuild
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 500 --force-rebuild
+python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --force-rebuild
+```
+
+最后两条是 profile full 命令，不代表本仓库已经执行过真实内网扫描。验收时应
+核对脱敏 accounting，目标规模仅作外部 evidence 对照：processing `3851`、DWF
+`4155`、合计 `8006`。
+
 ## 安全与边界
 
 仓库只提交 example 配置，其中使用 `demo_meta`、demo 占位值和占位环境变量名。
 真实密码、Token、私钥和连接串不得提交；内网人工执行可将 `connection` 写入被
 忽略的 `*.local.yaml`，CI / Docker 应使用 `connection_env` 或外部 secret manager。
-Phase 2 不实现 Parser、Physical DAG、Audit、TMP collapse、materialization、
-query/viewer、incremental rebuild 或 history/diff。
+Phase 2 不实现 Parser、Physical DAG、Audit、TMP collapse 或另一套
+materialization；SVN provider 只把 source 接入现有 pipeline，后续仍复用既有
+Physical DAG、Audit、incremental rebuild、materialization、query/viewer 和
+history/diff。

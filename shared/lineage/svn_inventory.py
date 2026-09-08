@@ -17,10 +17,22 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = ROOT_DIR / "configs" / "lineage_providers.local.yaml"
+EXAMPLE_CONFIG_PATH = ROOT_DIR / "configs" / "lineage_providers.example.yaml"
+
 WORKSPACE_DIR = "DIDP_PROJECT_WORKSPACE"
 PROCESSING_LAYOUT = "processing"
 DWF_LAYOUT = "dwf"
 SUPPORTED_LAYOUTS = frozenset({PROCESSING_LAYOUT, DWF_LAYOUT})
+_LOCAL_PROFILE_KEYS = frozenset(
+    {
+        "name",
+        "environment",
+        "root_path",
+        "layout",
+    }
+)
 
 # DWE is retained because it is present in the legacy is_dws_py matcher.  The
 # six layers below are the required production-processing layers documented by
@@ -105,6 +117,26 @@ class SVNProfile:
             self.environment
         ):
             raise SVNInventoryConfigError("environment must be a safe alias")
+        object.__setattr__(self, "environment", self.environment.strip().upper())
+        if not isinstance(self.root_path, Path):
+            try:
+                raw_root_text = os.fspath(self.root_path)
+                if isinstance(raw_root_text, bytes):
+                    raw_root_text = os.fsdecode(raw_root_text)
+                if "://" in str(raw_root_text).replace("\\", "/"):
+                    raise SVNInventoryConfigError(
+                        "root_path must be a local filesystem path"
+                    )
+                object.__setattr__(self, "root_path", Path(self.root_path))
+            except SVNInventoryConfigError:
+                raise
+            except (TypeError, ValueError, OSError) as exc:
+                raise SVNInventoryConfigError("root_path is invalid") from exc
+        root_text = os.fspath(self.root_path)
+        if isinstance(root_text, bytes):
+            root_text = os.fsdecode(root_text)
+        if "://" in str(root_text):
+            raise SVNInventoryConfigError("root_path must be a local filesystem path")
         if self.layout not in SUPPORTED_LAYOUTS:
             raise SVNInventoryConfigError("layout must be one of: processing, dwf")
 
@@ -123,6 +155,11 @@ class SVNProfile:
 
         name = required_text("name")
         environment = required_text("environment").upper()
+        for key in raw:
+            if not isinstance(key, str) or key.casefold() not in _LOCAL_PROFILE_KEYS:
+                raise SVNInventoryConfigError(
+                    f"profile[{index}] unsupported local-only field: {key}"
+                )
         root_value = raw.get("root_path")
         if (
             not isinstance(root_value, (str, os.PathLike))
@@ -130,6 +167,18 @@ class SVNProfile:
         ):
             raise SVNInventoryConfigError(
                 f"profile[{index}] missing required field: root_path"
+            )
+        try:
+            raw_root_text = os.fspath(root_value)
+            if isinstance(raw_root_text, bytes):
+                raw_root_text = os.fsdecode(raw_root_text)
+        except (TypeError, ValueError, OSError) as exc:
+            raise SVNInventoryConfigError(
+                f"profile[{index}] root_path is invalid"
+            ) from exc
+        if "://" in str(raw_root_text).replace("\\", "/"):
+            raise SVNInventoryConfigError(
+                f"profile[{index}] root_path must be a local filesystem path"
             )
         layout = required_text("layout").lower()
         try:
@@ -149,11 +198,18 @@ class SVNProfile:
             raise SVNInventoryConfigError(f"profile[{index}] {exc.reason}") from exc
 
 
-def load_svn_profiles(config_path: str | Path) -> list[SVNProfile]:
+def load_svn_profiles(
+    config_path: str | Path,
+    *,
+    allow_missing: bool = False,
+) -> list[SVNProfile]:
     """Load local-only ``svn_profiles`` from a YAML file.
 
     The parser intentionally accepts no URL, credential, checkout, or update
     settings.  A profile only identifies a local root and a known layout.
+    ``allow_missing`` is for the combined lineage provider config: an older
+    MySQL-only local config may omit the optional SVN section, while an
+    explicitly present but empty section remains invalid.
     """
 
     path = Path(config_path).expanduser()
@@ -182,6 +238,8 @@ def load_svn_profiles(config_path: str | Path) -> list[SVNProfile]:
 
     if not isinstance(raw_config, Mapping):
         raise SVNInventoryConfigError("root must be a mapping")
+    if "svn_profiles" not in raw_config and allow_missing:
+        return []
     raw_profiles = raw_config.get("svn_profiles")
     if not isinstance(raw_profiles, list) or not raw_profiles:
         raise SVNInventoryConfigError("svn_profiles must be a non-empty list")
@@ -738,13 +796,22 @@ def scan_svn_profile(
     sample_limit: int = 20,
     progress_callback: ProgressCallback | None = None,
     progress_interval: int = 500,
+    read_sources: bool = True,
 ) -> SVNScanResult:
-    """Scan one existing local working-copy root sequentially."""
+    """Scan one existing local working-copy root sequentially.
+
+    ``read_sources=False`` keeps this function at the inventory metadata
+    boundary.  Matching files remain ``NOT_ATTEMPTED`` and a downstream
+    provider can read each validated path lazily with :func:`read_python_source`.
+    The default remains ``True`` for the standalone verification CLI.
+    """
 
     if sample_limit < 0:
         raise ValueError("sample_limit must be non-negative")
     if progress_interval <= 0:
         raise ValueError("progress_interval must be positive")
+    if not isinstance(read_sources, bool):
+        raise ValueError("read_sources must be a boolean")
 
     root = profile.root_path.expanduser()
     if not root.exists():
@@ -808,18 +875,19 @@ def scan_svn_profile(
             except OSError:
                 file_size = None
 
-            read_result = read_python_source(file_path)
-            read_status = read_result.read_status
-            if read_status == READABLE:
-                readable_count += 1
-            elif read_status == READ_ERROR:
-                read_error_count += 1
-                reason_counts[READ_ERROR] += 1
-                unresolved_reason = READ_ERROR
-            elif read_status == DECODE_ERROR:
-                decode_error_count += 1
-                reason_counts[DECODE_ERROR] += 1
-                unresolved_reason = DECODE_ERROR
+            if read_sources:
+                read_result = read_python_source(file_path)
+                read_status = read_result.read_status
+                if read_status == READABLE:
+                    readable_count += 1
+                elif read_status == READ_ERROR:
+                    read_error_count += 1
+                    reason_counts[READ_ERROR] += 1
+                    unresolved_reason = READ_ERROR
+                elif read_status == DECODE_ERROR:
+                    decode_error_count += 1
+                    reason_counts[DECODE_ERROR] += 1
+                    unresolved_reason = DECODE_ERROR
         elif classification.candidate:
             if unresolved_reason is not None:
                 reason_counts[unresolved_reason] += 1
@@ -967,9 +1035,11 @@ def write_json_report(report: Mapping[str, object], output_path: str | Path) -> 
 
 __all__ = [
     "CONFIG_ERROR",
+    "DEFAULT_CONFIG_PATH",
     "DECODE_ERROR",
     "DWF_LAYOUT",
     "DWF_LAYER",
+    "EXAMPLE_CONFIG_PATH",
     "GRANDPARENT_MISMATCH",
     "IGNORED_DIRECTORY_NAMES",
     "INVALID_LAYOUT",
@@ -994,6 +1064,7 @@ __all__ = [
     "SVNProfile",
     "SVNScanResult",
     "SourceReadResult",
+    "UNRESOLVED_REASON_ORDER",
     "UNSUPPORTED_LAYER",
     "build_svn_verification_report",
     "build_verification_report",

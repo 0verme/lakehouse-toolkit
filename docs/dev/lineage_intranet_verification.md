@@ -14,7 +14,9 @@ MySQLProcessProvider / ProductionProvider
 
 它只负责回答“当前配置和真实 driver 是否可工作”，不改变 `ProgramSource`、Parser、Physical DAG、Audit、Materialization、Query、History、Diff 或 Viewer 的语义。
 
-SVN 继续保持 development/audit source（Role B）。本次没有新增 `SVNProgramSourceProvider`，也没有修改 `svn_service` 或 `svn_check`。
+SVN 的 diff/export 继续保持 development/audit source（Role B），不修改
+`svn_service` 或 `svn_check`；Issue #57 另新增只读已 checkout working copy 的
+`SVNProgramSourceProvider`，接入现有 formal lineage 主链。
 
 ## Threat Model
 
