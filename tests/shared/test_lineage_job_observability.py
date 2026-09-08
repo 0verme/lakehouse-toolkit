@@ -262,6 +262,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
             args.slow_threshold_ms,
             imp_lineage_edge.DEFAULT_SLOW_THRESHOLD_MS,
         )
+        self.assertFalse(args.diagnostic)
 
         controlled = imp_lineage_edge.build_parser().parse_args(
             [
@@ -276,6 +277,7 @@ class LineageJobObservabilityTests(unittest.TestCase):
                 "10",
                 "--slow-threshold-ms",
                 "5000",
+                "--diagnostic",
             ]
         )
         self.assertEqual(controlled.profile, ["profile_a", "profile_b"])
@@ -283,6 +285,40 @@ class LineageJobObservabilityTests(unittest.TestCase):
         self.assertTrue(controlled.force_rebuild)
         self.assertEqual(controlled.progress_every, 10)
         self.assertEqual(controlled.slow_threshold_ms, 5000)
+        self.assertTrue(controlled.diagnostic)
+
+    def test_diagnostic_logs_started_and_success_with_materialization_metrics(self):
+        program_source = source("PROGRAM_DIAGNOSTIC_OBSERVABILITY")
+        with TemporaryDirectory() as directory:
+            _, output = run_with_output(
+                imp_lineage_edge.materialize_sources,
+                [program_source],
+                db_path=Path(directory) / "lineage.db",
+                batch_id="batch-diagnostic-observability",
+                observed_at=OBSERVED_AT,
+                complete_snapshot=True,
+                diagnostic=True,
+            )
+
+        self.assertIn(
+            "stage=build_program status=STARTED program_id=",
+            output,
+        )
+        self.assertIn("source_profile=fixture ordinal=1", output)
+        self.assertIn("stage=build_program status=SUCCESS", output)
+        for field in (
+            "elapsed_ms=",
+            "dag_ms=",
+            "audit_ms=",
+            "materialization_ms=",
+            "physical_nodes=",
+            "physical_edges=",
+            "lineage_edges=",
+            "issues=",
+        ):
+            self.assertIn(field, output)
+        self.assertNotIn("PROGRAM_DIAGNOSTIC_OBSERVABILITY", output)
+        self.assertNotIn("INSERT INTO", output)
 
     def test_force_rebuild_reparses_an_unchanged_program(self):
         program_source = source("PROGRAM_DEMO_FORCE_REBUILD")

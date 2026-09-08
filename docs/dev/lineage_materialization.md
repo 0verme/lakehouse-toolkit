@@ -63,6 +63,48 @@ DWM.B → DWA.C
 只保留一个业务事实；重复 physical path 会合并到同一条 edge 的 deterministic
 `evidence.physical_paths`。
 
+### Bounded Evidence Contract
+
+`evidence.path_count` 是该 formal edge 发现的完整 collapsed physical path 数量，
+不是 sample 的长度。为避免一个 edge 携带无限 JSON，`physical_paths` 只保留按
+canonical JSON 排序后的前 `100` 条 deterministic sample，并用
+`physical_paths_truncated` 标识是否还有未保存的 path。`source`、`target`、程序身份、
+`path_count` 和 statement evidence summary 不因 sample 截断而丢失。
+
+聚合摘要也有固定边界：`physical_edge_pairs`、`collapsed_tmp_nodes` 和
+`statement_indices` 默认各保留最多 `200` 个 canonical 值，并分别用
+`physical_edge_pairs_truncated`、`collapsed_tmp_nodes_truncated` 和
+`statement_indices_truncated` 表示截断。SQLite 仍将 evidence 作为 JSON 文本保存，
+因此没有额外的表迁移；consumer 必须使用 `path_count` 判断完整规模，不能用
+`len(physical_paths)` 代替。
+
+Materialization 先收集每条 formal edge 的 path、计数和 bounded summaries，最后只做
+一次 normalize/dedupe/sort/finalize，不在每次新增 path 时重建全部历史 JSON。若一个
+Physical DAG 需要枚举超过 `100000` 条 collapsed path，会抛出
+`LineagePathEnumerationError`，由 job 记录为 `PATHOLOGICAL` 并以 controlled Python
+failure 结束，而不是继续拖死 batch。枚举 traversal state 另有 `1000000` 上限，避免
+尚未到达 formal endpoint 的 diamond branch 先耗尽内存。`_json_safe` 同时拒绝
+recursive cycle、超过 `64` 层的 nesting 和超过 `10000` 项的单个 collection，并抛出
+`LineageEvidenceError`；它不使用对象 `repr()` 代替 evidence。
+
+### Scaling 验证
+
+`benchmarks/lineage_materialization_benchmark.py` 使用 fictional `DEMO` Physical DAG，
+通过 instrumentation 统计 `_canonical_json` 调用次数，并验证完整 `path_count`、sample
+上限和 JSON 输出大小；它不读取数据库，也不是依赖机器速度的 CI timing gate。修复前
+在基线 `56844a7` 上，同一 synthetic DAG 的 canonicalization 次数为 `10 → 273`、
+`100 → 16248`、`500 → 381248`（500 paths 本地约 103 秒）；当前实现为
+`10 → 311`、`100 → 3101`、`500 → 14001`、`1000 → 27501`，并且 500/1000 paths
+的 `physical_paths` 都保持 100 条 sample。该差异证明 hot spot 是 merge 阶段反复
+canonicalize 累积历史 paths 的 superlinear 工作，而不是把 `_json_safe` 单独认定为
+Windows native crash 根因；`0xC0000005` 仍需结合生产 dump/driver 证据进一步定位。
+
+运行：
+
+```bash
+python benchmarks/lineage_materialization_benchmark.py
+```
+
 ## Audit 结果与 orphan
 
 已知 `expected_target` 时，materialization 只使用 Audit 已计算的
@@ -203,11 +245,16 @@ ProgramSource provider
 `source_load`、`replay`、`incremental_plan`、`build`、`publish` 和 `job` 边界输出已
 flush 的阶段状态。build progress 默认每 500 个本轮 rebuild 程序输出一次；日志只包含
 count、耗时、受限 batch ID、受控 profile 和异常 class，不输出 program name、源码、
-SQL、表名或 connection settings。单程序总耗时超过默认 5 秒时，才输出带稳定短 hash
-的 `stage=build_program status=SLOW`，并分别给出
-`build_program_physical_dag_ms`、`audit_program_physical_dag_ms` 和
-`single_program_total_ms`。build SUCCESS 还汇总 `processed`、`slow_programs`、
-`max_program_elapsed_ms` 和 `avg_program_elapsed_ms`。coverage funnel 的聚合行以
+SQL、表名或 connection settings。
+
+默认模式只输出超过阈值的
+`stage=build_program status=SLOW`、pathological failure 和 batch summary；SLOW 行带
+稳定短 hash、safe `source_profile`、`ordinal`、`elapsed_ms`、`dag_ms`、`audit_ms`、
+`materialization_ms`、`physical_nodes`、`physical_edges`、`lineage_edges` 和 `issues`。
+其中 `build_program_physical_dag_ms`、`audit_program_physical_dag_ms` 和
+`single_program_total_ms` 作为旧 log consumer 的兼容别名保留。使用
+`--diagnostic` 才会额外为每个程序输出 `STARTED` 和 `SUCCESS`，用于受控 replay 定位，
+不会让正常 2 万程序默认产生 4 万行日志。coverage funnel 的聚合行以
 `stage=coverage` 单独输出，详见 [`lineage_coverage.md`](lineage_coverage.md)。
 
 直接运行：
@@ -258,13 +305,26 @@ stage=job status=SUCCESS elapsed_ms=...
 `stage=job status=SUCCESS` 只会在 SQLite atomic publish 完成后出现。中途的 STARTED/RUNNING
 日志只表示计算进度，不表示 snapshot 已经发布；失败时会输出
 `status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。可用
-`build_program status=SLOW` 判断长尾属于 DAG build 还是 audit：前者的
-`build_program_physical_dag_ms` 高时检查 parser/DAG 提取，后者的
-`audit_program_physical_dag_ms` 高时检查 audit 遍历和 issue 判定；用
+`build_program status=SLOW` 判断长尾属于 DAG build、audit 还是 materialization：
+`dag_ms` 高时检查 parser/Physical DAG 提取，`audit_ms` 高时检查 audit 遍历和 issue
+判定，`materialization_ms` 高时检查 path collapse/evidence finalize；用
 `max_program_elapsed_ms`/`avg_program_elapsed_ms` 区分少数长尾与整体变慢。当前实现使用
 固定 count progress；如果未来需要在单个程序长时间运行期间提供 heartbeat，可单独增加时间阈值。
+Python thread timeout 不能安全中断 CPU-bound pure Python，因此本 Issue 不伪造 thread
+watchdog；path enumeration/evidence guard 会先提供 deterministic bounded behavior 或
+controlled failure。
 
 ## 本阶段边界
+
+可重复的 synthetic scaling benchmark 使用：
+
+```bash
+python benchmarks/lineage_materialization_benchmark.py
+```
+
+它固定运行 `10`、`100`、`500`、`1000` 条 physical path，输出 elapsed、
+canonicalization calls、peak evidence count、完整 `path_count` 和 output bytes；只对
+canonicalization operation count 设线性预算，不对机器相关的绝对耗时设 CI 门槛。
 
 Phase 5 本身仍只负责纯 materialization 与 atomic publish；增量、历史、diff、issue
 lifecycle 和 legacy decision 由 Phase 7 追加，详见
