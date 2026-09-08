@@ -58,10 +58,9 @@ from shared.lineage.materialization_sqlite import (  # noqa: E402  # pyright: ig
 )
 from shared.lineage.physical_dag import build_program_physical_dag  # noqa: E402
 from shared.lineage.providers import (  # noqa: E402
-    MySQLProcessProvider,
     ProgramSourceProvider,
     iter_program_sources,
-    load_mysql_process_profiles,
+    load_program_source_providers,
 )
 
 _PROVIDER_CONFIG_OVERRIDE = os.getenv("PYTOOLS_LINEAGE_PROVIDER_CONFIG", "").strip()
@@ -732,8 +731,18 @@ def materialize_sources(
     selected_profiles = _normalize_selected_profiles(selected_profiles)
     limit = _validate_limit(limit)
     slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
-    controlled_replay = bool(selected_profiles or limit is not None)
-    effective_complete_snapshot = complete_snapshot and not controlled_replay
+    # ``--limit`` is always partial.  A profile-only run can be a complete
+    # snapshot because its deletion authority is restricted to that profile.
+    controlled_partial_replay = limit is not None
+    effective_complete_snapshot = complete_snapshot and not controlled_partial_replay
+    resolved_snapshot_scopes = snapshot_scopes
+    if selected_profiles and snapshot_scopes is not None:
+        selected = set(selected_profiles)
+        resolved_snapshot_scopes = tuple(
+            scope
+            for scope in snapshot_scopes
+            if _snapshot_scope_profile(scope) in selected
+        )
     resolved_batch_id = batch_id if batch_id is not None else new_batch_id()
     resolved_observed_at = (
         observed_at if observed_at is not None else datetime.now(timezone.utc)
@@ -786,7 +795,7 @@ def materialize_sources(
         observed_at=resolved_observed_at,
         job_keys=job_keys,
         complete_snapshot=effective_complete_snapshot,
-        snapshot_scopes=snapshot_scopes,
+        snapshot_scopes=resolved_snapshot_scopes,
         coverage=coverage,
         force_rebuild=force_rebuild,
         progress_every=progress_every,
@@ -820,9 +829,97 @@ def materialize_sources(
     return result
 
 
+def _provider_matches_selection(
+    provider: ProgramSourceProvider,
+    selected_profiles: tuple[str, ...],
+) -> bool:
+    if not selected_profiles:
+        return True
+    profile = _provider_source_profile(provider)
+    # Providers without an exposed profile remain eligible; their yielded
+    # ProgramSource values are filtered by _iter_selected_program_sources.
+    return profile is None or profile in set(selected_profiles)
+
+
+def _selected_providers(
+    providers: Iterable[ProgramSourceProvider],
+    selected_profiles: tuple[str, ...],
+) -> tuple[ProgramSourceProvider, ...]:
+    return tuple(
+        provider
+        for provider in providers
+        if _provider_matches_selection(provider, selected_profiles)
+    )
+
+
+def _provider_snapshot_complete(provider: ProgramSourceProvider) -> bool:
+    value = getattr(provider, "snapshot_complete", None)
+    if value is False:
+        return False
+    status = getattr(provider, "snapshot_status", None)
+    if isinstance(status, str) and status in {"PARTIAL", "FAILED"}:
+        return False
+    return True
+
+
+def _provider_diagnostic_reasons(provider: ProgramSourceProvider) -> str:
+    diagnostics = getattr(provider, "diagnostics", ())
+    counts: dict[str, int] = {}
+    try:
+        items = tuple(diagnostics)
+    except TypeError:
+        items = ()
+    for item in items:
+        reason = getattr(item, "reason", None)
+        count = getattr(item, "count", 1)
+        if not isinstance(reason, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", reason):
+            reason = "UNKNOWN"
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            count = 1
+        counts[reason] = counts.get(reason, 0) + count
+    if not counts:
+        return "UNKNOWN"
+    return ",".join(f"{reason}:{counts[reason]}" for reason in sorted(counts))
+
+
+def _emit_incomplete_provider_diagnostics(
+    providers: Iterable[ProgramSourceProvider],
+    selected_profiles: tuple[str, ...],
+) -> None:
+    for provider in _selected_providers(providers, selected_profiles):
+        if _provider_snapshot_complete(provider):
+            continue
+        profile = _provider_source_profile(provider)
+        safe_profile = _safe_profile_name(profile) if profile else "<unknown>"
+        status = getattr(provider, "snapshot_status", None)
+        safe_status = (
+            status
+            if isinstance(status, str) and re.fullmatch(r"[A-Z][A-Z0-9_]*", status)
+            else "INCOMPLETE"
+        )
+        _emit_log(
+            "source_provider",
+            "INCOMPLETE",
+            source_profile=safe_profile,
+            snapshot_status=safe_status,
+            reasons=_provider_diagnostic_reasons(provider),
+        )
+
+
+def _snapshot_scope_profile(scope: object) -> str | None:
+    if isinstance(scope, (SnapshotScope, ProgramIdentity, ProgramSource)):
+        return scope.source_profile
+    if isinstance(scope, tuple) and len(scope) == 2:
+        profile = scope[1]
+        return profile if isinstance(profile, str) else None
+    return None
+
+
 def _provider_snapshot_scopes(
     providers: Iterable[ProgramSourceProvider],
+    selected_profiles: tuple[str, ...] = (),
 ) -> tuple[SnapshotScope, ...]:
+    selected = set(selected_profiles)
     scopes: set[SnapshotScope] = set()
     for provider in providers:
         environment = getattr(provider, "environment", None)
@@ -831,6 +928,12 @@ def _provider_snapshot_scopes(
         if profile is not None:
             environment = environment or getattr(profile, "environment", None)
             source_profile = source_profile or getattr(profile, "name", None)
+        if (
+            selected
+            and isinstance(source_profile, str)
+            and source_profile not in selected
+        ):
+            continue
         if (
             isinstance(environment, str)
             and isinstance(source_profile, str)
@@ -844,15 +947,18 @@ def _provider_snapshot_scopes(
 def load_default_providers(
     config_path: str | Path | None = None,
 ) -> tuple[ProgramSourceProvider, ...]:
-    """从 local/example 配置创建 DEV MySQL provider；不在 import 时连接数据库。"""
+    """从 local/example 配置创建 MySQL 与 local-SVN providers。
+
+    SVN provider 只读取已 checkout 的 local working copy；legacy
+    ``ProductionProvider`` 不会被替换或隐式加入。
+    """
 
     selected_path = (
         config_path
         if config_path is not None
         else (PROVIDER_CONFIG_PATH if _PROVIDER_CONFIG_OVERRIDE else None)
     )
-    profiles = load_mysql_process_profiles(selected_path)
-    return tuple(MySQLProcessProvider(profile) for profile in profiles)
+    return load_program_source_providers(selected_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -953,8 +1059,10 @@ def main(
     selected_profiles = _normalize_selected_profiles(selected_profiles)
     limit = _validate_limit(limit)
     slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
-    controlled_replay = bool(selected_profiles or limit is not None)
-    effective_complete_snapshot = complete_snapshot and not controlled_replay
+    # ``--limit`` is always partial.  A profile-only run can be a complete
+    # snapshot because its deletion authority is restricted to that profile.
+    controlled_partial_replay = limit is not None
+    effective_complete_snapshot = complete_snapshot and not controlled_partial_replay
     job_started_at = time.perf_counter()
     coverage = LineageCoverageAccumulator()
     try:
@@ -974,15 +1082,30 @@ def main(
         resolved_scopes = (
             tuple(snapshot_scopes)
             if snapshot_scopes is not None
-            else _provider_snapshot_scopes(active_providers)
+            else _provider_snapshot_scopes(active_providers, selected_profiles)
         )
         source_iterator = (
             _iter_selected_program_sources(active_providers, selected_profiles)
             if selected_profiles
             else iter_program_sources(active_providers)
         )
+        # Consume the provider inventory before starting the shared pipeline so
+        # a provider's completeness flag can gate deletion authority.  The
+        # materialization API already materializes its input, so this does not
+        # introduce a second parser/DAG path or change replay ordering.
+        loaded_sources = tuple(source_iterator)
+        provider_snapshot_complete = all(
+            _provider_snapshot_complete(provider)
+            for provider in _selected_providers(active_providers, selected_profiles)
+        )
+        if not provider_snapshot_complete:
+            effective_complete_snapshot = False
+            _emit_incomplete_provider_diagnostics(
+                active_providers,
+                selected_profiles,
+            )
         result = materialize_sources(
-            source_iterator,
+            loaded_sources,
             db_path=db_path,
             batch_id=batch_id,
             observed_at=observed_at,

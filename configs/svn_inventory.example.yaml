@@ -1,7 +1,8 @@
 # 公开示例只使用虚构本地路径。真实 root_path 只写入被忽略的
 # configs/lineage_providers.local.yaml，不提交生产路径。
 # 同一 working copy 可配置多个 layout；verifier 会按 profile 选择 candidate，
-# 其他 layout / sibling subtree 会作为 OUT_OF_SCOPE 单独统计。
+# 其他 layout / sibling subtree 会作为 OUT_OF_SCOPE 单独统计；同一配置也可被
+# SVNProgramSourceProvider 读取，接入现有 ProgramSource pipeline。
 svn_profiles:
   - name: prod_svn_processing
     environment: PROD

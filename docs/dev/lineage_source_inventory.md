@@ -42,7 +42,8 @@
 - **UNKNOWN — requires intranet verification**：公开仓库没有足够证据证明的
   内网事实，本文不做推断。
 - **FULL** 只表示当前代码契约已经覆盖，不表示已用真实内网数据验证。
-- 本文没有修改 Phase 1～7 主链，也没有新增 `SVNProgramSourceProvider`。
+- 本 Issue 新增的 SVN 代码只停在 `ProgramSource` provider 边界，没有修改
+  Phase 1～7 Parser/DAG/Audit/materialization 主逻辑。
 
 ## 2. Executive Findings
 
@@ -54,12 +55,13 @@
 | --- | --- | --- |
 | DEV formal lineage | `shared/lineage/providers.py::MySQLProcessProvider` 根据 profile 查询配置的 process table，读取 program-name 列和 script/code 列，并通过 `fetchmany()` 生成 `ProgramSource`。 | 当前 V1 的正式程序代码入口 |
 | legacy/PROD adapter | `ProductionProvider` 默认调用 `_default_legacy_process_loader()`，再调用 `shared.lineage.lineage_builder.load_process_infos()`；后者通过 `pymysql.connect()` 查询 process registry 的 `script_code`。 | 现有 legacy loader 的适配入口；不是另一套已验证的生产连接 |
-| SVN 审计 | `svn_service.svn_main()` 使用 SVN `diff` 找到变更文件，再 `svn export` 到本地导出目录；`lakehouse_stream`、`fine_stream`、`upstream_stream` 随后调用 `read_data_from_file()` 读取导出文件。 | 开发/审计代码来源，不进入当前 `ProgramSource` 主链 |
-| local workspace 审计 | `load_local_workspace()` 扫描调用方传入的目录；审计 UI 直接读取这些本地文件。 | 本地审计来源，不进入当前 `ProgramSource` 主链 |
+| SVN 审计 | `svn_service.svn_main()` 使用 SVN `diff` 找到变更文件，再 `svn export` 到本地导出目录；`lakehouse_stream`、`fine_stream`、`upstream_stream` 随后调用 `read_data_from_file()` 读取导出文件。 | legacy 开发/审计代码来源，保持独立 |
+| local workspace / production SVN provider | `SVNProgramSourceProvider` 只扫描已经 checkout 的 local working copy，复用 `svn_inventory` directory contract 与 `read_python_source()`，输出 validated `ProgramSource`。 | 当前 Issue #57 的 formal lineage source adapter |
 | `programs.file_path` | `apps/svn_check` 用它与 JOB 元数据合并、做路径尾部匹配和展示；代码内容仍由导出的/本地文件路径读取。 | 程序路径 metadata，不是当前 formal lineage 的代码读取器 |
 
-因此，当前仓库能够证明的 formal lineage 代码来源是 **MySQL process metadata
-或其 legacy loader**；SVN 和 local workspace 是另一个审计工作流。
+因此，当前仓库能够证明的 formal lineage 代码来源包括 **MySQL process metadata
+或其 legacy loader**，以及 Issue #57 新增的 **validated local SVN working copy
+adapter**；SVN diff/export 与 local workspace audit 仍是另一个独立工作流。
 
 ### Q2：四套 DEV MySQL 是否相同 schema？
 
@@ -95,7 +97,7 @@ profile supports per-source table/column mapping
 ### Q3：SVN 的真实角色是什么？
 
 ```text
-SVN Lineage Role: B — development/audit source
+SVN Lineage Role: B — validated local production source plus legacy development/audit source
 ```
 
 证据：
@@ -107,19 +109,23 @@ SVN Lineage Role: B — development/audit source
   `get_lakehouse_type()`、规则函数和 `read_data_from_file()`。
 - `apps/svn_check/ui/fine_stream.py`、`upstream_stream.py` 也直接调用
   `svn_main()`，然后对导出的报表/脚本进行检查。
-- `jobs/crontab/imp_lineage_edge.py::load_default_providers()` 只加载
-  `MySQLProcessProvider`；当前默认 formal lineage 编排没有 SVN 调用。
-- 仓库内没有 `SVNProgramSourceProvider`，也没有证据表明
-  `SVN file -> ProgramSource -> physical DAG` 是现行链路。
+- `jobs/crontab/imp_lineage_edge.py::load_default_providers()` 现在通过 generic
+  loader 保留 MySQL providers，并独立加载 `prod_svn_processing` 与
+  `prod_svn_dwf` 的 `SVNProgramSourceProvider`。
+- SVN provider 只把 validated local file 接到既有
+  `ProgramSource -> physical DAG` 链路，不接管 SVN diff/export/audit。
 
 当前可还原的关系是：
 
 ```text
 SVN -> branch diff / trunk overlap -> export -> local workspace -> audit
 MySQL process metadata -> ProgramSource -> Physical DAG -> Audit -> materialization
+local checked-out SVN inventory -> SVNProgramSourceProvider -> ProgramSource
+  -> existing Physical DAG -> Audit -> materialization
 ```
 
-不能因为仓库存在 SVN 代码，就自动把 SVN 设计成 `ProgramSource` provider。
+SVN 的 formal provider 只接受已验证 directory evidence，不会把 legacy
+SVN diff/export 或未验证的文件猜测成 ProgramSource。
 
 ### Q4：Phase 2 已覆盖什么？
 
@@ -130,8 +136,8 @@ MySQL process metadata -> ProgramSource -> Physical DAG -> Audit -> materializat
   转换为 `ProgramSource`，兼容 `process_name`/`program_name`、
   `script_code`/`code`，并支持显式 target getter。
 - `ProductionProvider` 当前没有接入 `load_default_providers()` 的默认 main；它
-  是可注入的 adapter。默认 `imp_lineage_edge.main()` 当前仍只从 configured
-  MySQL profiles 建立 providers。
+  是可注入的 legacy adapter。generic loader 另行加载 MySQL 和 local-SVN
+  providers，不会把 legacy provider 偷换成 SVN backend。
 - relations、jobs、programs、result receipts、runtimes、SEND/RECV 和字段
   mapping 仍属于各自的 legacy metadata/audit contract，不会自动变成
   `ProgramSource` 字段。
@@ -146,8 +152,8 @@ MySQL process metadata -> ProgramSource -> Physical DAG -> Audit -> materializat
 3. 核验实际 code 返回类型和编码，特别是 CLOB/driver-specific object；
 4. 核验 PROD loader 的真实 backend、行 shape 和是否需要额外 job identity；
 5. 核验 public demo 中多个 receipt/mapping SQL 变体对应的内网 canonical contract；
-6. 保留 SVN 审计工作流，除非后续证据证明 SVN 文件才是 authoritative lineage
-   program source。
+6. 保留 SVN 审计工作流；#57 只在 validated local working copy 上接入
+   `ProgramSource`，不改变 SVN diff/export 的 authoritative boundary。
 
 目前没有证据要求修改 `ProgramSource`、Physical DAG、Audit、Materialization、
 Query 或 Phase 7 的 history/diff 语义。
@@ -279,7 +285,8 @@ backend topology。
 | --- | --- | --- | --- | --- | --- |
 | DEV MySQL | `lineage_builder.load_process_infos()`、各 legacy MySQL reader | process name、script/code、relations（分开的 query） | `MySQLProcessProvider` | PARTIAL | 用内网结果确认 A-D table/column/filter/encoding；若只是 identifier 差异则填 profile。 |
 | PROD metadata | `ProductionProvider` -> `_default_legacy_process_loader()` | `ProcessInfo` 的 `process_name`/`script_code`；target 可能缺失 | `ProductionProvider` -> `ProgramSource` | PARTIAL | 核验真实 backend、row shape、target authority 和是否需要 getter。 |
-| SVN | `svn_service.svn_main()`、`load_svn_workspace()` | branch/trunk revision、diff 文件、exported paths | 当前没有 SVN V1 component；由 `svn_check` 审计 | NOT APPLICABLE | `LEGACY_KEEP`；只核验是否存在未被源码发现的 lineage 使用。 |
+| Production SVN inventory | `svn_inventory.scan_svn_profile()`、`SVNProgramSourceProvider` | validated relative locator、directory-derived primary target、local Python source | `SVNProgramSourceProvider` -> `ProgramSource` | PARTIAL | `THIN_ADAPTER`；核验 inventory coverage 与 production target/code authority。 |
+| SVN legacy diff/export | `svn_service.svn_main()`、`load_svn_workspace()` | branch/trunk revision、diff 文件、exported paths | 由 `svn_check` 审计 | NOT APPLICABLE | `LEGACY_KEEP`；不把 diff/export 入口并入 formal provider。 |
 | local workspace | `load_local_workspace()`、`read_data_from_file()` | 本地文件内容和路径 | 当前没有 V1 component | NOT APPLICABLE | `LEGACY_KEEP`；保持本地审计入口。 |
 | jobs/programs | `core.public_data`、`schedule_table_lineage` | job/program/target/path/status/dependency | V1 仅有可注入 target/job provenance 边界 | PARTIAL | 核验 target/job authority；必要时另立 thin adapter。 |
 | result/SEND/field metadata | `result_receipts`、`send_jobs`、`asset_mappings`/mapping SQLite | RECV、SEND、字段级映射 | 不进入 `ProgramSource` | NOT APPLICABLE | `LEGACY_KEEP`；先确认 canonical metadata contract。 |
@@ -405,7 +412,7 @@ If its required semantics cannot be represented by ProgramSource:
 ### Decision
 
 ```text
-SVN Lineage Role: B — development/audit source
+SVN Lineage Role: B — validated local production source plus legacy development/audit source
 ```
 
 ### Evidence DAG
@@ -434,15 +441,14 @@ MySQL process metadata
   -> lineage_edge / lineage_issue
 ```
 
-仓库当前没有如下已证实路径：
+#57 新增的正式接入路径只针对已 checkout working copy：
 
 ```text
-SVN exported file -> ProgramSource -> build_program_physical_dag
+validated local SVN file -> ProgramSource -> build_program_physical_dag
 ```
 
-所以本轮不新增 `SVNProgramSourceProvider`。只有后续内网证据证明 SVN 文件内容
-是 authoritative lineage program source，才可另立 Issue 讨论 provider 或
-thin adapter。
+它不使用 SVN URL、checkout/update、credentials，也不替换 legacy
+`ProductionProvider` 或 parser 主链。
 
 ## 8. Caller / Callee Graph
 
@@ -535,7 +541,7 @@ flowchart TD
 | MySQL process registry read | `MySQLProcessProvider` | FULL | NO_ACTION | 配置 table，读取 program/code，过滤 code 非空；连接值仍需内网配置。 |
 | program name mapping | `ProgramSource.program_name`、`ProductionProvider` | FULL | NO_ACTION | provider 支持 `program_name`/`process_name`；旧 `ProcessInfo.process_name` 已有 adapter。 |
 | script code mapping | `ProgramSource.script_code`、`MySQLProcessProvider`、`ProductionProvider` | FULL | NO_ACTION | 支持 `script_code`；legacy row 额外兼容 `code`。 |
-| target mapping | `expected_target_column`、`expected_target_getter` | PARTIAL | INTRANET_VERIFY | 仅接受 explicit target；旧 process-name/path 推导不自动成为 V1 target。 |
+| target mapping | `expected_target_column`、`expected_target_getter`、`SVNFileInventory.declared_primary_target` | PARTIAL | INTRANET_VERIFY | MySQL/legacy 仍只接受 explicit target；SVN production 仅接受已经验证的 directory-contract target，不从 filename/SQL 猜测。 |
 | source hash | `compute_source_hash()` in provider boundary | FULL | NO_ACTION | hash 覆盖 normalized program/code/target；Phase 7 已消费。 |
 | multi-profile | `MySQLProcessProfile` + `load_mysql_process_profiles()` + provider aggregation | FULL（抽象层） | INTRANET_VERIFY | 支持 `1..N`；真实 DEV A-D 是否同 schema 未证明。 |
 | streaming read | generator + `cursor.fetchmany(batch_size)` | FULL | NO_ACTION | 不使用 `fetchall()`；测试覆盖多批次。 |
@@ -544,7 +550,7 @@ flowchart TD
 | schema normalization | `lineage_builder.normalize_table_name()` reused by `physical_dag` | FULL | NO_ACTION | normalization、schema alias 和注释清理在 V1 parser boundary 复用；Physical DAG 的 SQL extraction 仍由自身实现，不等于内网命名规则已核验。 |
 | SVN branch diff | `apps/svn_check.services.svn_service` | NOT APPLICABLE | LEGACY_KEEP | SVN diff 是审计/开发流程，不是 formal ProgramSource。 |
 | SVN export | `svn_main()` -> `export_svn_file()` | NOT APPLICABLE | LEGACY_KEEP | 导出到 local workspace 后由审计 UI 读取。 |
-| SVN workspace | `load_svn_workspace()` / `load_local_workspace()` | NOT APPLICABLE | LEGACY_KEEP | workspace 是文件审计输入，不进入当前 V1 provider。 |
+| SVN workspace | `SVNProfile` / `SVNProgramSourceProvider` + `load_local_workspace()` | PARTIAL | THIN_ADAPTER / LEGACY_KEEP | 已 checkout 的 local working copy 可通过严格 layout inventory 进入 V1 `ProgramSource`；SVN diff/export/workspace 审计入口仍保持独立。 |
 | jobs/programs join | `apps/svn_check`、`schedule_table_lineage` | PARTIAL | INTRANET_VERIFY | legacy audit/schedule 已支持 `jobs.program_name = programs.program_name`；V1 provider 不直接 join，也未确认 target/job authority。 |
 | relation metadata | `load_schedule_map()`、`schedule_diff`、legacy schedule tools | NOT APPLICABLE | LEGACY_KEEP | relations 是配置关系/差异检查；formal V1 以 script-derived Physical DAG 为输入。 |
 | schedule metadata | `schedule_table_lineage`、legacy `SCHEDULE_TIME_SQL` | NOT APPLICABLE | LEGACY_KEEP | jobs/plans/dependency_text 和 schedule time 不属于 ProgramSource。 |
@@ -552,18 +558,18 @@ flowchart TD
 | result receipt / RECV metadata | `apps/svn_check`、`imp_recv_dwf`、legacy schedule SQL | NOT APPLICABLE | INTRANET_VERIFY | RECV/result registration 不应被误映射为 ProgramSource；公开代码存在 `receive_plan`/`plan_name`/`data_source` 变体。 |
 | SEND metadata | `send_jobs`、`imp_send_lineage`、SEND search | NOT APPLICABLE | LEGACY_KEEP | SEND job/field list 是独立发送语义，不是 table source/target 的 ProgramSource。 |
 | field mapping | `mapping_sqlite`、`asset_mappings`、`imp_dws_comments` | NOT APPLICABLE | LEGACY_KEEP | 字段级 mapping 与 formal V1 表级 `lineage_edge` 是不同 contract。 |
-| local exported code read | `read_data_from_file()` in `apps/svn_check` | NOT APPLICABLE | LEGACY_KEEP | 当前只服务 SVN/local audit；没有 SVN-to-ProgramSource 证据。 |
+| local exported code read | `SVNProgramSourceProvider` + `read_python_source()`、`read_data_from_file()` | PARTIAL | THIN_ADAPTER / LEGACY_KEEP | Provider 只惰性读取已验证的 local working-copy Python；legacy export/audit 读取仍不替换。 |
 
 ## 10. Gap Classification
 
 | Category | Confirmed finding | Action boundary |
 | --- | --- | --- |
 | `CONFIG_ONLY` | 如果 DEV A-D 只是连接值或已确认的 identifier mapping 不同，现有 profile 已有 host/port/user/password/database env 和 table/column 配置。 | 后续只填 local config/env；不把值写入公开仓库。 |
-| `THIN_ADAPTER` | 若真实 target 在 `programs` 或另一个 metadata row，或 driver 返回需要 unwrap 的 code object，现有 target getter/loader injection 可作为部分 adapter 边界；code unwrap 仍需按真实 driver 评估。 | 先核验实际 row shape；必要时另立小 Issue，不扩展本轮。 |
+| `THIN_ADAPTER` | MySQL/legacy target getter 与 local SVN `SVNProgramSourceProvider` 都停在 `ProgramSource` 边界；SVN target 只来自 validated directory evidence，源码使用安全 lazy read。 | 先核验实际 row shape、SVN inventory coverage；必要时另立小 Issue，不扩展 Parser/DAG/Audit。 |
 | `DOMAIN_CHANGE` | 当前没有被代码事实证明的 domain gap。只有当内网权威来源需要 `ProgramSource` 当前没有表达的稳定语义时，才进入此类。 | 本轮 `NONE IDENTIFIED`；不改 `ProgramSource`。 |
 | `LEGACY_KEEP` | SVN diff/export/workspace、旧 lineage graph、schedule/DWF cutoff、SEND/RECV、字段 mapping、审计 UI 各有独立 contract。 | 保留现有入口；不要用 V1 Query 或 ProgramSource 强行替换。 |
 | `INTRANET_VERIFY` | DEV A-D schema、真实 target authority、CLOB/encoding、PROD backend/loader wiring、SVN code authority、receipt canonical columns、trunk comparison behavior。 | 只生成核验清单；当前 Agent 不连接内网。 |
-| `NO_ACTION` | provider code/name/hash/streaming 已覆盖；当前没有证据要求新增 SVN provider 或修改 V1 主链。 | 停止在 inventory，不为制造产出而改算法。 |
+| `NO_ACTION` | provider code/name/hash/streaming 与现有 V1 主链已覆盖；#57 不要求修改 Parser/DAG/Audit/materialization。 | 保持 adapter-only 边界，不为制造产出而改算法。 |
 
 ## 11. Intranet Verification Checklist
 
@@ -624,12 +630,16 @@ flowchart TD
 - branch origin 是否应继续由 `svn log --stop-on-copy` 解析，还是应使用配置的
   trunk URL；确认当前 `trunk_url` 字段未直接参与比较是否为预期。
 - branch diff、trunk overlap、revision 和 export 的权限/性能限制。
-- 导出的文件是否只用于 development/audit，还是有任何业务入口将导出内容当作
-  authoritative lineage program source。
+- 已 checkout production inventory 的目录覆盖、程序数量、out-of-scope、read/decode
+  failure 计数是否与内网验收基线一致；路径值只留在受控 local config。
+- 导出的文件是否只用于 development/audit；#57 的 formal provider 只读取已 checkout
+  working copy，不使用 SVN URL/credentials，也不把 export 入口并入主链。
 - 对同一个程序抽样比较：SVN export 文件内容/hash 与 MySQL process metadata
-  的 `script_code` 是否一致；若不一致，确认谁是权威。
+  的 `script_code` 是否一致；若不一致，按既定 target/code authority 记录差异，不改变
+  本 Issue 的 inventory-only boundary。
 - 确认 local workspace、SVN export、JOB/PROGRAM Excel、metadata catalog 之间
-  是否存在需要固定的 path mapping；不要由路径目录名单方面推断 target。
+  是否存在需要固定的 path mapping；formal provider 只接受 inventory 已验证的
+  directory-derived target，不由未验证文件名或 SQL 猜测 target。
 
 ### 11.7 Metadata contract
 
@@ -655,16 +665,17 @@ Lineage Productionization — 内网 DEV A-D schema 与 target authority 核验
 1. 用不含敏感值的核验结果填写 A/B/C/D profile mapping worksheet；
 2. 确认 process/code/target 的 authoritative source 和 PROD loader shape；
 3. 确认 receipt/relation/SEND/field mapping 的 canonical contract；
-4. 比对 SVN export 与 MySQL `script_code`，决定是否仍保持 SVN 的 B 角色；
+4. 比对 SVN export 与 MySQL `script_code`，记录 legacy audit 与 production
+   inventory 之间的差异；不把该比对扩展为新的 parser/DAG 分支；
 5. 如果所有差异都能由现有 profile/loader injection 表达，再做最小 adapter/config
    变更；如果不能表达，再单独评审 `DOMAIN_CHANGE`。
 
-在上述证据完成前，不建议：
+本 Issue 已完成最小 `SVNProgramSourceProvider` thin adapter；仍不建议：
 
-- 新增 `SVNProgramSourceProvider`；
 - 把 schedule、SEND/RECV 或字段 mapping 加入 `ProgramSource`；
 - 重写 `lineage_builder` 或删除 legacy tools；
-- 接入真实内网或提交真实配置。
+- 接入真实内网或提交真实配置；
+- 将 partial replay 当作 complete snapshot，或绕过 inventory 重新猜 target。
 
 ## 13. Security Boundary
 
@@ -689,8 +700,8 @@ internal URL、branch URL、Token、真实程序名或真实资产名。
 DISCOVERY: DONE
 MAPPING: DONE
 GAP ANALYSIS: DONE
-SVN ROLE: B — development/audit source
-NEW SVN PROVIDER: NO
-LINEAGE V1 CORE CHANGED: NO
+SVN ROLE: B — validated local production source plus legacy development/audit source
+NEW SVN PROVIDER: YES — `SVNProgramSourceProvider` (#57)
+LINEAGE V1 CORE CHANGED: NO — existing Parser/DAG/Audit/materialization reused
 INTRANET CONNECTION ATTEMPTED: NO
 ```

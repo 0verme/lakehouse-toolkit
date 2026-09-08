@@ -297,8 +297,9 @@ python jobs/crontab/imp_lineage_edge.py
 `ProgramSource` 输出一条记录。默认运行与 controlled replay 的区别如下：
 
 - 不传 `--profile`、`--limit`：保持正常全 provider、complete snapshot 运行；
-- `--profile SOURCE_PROFILE`：只选定 source profile，默认按 partial snapshot 发布，
-  不会因未选 profile 触发 DELETE；
+- `--profile SOURCE_PROFILE`：只选定 source profile；不带 `--limit` 时，只有该
+  profile 完整成功扫描才允许其 scope 内的 disappearance / DELETE；其它 profile
+  不会受影响；
 - `--limit N`：收集选定来源后按 `ProgramIdentity` 排序取前 N 个，只让 sample 进入
   parser/DAG/audit，并强制 partial snapshot，sample 外程序不会判定 `DELETED`；
 - `--force-rebuild`：只对本次 replay 选中的程序绕过 hash/version reuse，不代表应该
@@ -313,9 +314,11 @@ python jobs/crontab/imp_lineage_edge.py \
 ```
 
 推荐内网验证顺序为：`100 programs → 500 programs → one profile → all profiles`。
-当前已观测 38 个 rebuild 约耗时 17 分钟；因此不建议直接对约 2 万程序 force
-rebuild，也不要为了掩盖瓶颈而盲目并发。每一级先检查 active edge diff、issue、
-耗时和 `partial_snapshot`，再进入下一阶段。
+其中 sample 阶段必须带 `--limit` 并保持 partial snapshot；单 profile full 阶段不带
+`--limit`，由 provider 的完整扫描状态决定是否开放 scoped disappearance。当前已观测
+38 个 rebuild 约耗时 17 分钟；因此不建议直接对约 2 万程序 force rebuild，也不要
+为了掩盖瓶颈而盲目并发。每一级先检查 active edge diff、issue、耗时和
+`partial_snapshot`，再进入下一阶段。
 
 日志示例：
 
