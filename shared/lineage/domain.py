@@ -365,7 +365,9 @@ class ProgramIdentity:
     """一个程序实例的稳定 identity。
 
     ``program_name`` 只有在 ``environment`` 和 ``source_profile`` 相同的
-    scope 内才有意义。Phase 7 不把没有稳定来源的 ``job_key`` 猜测性地加入
+    scope 内才有意义。Identity boundary 只去除三个字段的 surrounding
+    whitespace，保留大小写；不为了追求与 DatasetIdentity 相同而重写既有
+    program/profile 名称。Phase 7 不把没有稳定来源的 ``job_key`` 猜测性地加入
     identity；如果 Provider 以后提供稳定 job identity，应单独扩展 Provider
     contract，而不是改变本类已有三元组的语义。
     """
@@ -385,7 +387,18 @@ class ProgramIdentity:
 
     @property
     def key(self) -> tuple[str, str, str]:
+        """返回不依赖数据库 surrogate id 的 canonical identity tuple。"""
+
         return (self.environment, self.source_profile, self.program_name)
+
+    def to_dict(self) -> dict[str, str]:
+        """返回可用于稳定 JSON 序列化的 identity payload。"""
+
+        return {
+            "environment": self.environment,
+            "source_profile": self.source_profile,
+            "program_name": self.program_name,
+        }
 
 
 @dataclass(frozen=True, slots=True)
