@@ -137,6 +137,23 @@ Windows native crash 根因；`0xC0000005` 仍需结合生产 dump/driver 证据
 python benchmarks/lineage_materialization_benchmark.py
 ```
 
+### Evidence 与 SQLite Publish Scaling
+
+`benchmarks/lineage_serialization_benchmark.py` 使用完全虚构的 `DEMO` edge
+candidates，固定运行 `1_000`、`10_000`、`100_000` 条输入，报告 batch build、SQLite
+publish 分段耗时、evidence canonicalization/`json.dumps` 次数、prepare/validate
+row count 以及 serialization 次数。它同时断言每条 edge 只准备并校验一次，作为
+Issue #55 的回归基线；耗时只用于观察 scaling，不设置机器相关的 CI threshold。
+
+```bash
+python benchmarks/lineage_serialization_benchmark.py
+```
+
+publish 的 `prepare` 阶段生成不可变的 row payload，`insert` 直接绑定这些 payload，
+`validate` 复用同一份 candidate snapshot；因此 `lineage_edge` 与 `lineage_issue` 的
+canonical JSON 不会在 insert/validation 之间重复序列化。任何阶段失败仍由同一个
+SQLite transaction rollback，active batch 切换语义不变。
+
 ## Audit 结果与 orphan
 
 已知 `expected_target` 时，materialization 只使用 Audit 已计算的
@@ -336,7 +353,12 @@ stage=job status=SUCCESS elapsed_ms=...
 
 `stage=job status=SUCCESS` 只会在 SQLite atomic publish 完成后出现。中途的 STARTED/RUNNING
 日志只表示计算进度，不表示 snapshot 已经发布；失败时会输出
-`status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。可用
+`status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。`build`
+成功摘要还包括 `program_computation_ms`、`program_materialization_ms`、
+`batch_finalize_ms`、`candidate_finalize_ms`、canonicalization/serialization 次数；
+`publish` 成功或失败摘要包括 `prepare_ms`、`insert_ms`、`validate_ms`、
+`active_switch_ms`、`commit_ms` 及 prepared/validated row count，用于区分计算、
+finalize 与 SQLite 写入阶段。可用
 `build_program status=SLOW` 判断长尾属于 DAG build、audit 还是 materialization：
 `dag_ms` 高时检查 parser/Physical DAG 提取，`audit_ms` 高时检查 audit 遍历和 issue
 判定，`materialization_ms` 高时检查 path collapse/evidence finalize；用

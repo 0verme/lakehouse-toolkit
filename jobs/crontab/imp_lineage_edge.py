@@ -46,6 +46,7 @@ from shared.lineage.evolution import (  # noqa: E402  # pyright: ignore[reportMi
     issue_identity_key,
     plan_incremental,
 )
+import shared.lineage.materialization as materialization_module  # noqa: E402
 from shared.lineage.materialization import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     MaterializationBatch,
     build_materialization_batch,
@@ -55,6 +56,7 @@ from shared.lineage.materialization_sqlite import (  # noqa: E402  # pyright: ig
     DEFAULT_MATERIALIZATION_DB_PATH,
     PublishResult,
     SQLiteMaterializationStore,
+    SQLitePublishMetrics,
 )
 from shared.lineage.physical_dag import build_program_physical_dag  # noqa: E402
 from shared.lineage.providers import (  # noqa: E402
@@ -93,6 +95,14 @@ class _ProgramTimingStats:
     slow_programs: int = 0
     total_program_elapsed_ms: int = 0
     max_program_elapsed_ms: int = 0
+    total_program_computation_ms: int = 0
+    total_program_materialization_ms: int = 0
+    batch_finalize_ms: int = 0
+    canonicalization_calls: int = 0
+    canonical_json_calls: int = 0
+    canonical_json_safe_calls: int = 0
+    json_safe_calls: int = 0
+    json_dumps_calls: int = 0
 
     @property
     def avg_program_elapsed_ms(self) -> int:
@@ -100,9 +110,18 @@ class _ProgramTimingStats:
             return 0
         return self.total_program_elapsed_ms // self.processed
 
-    def observe(self, elapsed_ms: int) -> bool:
+    def observe(
+        self,
+        elapsed_ms: int,
+        *,
+        dag_ms: int = 0,
+        audit_ms: int = 0,
+        materialization_ms: int = 0,
+    ) -> bool:
         self.processed += 1
         self.total_program_elapsed_ms += elapsed_ms
+        self.total_program_computation_ms += dag_ms + audit_ms
+        self.total_program_materialization_ms += materialization_ms
         self.max_program_elapsed_ms = max(self.max_program_elapsed_ms, elapsed_ms)
         is_slow = elapsed_ms > self.slow_threshold_ms
         if is_slow:
@@ -132,6 +151,23 @@ def _exception_name(error: Exception) -> str:
     """只返回异常 class，避免把 provider 错误文本写入日志。"""
 
     return type(error).__name__
+
+
+def _publish_metric_fields(metrics: SQLitePublishMetrics) -> dict[str, int]:
+    return {
+        "prepare_ms": metrics.prepare_ms,
+        "insert_ms": metrics.insert_ms,
+        "validate_ms": metrics.validate_ms,
+        "active_switch_ms": metrics.active_switch_ms,
+        "commit_ms": metrics.commit_ms,
+        "prepared_edges": metrics.prepared_edge_rows,
+        "prepared_issues": metrics.prepared_issue_rows,
+        "prepared_programs": metrics.prepared_program_rows,
+        "validated_edges": metrics.validated_edge_rows,
+        "validated_issues": metrics.validated_issue_rows,
+        "validated_programs": metrics.validated_program_rows,
+        "serialization_calls": metrics.evidence_serialization_calls,
+    }
 
 
 def _safe_batch_id(value: str | None) -> str:
@@ -179,6 +215,8 @@ def _normalize_selected_profiles(
 
 
 def _safe_profile_name(value: str) -> str:
+    if not isinstance(value, str):
+        return "<redacted>"
     candidate = value.strip()
     return candidate if _SAFE_PROFILE_VALUE.fullmatch(candidate) else "<redacted>"
 
@@ -321,13 +359,12 @@ def build_audits(
     del timing
     stage_timings = stage_timings if stage_timings is not None else {}
     total = len(program_sources) if isinstance(program_sources, Sized) else None
-    processed = 0
-    for program_source in program_sources:
+    for processed, program_source in enumerate(program_sources, start=1):
         audit = _build_program_audit(
             program_source,
             observed_at=observed_at,
             batch_id=batch_id,
-            ordinal=processed + 1,
+            ordinal=processed,
             diagnostic=diagnostic,
             stage_timings=stage_timings,
         )
@@ -336,7 +373,6 @@ def build_audits(
             coverage.observe_dag(dag, count_program=count_program_totals)
         # consumer 在请求下一个 audit 前会先 materialize 当前结果。
         yield audit
-        processed += 1
         if (
             progress_started_at is not None
             and total is not None
@@ -409,7 +445,12 @@ def build_candidate_batch(
             )
             return
 
-        is_slow = timing.observe(elapsed_ms)
+        is_slow = timing.observe(
+            elapsed_ms,
+            dag_ms=dag_ms,
+            audit_ms=audit_ms,
+            materialization_ms=materialization_ms,
+        )
         if result is None:
             raise RuntimeError("program observer received no materialization result")
         common_fields.update(
@@ -425,24 +466,34 @@ def build_candidate_batch(
         if is_slow:
             _emit_log("build_program", "SLOW", **common_fields)
 
-    candidate = build_materialization_batch(
-        build_audits(
-            program_sources,
+    materialization_metrics = materialization_module._MaterializationMetrics()
+    with materialization_module._capture_metrics(materialization_metrics):
+        candidate = build_materialization_batch(
+            build_audits(
+                program_sources,
+                batch_id=batch_id,
+                observed_at=observed_at,
+                coverage=coverage,
+                count_program_totals=count_program_totals,
+                progress_every=progress_every,
+                progress_started_at=progress_started_at,
+                slow_threshold_ms=slow_threshold_ms,
+                diagnostic=diagnostic,
+                stage_timings=stage_timings,
+            ),
             batch_id=batch_id,
             observed_at=observed_at,
-            coverage=coverage,
-            count_program_totals=count_program_totals,
-            progress_every=progress_every,
-            progress_started_at=progress_started_at,
-            slow_threshold_ms=slow_threshold_ms,
-            diagnostic=diagnostic,
-            stage_timings=stage_timings,
-        ),
-        batch_id=batch_id,
-        observed_at=observed_at,
-        job_keys=job_keys,
-        program_observer=observe_program,
+            job_keys=job_keys,
+            program_observer=observe_program,
+        )
+    timing.batch_finalize_ms = materialization_metrics.batch_finalize_ms
+    timing.canonical_json_calls = materialization_metrics.canonical_json_calls
+    timing.canonical_json_safe_calls = materialization_metrics.canonical_json_safe_calls
+    timing.canonicalization_calls = (
+        timing.canonical_json_calls + timing.canonical_json_safe_calls
     )
+    timing.json_safe_calls = materialization_metrics.json_safe_calls
+    timing.json_dumps_calls = materialization_metrics.json_dumps_calls
     if coverage is not None and observe_materialized_edges:
         coverage.observe_materialized_edges(candidate.edges)
     return candidate
@@ -604,6 +655,7 @@ def build_incremental_candidate_batch(
             timing=timing,
             diagnostic=diagnostic,
         )
+        candidate_finalize_started_at = time.perf_counter()
 
         retained_edges = [
             _rebase_edge(edge, batch_id=batch_id, observed_at=observed_at)
@@ -676,6 +728,7 @@ def build_incremental_candidate_batch(
                 batch_id=batch_id,
             ),
         )
+        candidate_finalize_ms = _elapsed_ms(candidate_finalize_started_at)
     except Exception as error:
         _emit_log(
             "build",
@@ -692,6 +745,15 @@ def build_incremental_candidate_batch(
         slow_programs=timing.slow_programs,
         max_program_elapsed_ms=timing.max_program_elapsed_ms,
         avg_program_elapsed_ms=timing.avg_program_elapsed_ms,
+        program_computation_ms=timing.total_program_computation_ms,
+        program_materialization_ms=timing.total_program_materialization_ms,
+        batch_finalize_ms=timing.batch_finalize_ms,
+        candidate_finalize_ms=candidate_finalize_ms,
+        canonicalization_calls=timing.canonicalization_calls,
+        canonical_json_calls=timing.canonical_json_calls,
+        canonical_json_safe_calls=timing.canonical_json_safe_calls,
+        json_safe_calls=timing.json_safe_calls,
+        serialization_calls=timing.json_dumps_calls,
         edges=len(candidate.edges),
         issues=len(candidate.issues),
         elapsed_ms=_elapsed_ms(build_started_at),
@@ -795,14 +857,19 @@ def materialize_sources(
     )
 
     publish_started_at = time.perf_counter()
+    publish_metrics = SQLitePublishMetrics()
     _emit_log("publish", "STARTED")
     try:
-        result = materialization_store.publish(candidate)
+        result = materialization_store.publish(
+            candidate,
+            instrumentation=publish_metrics,
+        )
     except Exception as error:
         _emit_log(
             "publish",
             "FAILED",
             exception=_exception_name(error),
+            **_publish_metric_fields(publish_metrics),
             elapsed_ms=_elapsed_ms(publish_started_at),
         )
         raise
@@ -815,6 +882,7 @@ def materialize_sources(
         previous=_safe_batch_id(result.previous_batch_id)
         if result.previous_batch_id
         else "-",
+        **_publish_metric_fields(publish_metrics),
         elapsed_ms=_elapsed_ms(publish_started_at),
     )
     return result
