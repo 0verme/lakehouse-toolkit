@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import yaml  # pyright: ignore[reportMissingModuleSource]
@@ -16,9 +17,11 @@ from shared.lineage.svn_inventory import (
     DECODE_ERROR,
     DWF_LAYOUT,
     GRANDPARENT_MISMATCH,
+    INVALID_LAYOUT,
     INVALID_PROGRAM_DIRECTORY,
     NO_MATCHED_FILES,
     NOT_ATTEMPTED,
+    OUT_OF_SCOPE,
     PATH_LAYOUT_ERROR,
     PROCESSING_LAYOUT,
     READ_ERROR,
@@ -26,6 +29,7 @@ from shared.lineage.svn_inventory import (
     SUCCESS,
     SVNProfile,
     SourceReadResult,
+    SVN_REPORT_VERSION,
     UNSUPPORTED_LAYER,
     build_svn_verification_report,
     classify_svn_program_path,
@@ -125,13 +129,20 @@ class SVNInventoryPathTests(unittest.TestCase):
         )
         unsupported_result = classify_svn_program_path(unsupported, PROCESSING_LAYOUT)
         self.assertFalse(unsupported_result.matched_program_file)
-        self.assertEqual(unsupported_result.unresolved_reason, UNSUPPORTED_LAYER)
+        self.assertFalse(unsupported_result.candidate)
+        self.assertTrue(unsupported_result.out_of_scope)
+        self.assertEqual(unsupported_result.unresolved_reason, OUT_OF_SCOPE)
         self.assertEqual(
             classify_svn_program_path(
                 "demo/not-a-python.txt", PROCESSING_LAYOUT
             ).unresolved_reason,
             svn_inventory.NOT_PYTHON,
         )
+        outside_workspace = classify_svn_program_path(
+            "demo/OTHER_DOMAIN/program.py", PROCESSING_LAYOUT
+        )
+        self.assertTrue(outside_workspace.out_of_scope)
+        self.assertEqual(outside_workspace.unresolved_reason, OUT_OF_SCOPE)
 
 
 class SVNInventoryScanTests(unittest.TestCase):
@@ -143,6 +154,36 @@ class SVNInventoryScanTests(unittest.TestCase):
             layout=layout,
         )
 
+    @staticmethod
+    def _write_program(root: Path, *parts: str) -> Path:
+        path = root.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("print('synthetic')\n", encoding="utf-8")
+        return path
+
+    def _ordered_layout_fixture(self, directory: str) -> Path:
+        root = Path(directory) / "production"
+        for index in range(3):
+            self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DWM",
+                "1.0",
+                "DWS_DWM",
+                f"DWS_DWM.PROCESSING_{index}",
+                f"processing_{index}.py",
+            )
+            self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DW_PROJECT",
+                "1.0",
+                "DWS_DWF",
+                f"DWS_DWF.DWF_{index}",
+                f"dwf_{index}.py",
+            )
+        return root
+
     def test_processing_scan_uses_strict_layout_and_layer_counts(self):
         progress: list[tuple[str, int, int, int]] = []
         result = scan_svn_profile(
@@ -152,11 +193,14 @@ class SVNInventoryScanTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, SUCCESS)
+        self.assertEqual(result.candidate_program_files, 4)
         self.assertEqual(result.matched_program_files, 2)
+        self.assertEqual(result.out_of_scope_python_files, 3)
         self.assertEqual(result.layer_counts["DWM"], 1)
         self.assertEqual(result.layer_counts["DWP"], 1)
-        self.assertGreater(result.unmatched_python_files, 0)
-        self.assertGreater(result.primary_target_unresolved, 0)
+        self.assertEqual(result.unmatched_python_files, 5)
+        self.assertEqual(result.primary_target_unresolved, 2)
+        self.assertEqual(result.primary_resolved_rate, 50.0)
         self.assertEqual(result.readable_files, 2)
         self.assertEqual(result.read_errors, 0)
         self.assertEqual(result.decode_errors, 0)
@@ -182,13 +226,20 @@ class SVNInventoryScanTests(unittest.TestCase):
             item for item in result.records if item.filename == "unrelated.py"
         )
         self.assertFalse(unrelated.matched_program_file)
+        self.assertFalse(unrelated.candidate)
+        self.assertTrue(unrelated.out_of_scope)
+        self.assertEqual(unrelated.unresolved_reason, OUT_OF_SCOPE)
         self.assertEqual(unrelated.read_status, NOT_ATTEMPTED)
-        self.assertGreater(result.unresolved_reasons[UNSUPPORTED_LAYER], 0)
+        self.assertEqual(result.unresolved_reasons[UNSUPPORTED_LAYER], 0)
 
     def test_dwf_scan_is_separate_from_processing(self):
         result = scan_svn_profile(self.profile(DWF_LAYOUT))
         self.assertEqual(result.status, SUCCESS)
+        self.assertEqual(result.candidate_program_files, 1)
         self.assertEqual(result.matched_program_files, 1)
+        self.assertEqual(result.out_of_scope_python_files, 6)
+        self.assertEqual(result.primary_target_unresolved, 0)
+        self.assertEqual(result.primary_resolved_rate, 100.0)
         self.assertEqual(result.layer_counts, {"DWF": 1})
         record = next(item for item in result.records if item.matched_program_file)
         self.assertEqual(record.layer, "DWF")
@@ -199,7 +250,186 @@ class SVNInventoryScanTests(unittest.TestCase):
             self.profile(PROCESSING_LAYOUT), sample_only=True, sample_limit=2
         )
         self.assertEqual(result.scanned_python_files, 2)
+        self.assertEqual(result.candidate_program_files, 2)
+        self.assertEqual(result.out_of_scope_python_files, 0)
         self.assertEqual(len(result.records), 2)
+
+    def test_sample_selection_is_profile_aware_and_deterministic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._ordered_layout_fixture(directory)
+            for layout in (PROCESSING_LAYOUT, DWF_LAYOUT):
+                profile = SVNProfile(
+                    name=f"sample_{layout}",
+                    environment="PROD",
+                    root_path=root,
+                    layout=layout,
+                )
+                first = scan_svn_profile(profile, sample_only=True, sample_limit=2)
+                second = scan_svn_profile(profile, sample_only=True, sample_limit=2)
+
+                self.assertEqual(first.status, SUCCESS)
+                self.assertEqual(first.scanned_python_files, 2)
+                self.assertEqual(first.candidate_program_files, 2)
+                self.assertEqual(first.matched_program_files, 2)
+                self.assertEqual(first.primary_target_resolved, 2)
+                self.assertEqual(first.primary_target_unresolved, 0)
+                self.assertEqual(first.out_of_scope_python_files, 0)
+                self.assertEqual(
+                    [record.relative_path for record in first.records],
+                    [record.relative_path for record in second.records],
+                )
+                self.assertTrue(
+                    all(record.matched_program_file for record in first.records)
+                )
+                self.assertTrue(
+                    all(record.layout == layout for record in first.records)
+                )
+
+    def test_sample_selection_does_not_read_unselected_or_out_of_scope_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._ordered_layout_fixture(directory)
+            for index in range(5):
+                self._write_program(
+                    root,
+                    "DIDP_PROJECT_WORKSPACE",
+                    "OTHER_DOMAIN",
+                    "nested",
+                    f"other_{index}.py",
+                )
+            profile = SVNProfile(
+                name="sample_io",
+                environment="PROD",
+                root_path=root,
+                layout=PROCESSING_LAYOUT,
+            )
+            real_reader = svn_inventory.read_python_source
+            with patch.object(
+                svn_inventory, "read_python_source", wraps=real_reader
+            ) as reader:
+                result = scan_svn_profile(profile, sample_only=True, sample_limit=2)
+
+        self.assertEqual(result.status, SUCCESS)
+        self.assertEqual(reader.call_count, 2)
+        self.assertTrue(
+            all(
+                "DWS_DWM.PROCESSING_" in str(call.args[0])
+                for call in reader.call_args_list
+            )
+        )
+
+    def test_out_of_scope_siblings_do_not_pollute_primary_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "production"
+            self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DWM",
+                "1.0",
+                "DWS_DWM",
+                "DWS_DWM.PROCESSING",
+                "processing.py",
+            )
+            self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DW_PROJECT",
+                "1.0",
+                "DWS_DWF",
+                "DWS_DWF.DWF",
+                "dwf.py",
+            )
+            for domain in ("OTHER_PIPELINE", "OTHER_EXPORT", "OTHER_DOMAIN"):
+                self._write_program(
+                    root,
+                    "DIDP_PROJECT_WORKSPACE",
+                    domain,
+                    "nested",
+                    f"{domain.lower()}.py",
+                )
+
+            processing = scan_svn_profile(
+                SVNProfile(
+                    name="scope_processing",
+                    environment="PROD",
+                    root_path=root,
+                    layout=PROCESSING_LAYOUT,
+                )
+            )
+            dwf = scan_svn_profile(
+                SVNProfile(
+                    name="scope_dwf",
+                    environment="PROD",
+                    root_path=root,
+                    layout=DWF_LAYOUT,
+                )
+            )
+
+        for result in (processing, dwf):
+            self.assertEqual(result.status, SUCCESS)
+            self.assertEqual(result.candidate_program_files, 1)
+            self.assertEqual(result.matched_program_files, 1)
+            self.assertEqual(result.out_of_scope_python_files, 4)
+            self.assertEqual(result.primary_target_resolved, 1)
+            self.assertEqual(result.primary_target_unresolved, 0)
+            self.assertEqual(result.primary_resolved_rate, 100.0)
+            self.assertEqual(result.unresolved_reasons[INVALID_LAYOUT], 0)
+            self.assertEqual(result.unresolved_reasons[UNSUPPORTED_LAYER], 0)
+
+    def test_malformed_target_candidates_remain_layout_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "production"
+            processing_bad = self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DWM",
+                "WRONG_VERSION",
+                "DWS_DWM",
+                "DWS_DWM.BAD_PROCESSING",
+                "bad_processing.py",
+            )
+            dwf_bad = self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DW_PROJECT",
+                "WRONG_VERSION",
+                "DWS_DWF",
+                "DWS_DWF.BAD_DWF",
+                "bad_dwf.py",
+            )
+            processing_classification = classify_svn_program_path(
+                processing_bad, PROCESSING_LAYOUT
+            )
+            dwf_classification = classify_svn_program_path(dwf_bad, DWF_LAYOUT)
+            processing = scan_svn_profile(
+                SVNProfile(
+                    name="malformed_processing",
+                    environment="PROD",
+                    root_path=root,
+                    layout=PROCESSING_LAYOUT,
+                )
+            )
+            dwf = scan_svn_profile(
+                SVNProfile(
+                    name="malformed_dwf",
+                    environment="PROD",
+                    root_path=root,
+                    layout=DWF_LAYOUT,
+                )
+            )
+
+        for classification in (processing_classification, dwf_classification):
+            self.assertTrue(classification.candidate)
+            self.assertFalse(classification.out_of_scope)
+            self.assertEqual(classification.unresolved_reason, INVALID_LAYOUT)
+        for result in (processing, dwf):
+            self.assertEqual(result.status, PATH_LAYOUT_ERROR)
+            self.assertEqual(result.candidate_program_files, 1)
+            self.assertEqual(result.matched_program_files, 0)
+            self.assertEqual(result.out_of_scope_python_files, 1)
+            self.assertEqual(result.primary_target_resolved, 0)
+            self.assertEqual(result.primary_target_unresolved, 1)
+            self.assertEqual(result.primary_resolved_rate, 0.0)
+            self.assertEqual(result.unresolved_reasons[INVALID_LAYOUT], 1)
 
     def test_empty_and_invalid_roots_have_distinct_scan_statuses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -224,9 +454,11 @@ class SVNInventoryScanTests(unittest.TestCase):
                 root_path=invalid_root,
                 layout=PROCESSING_LAYOUT,
             )
-            self.assertEqual(
-                scan_svn_profile(invalid_profile).status, PATH_LAYOUT_ERROR
-            )
+            invalid_result = scan_svn_profile(invalid_profile)
+            self.assertEqual(invalid_result.status, NO_MATCHED_FILES)
+            self.assertEqual(invalid_result.candidate_program_files, 0)
+            self.assertEqual(invalid_result.out_of_scope_python_files, 1)
+            self.assertEqual(invalid_result.primary_target_unresolved, 0)
 
     def test_coding_cookie_is_read_with_tokenize_open(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +496,9 @@ class SVNInventoryScanTests(unittest.TestCase):
         self.assertEqual(result.read_errors, 1)
         self.assertEqual(result.decode_errors, 0)
         self.assertEqual(result.matched_program_files, 2)
+        self.assertEqual(result.primary_target_resolved, 2)
+        self.assertEqual(result.primary_target_unresolved, 2)
+        self.assertEqual(result.out_of_scope_python_files, 3)
         self.assertEqual(result.readable_files, 1)
 
     def test_decode_error_is_counted_separately(self):
@@ -282,6 +517,9 @@ class SVNInventoryScanTests(unittest.TestCase):
         self.assertEqual(result.status, DECODE_ERROR)
         self.assertEqual(result.decode_errors, 1)
         self.assertEqual(result.read_errors, 0)
+        self.assertEqual(result.primary_target_resolved, 2)
+        self.assertEqual(result.primary_target_unresolved, 2)
+        self.assertEqual(result.out_of_scope_python_files, 3)
         self.assertEqual(result.readable_files, 1)
 
 
@@ -355,11 +593,27 @@ svn_profiles:
         serialized = json.dumps(report, ensure_ascii=False)
 
         self.assertIn("scanned_python_files", serialized)
+        self.assertIn("candidate_program_files", serialized)
+        self.assertIn("out_of_scope_python_files", serialized)
         self.assertIn("directory_pattern_valid", serialized)
+        self.assertEqual(report["report_version"], SVN_REPORT_VERSION)
         self.assertNotIn("DWM.RESULT_A", serialized)
         self.assertNotIn("005_DWS_DWM_RESULT_A_00.py", serialized)
         self.assertNotIn(str(FIXTURE_ROOT), serialized)
         self.assertNotIn("Fictional DWM fixture", serialized)
+
+    def test_report_preserves_accounting_fields_for_full_scan(self):
+        result = scan_svn_profile(self._profile(PROCESSING_LAYOUT))
+        report = build_svn_verification_report([result])
+        profiles = cast(list[dict[str, object]], report["profiles"])
+        profile = profiles[0]
+
+        self.assertEqual(profile["candidate_program_files"], 4)
+        self.assertEqual(profile["matched_program_files"], 2)
+        self.assertEqual(profile["out_of_scope_python_files"], 3)
+        self.assertEqual(profile["primary_target_resolved"], 2)
+        self.assertEqual(profile["primary_target_unresolved"], 2)
+        self.assertEqual(profile["primary_resolved_rate"], 50.0)
 
     def _profile(self, layout: str) -> SVNProfile:
         return SVNProfile(
@@ -417,12 +671,63 @@ class VerifySVNSourcesCLITests(unittest.TestCase):
             "stage=svn_scan profile=prod_svn_dwf environment=PROD status=SUCCESS",
             text,
         )
+        self.assertIn("scanned=", text)
+        self.assertIn("candidate_files=", text)
+        self.assertIn("matched_files=", text)
+        self.assertIn("out_of_scope=", text)
+        self.assertIn("primary_rate=", text)
+        self.assertIn("readable=", text)
+        self.assertIn("read_failed=", text)
         self.assertNotIn("RESULT_A", report_text)
         self.assertNotIn("005_DWS", report_text)
         self.assertNotIn(str(FIXTURE_ROOT), report_text)
         report = json.loads(report_text)
         self.assertEqual(report["sample_only"], True)
+        self.assertEqual(report["report_version"], SVN_REPORT_VERSION)
         self.assertEqual(len(report["profiles"]), 2)
+        self.assertTrue(
+            all(
+                {
+                    "scanned_python_files",
+                    "candidate_program_files",
+                    "matched_program_files",
+                    "out_of_scope_python_files",
+                    "primary_target_resolved",
+                    "primary_target_unresolved",
+                    "primary_resolved_rate",
+                }.issubset(profile)
+                for profile in report["profiles"]
+            )
+        )
+
+    def test_full_cli_summary_separates_out_of_scope_from_unresolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.write_config(directory, str(FIXTURE_ROOT))
+            output = Path(directory) / "report.json"
+            console = io.StringIO()
+            with redirect_stdout(console):
+                exit_code = verify_svn_sources.main(
+                    [
+                        "--config",
+                        str(config),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+        text = console.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("profile=prod_svn_processing", text)
+        self.assertIn(
+            "candidate_files=4 matched_files=2 out_of_scope=3 "
+            "primary_resolved=2 primary_unresolved=2 primary_rate=50.00%",
+            text,
+        )
+        self.assertIn(
+            "candidate_files=1 matched_files=1 out_of_scope=6 "
+            "primary_resolved=1 primary_unresolved=0 primary_rate=100.00%",
+            text,
+        )
 
     def test_missing_root_has_a_specific_status(self):
         with tempfile.TemporaryDirectory() as directory:

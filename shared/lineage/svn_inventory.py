@@ -54,8 +54,13 @@ CONFIG_ERROR = "CONFIG_ERROR"
 INVALID_LAYOUT = "INVALID_LAYOUT"
 GRANDPARENT_MISMATCH = "GRANDPARENT_MISMATCH"
 INVALID_PROGRAM_DIRECTORY = "INVALID_PROGRAM_DIRECTORY"
+# Retained for compatibility with report consumers that know the legacy key.
+# A non-target top-level subtree is now classified as OUT_OF_SCOPE instead.
 UNSUPPORTED_LAYER = "UNSUPPORTED_LAYER"
+OUT_OF_SCOPE = "OUT_OF_SCOPE"
 NOT_PYTHON = "NOT_PYTHON"
+
+SVN_REPORT_VERSION = 2
 
 UNRESOLVED_REASON_ORDER = (
     INVALID_LAYOUT,
@@ -199,11 +204,6 @@ def _component(value: object) -> str:
     return str(value).casefold()
 
 
-def _looks_like_layout_component(value: object) -> bool:
-    text = str(value)
-    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", text))
-
-
 def _path_parts(path: str | os.PathLike[str]) -> tuple[str, ...]:
     """Return path components for both native and foreign Windows paths.
 
@@ -286,7 +286,12 @@ def derive_primary_target_from_program_path(
 
 @dataclass(frozen=True)
 class PathClassification:
-    """Safe classification metadata for one filesystem path."""
+    """Safe classification metadata for one filesystem path.
+
+    ``candidate`` marks a path inside the selected layout's domain, including
+    malformed candidates.  ``out_of_scope`` is deliberately separate so a
+    sibling layout or unrelated subtree cannot become a verification failure.
+    """
 
     layout: str
     layer: str | None
@@ -294,7 +299,8 @@ class PathClassification:
     matched_program_file: bool
     directory_pattern_valid: bool
     candidate: bool
-    unresolved_reason: str | None
+    unresolved_reason: str | None = None
+    out_of_scope: bool = False
 
     @property
     def primary_target_resolved(self) -> bool:
@@ -310,6 +316,7 @@ def _classification(
     directory_valid: bool = False,
     candidate: bool = False,
     reason: str | None = None,
+    out_of_scope: bool = False,
 ) -> PathClassification:
     return PathClassification(
         layout=layout,
@@ -319,6 +326,7 @@ def _classification(
         directory_pattern_valid=directory_valid,
         candidate=candidate,
         unresolved_reason=reason,
+        out_of_scope=out_of_scope,
     )
 
 
@@ -335,12 +343,10 @@ def _classify_processing_at(
         else None
     )
     if first_after_workspace not in PROCESSING_LAYERS:
-        candidate = _looks_like_layout_component(first_after_workspace_raw)
         return _classification(
             layout,
-            layer=first_after_workspace if candidate else None,
-            candidate=candidate,
-            reason=UNSUPPORTED_LAYER if candidate else INVALID_LAYOUT,
+            reason=OUT_OF_SCOPE,
+            out_of_scope=True,
         )
 
     layer = first_after_workspace
@@ -421,12 +427,10 @@ def _classify_dwf_at(
         else None
     )
     if first_after_workspace != "DW_PROJECT":
-        candidate = _looks_like_layout_component(first_after_workspace_raw)
         return _classification(
             layout,
-            layer=first_after_workspace if candidate else None,
-            candidate=candidate,
-            reason=UNSUPPORTED_LAYER if candidate else INVALID_LAYOUT,
+            reason=OUT_OF_SCOPE,
+            out_of_scope=True,
         )
 
     layer = DWF_LAYER
@@ -512,7 +516,8 @@ def classify_svn_program_path(
         return _classification(
             normalized_layout,
             candidate=False,
-            reason=INVALID_LAYOUT,
+            reason=OUT_OF_SCOPE,
+            out_of_scope=True,
         )
 
     classifications = []
@@ -526,13 +531,14 @@ def classify_svn_program_path(
         if result.matched_program_file:
             return result
 
-    # Prefer a layout candidate's specific reason over a completely unrelated
-    # Python path, while keeping the return deterministic for unusual nested
+    # Prefer a layout candidate's specific reason over an out-of-scope Python
+    # path, while keeping the return deterministic for unusual nested
     # workspaces.
     return sorted(
         classifications,
         key=lambda result: (
             not result.candidate,
+            result.out_of_scope,
             UNRESOLVED_REASON_ORDER.index(result.unresolved_reason)
             if result.unresolved_reason in UNRESOLVED_REASON_ORDER
             else len(UNRESOLVED_REASON_ORDER),
@@ -593,6 +599,8 @@ class SVNFileInventory:
     matched_program_file: bool
     directory_pattern_valid: bool
     unresolved_reason: str | None = None
+    candidate: bool = False
+    out_of_scope: bool = False
 
     @property
     def primary_target_resolved(self) -> bool:
@@ -619,6 +627,10 @@ class SVNScanResult:
     unresolved_reasons: dict[str, int]
     elapsed_ms: float
     records: tuple[SVNFileInventory, ...] = field(repr=False, default_factory=tuple)
+    # Appended with defaults so existing report/result constructors remain
+    # source-compatible while consumers adopt the v2 accounting fields.
+    candidate_program_files: int = 0
+    out_of_scope_python_files: int = 0
 
     @property
     def primary_resolved_rate(self) -> float:
@@ -645,7 +657,9 @@ class SVNScanResult:
             layout=profile.layout,
             status=status,
             scanned_python_files=0,
+            candidate_program_files=0,
             matched_program_files=0,
+            out_of_scope_python_files=0,
             unmatched_python_files=0,
             primary_target_resolved=0,
             primary_target_unresolved=0,
@@ -697,6 +711,8 @@ def _scan_status(
     matched: int,
     read_errors: int,
     decode_errors: int,
+    *,
+    candidate: int | None = None,
 ) -> str:
     if read_errors and decode_errors:
         return READ_ERROR
@@ -706,7 +722,11 @@ def _scan_status(
         return DECODE_ERROR
     if matched:
         return SUCCESS
-    if scanned:
+    # Only a scanned candidate can prove that the target layout is malformed.
+    # A root containing only sibling or unrelated Python files is not a path
+    # layout error for this profile.
+    candidate_count = scanned if candidate is None else candidate
+    if candidate_count:
         return PATH_LAYOUT_ERROR
     return NO_MATCHED_FILES
 
@@ -735,12 +755,23 @@ def scan_svn_profile(
 
     started_at = time.perf_counter()
     all_python_paths, walk_errors = _iter_python_files(root)
-    python_paths = all_python_paths[:sample_limit] if sample_only else all_python_paths
+    classified_paths = [
+        (path, classify_svn_program_path(path, profile.layout))
+        for path in all_python_paths
+    ]
+    if sample_only:
+        # Walking and classifying paths is cheap metadata work.  Source reads
+        # still happen only for the selected, profile-relevant sample below.
+        classified_paths = [item for item in classified_paths if item[1].candidate][
+            :sample_limit
+        ]
 
     records: list[SVNFileInventory] = []
     layer_counts = _initial_layer_counts(profile.layout)
     reason_counts = _initial_reason_counts()
+    candidate_count = 0
     matched_count = 0
+    out_of_scope_count = 0
     primary_resolved_count = 0
     primary_unresolved_count = 0
     readable_count = 0
@@ -751,12 +782,15 @@ def scan_svn_profile(
         reason_counts[READ_ERROR] += walk_errors
         read_error_count += walk_errors
 
-    for processed, file_path in enumerate(python_paths, start=1):
+    for processed, (file_path, classification) in enumerate(classified_paths, start=1):
         relative_path = file_path.relative_to(root).as_posix()
-        classification = classify_svn_program_path(file_path, profile.layout)
         file_size: int | None = None
         read_status = NOT_ATTEMPTED
         unresolved_reason = classification.unresolved_reason
+        if classification.candidate:
+            candidate_count += 1
+        elif classification.out_of_scope:
+            out_of_scope_count += 1
 
         if classification.matched_program_file:
             matched_count += 1
@@ -786,10 +820,10 @@ def scan_svn_profile(
                 decode_error_count += 1
                 reason_counts[DECODE_ERROR] += 1
                 unresolved_reason = DECODE_ERROR
-        else:
+        elif classification.candidate:
             if unresolved_reason is not None:
                 reason_counts[unresolved_reason] += 1
-            if classification.candidate and not classification.primary_target_resolved:
+            if not classification.primary_target_resolved:
                 primary_unresolved_count += 1
 
         records.append(
@@ -808,6 +842,8 @@ def scan_svn_profile(
                 matched_program_file=classification.matched_program_file,
                 directory_pattern_valid=classification.directory_pattern_valid,
                 unresolved_reason=unresolved_reason,
+                candidate=classification.candidate,
+                out_of_scope=classification.out_of_scope,
             )
         )
 
@@ -825,14 +861,17 @@ def scan_svn_profile(
         environment=profile.environment,
         layout=profile.layout,
         status=_scan_status(
-            len(python_paths),
+            len(classified_paths),
             matched_count,
             read_error_count,
             decode_error_count,
+            candidate=candidate_count,
         ),
-        scanned_python_files=len(python_paths),
+        scanned_python_files=len(classified_paths),
+        candidate_program_files=candidate_count,
         matched_program_files=matched_count,
-        unmatched_python_files=len(python_paths) - matched_count,
+        out_of_scope_python_files=out_of_scope_count,
+        unmatched_python_files=len(classified_paths) - matched_count,
         primary_target_resolved=primary_resolved_count,
         primary_target_unresolved=primary_unresolved_count,
         readable_files=readable_count,
@@ -851,6 +890,8 @@ def _safe_sample(record: SVNFileInventory) -> dict[str, object]:
     return {
         "layout": record.layout,
         "layer": record.layer,
+        "candidate": record.candidate,
+        "out_of_scope": record.out_of_scope,
         "directory_pattern_valid": record.directory_pattern_valid,
         "primary_target_resolved": record.primary_target_resolved,
         "read_status": record.read_status,
@@ -872,6 +913,13 @@ def build_svn_verification_report(
     profiles: list[dict[str, object]] = []
     for result in results:
         sample = [_safe_sample(record) for record in result.records[:sample_limit]]
+        candidate_count = result.candidate_program_files
+        if candidate_count == 0:
+            # Results constructed by pre-v2 callers do not have the appended
+            # field; their primary counters still provide the candidate total.
+            candidate_count = (
+                result.primary_target_resolved + result.primary_target_unresolved
+            )
         profiles.append(
             {
                 "profile_name": result.profile_name,
@@ -879,7 +927,9 @@ def build_svn_verification_report(
                 "layout": result.layout,
                 "status": result.status,
                 "scanned_python_files": result.scanned_python_files,
+                "candidate_program_files": candidate_count,
                 "matched_program_files": result.matched_program_files,
+                "out_of_scope_python_files": result.out_of_scope_python_files,
                 "unmatched_python_files": result.unmatched_python_files,
                 "primary_target_resolved": result.primary_target_resolved,
                 "primary_target_unresolved": result.primary_target_unresolved,
@@ -895,7 +945,7 @@ def build_svn_verification_report(
         )
     return {
         "report_type": "svn_source_verification",
-        "report_version": 1,
+        "report_version": SVN_REPORT_VERSION,
         "sample_only": sample_only,
         "profiles": profiles,
     }
@@ -927,6 +977,7 @@ __all__ = [
     "NO_MATCHED_FILES",
     "NOT_ATTEMPTED",
     "NOT_PYTHON",
+    "OUT_OF_SCOPE",
     "PATH_LAYOUT_ERROR",
     "PROCESSING_LAYERS",
     "PROCESSING_LAYOUT",
@@ -936,6 +987,7 @@ __all__ = [
     "ROOT_NOT_DIRECTORY",
     "ROOT_NOT_FOUND",
     "SUCCESS",
+    "SVN_REPORT_VERSION",
     "PathClassification",
     "SVNFileInventory",
     "SVNInventoryConfigError",

@@ -120,6 +120,21 @@ DIDP_PROJECT_WORKSPACE/
 DWF profile 与 processing profile 分开扫描、分开统计。DWF 特殊的是 discovery
 path；primary target 的 normalization 仍然相同。
 
+## Profile scope 与 classification
+
+每个 profile 都有自己的 candidate domain：processing 的第一层必须是受支持的
+processing layer，DWF 的第一层必须是 `DW_PROJECT`。只有进入该 domain 的 Python
+才会成为当前 profile 的 `candidate`；candidate 可以是合法程序，也可以是后续
+目录结构损坏的 malformed candidate。
+
+其他 layout、其他业务 sibling 或 workspace 外的 Python 是 `OUT_OF_SCOPE`，不是
+当前 verifier 的错误，不会增加 `primary_target_unresolved` 或降低
+`primary_resolved_rate`。`INVALID_LAYOUT`、`GRANDPARENT_MISMATCH` 和
+`INVALID_PROGRAM_DIRECTORY` 只用于已进入当前 profile candidate domain、但不满足
+layout contract 的路径。这样不会把 DWF 当成 processing parse failure，也不会把
+processing 当成 DWF parse failure；真正的错误版本、错误 DWS 或错误 program
+folder 仍然会保留 diagnostic。
+
 ## Primary target 规则
 
 `derive_primary_target_from_program_path(path)` 只在以下条件同时成立时返回结果：
@@ -148,7 +163,10 @@ inventory locator，不能覆盖目录推导，也不读取 SQL 猜 target。par
 `READ_ERROR`，编码声明或解码失败计为 `DECODE_ERROR`，扫描继续进行。
 
 JSON report 只包含 profile alias、environment、layout、状态、计数、耗时、layer
-计数、原因计数和脱敏 sample shape，例如：
+计数、原因计数和脱敏 sample shape。当前 report `report_version` 为 `2`；原有
+字段保留，新增范围 accounting 字段，并明确修正 primary metrics 的语义。没有
+发现仓库内的 report consumer；兼容 consumer 可以继续读取原有字段，但应按
+version 2 的 denominator 解释 primary metrics。例如：
 
 ```json
 {
@@ -162,19 +180,39 @@ JSON report 只包含 profile alias、environment、layout、状态、计数、�
 默认不会写入 root path、absolute path、relative path、filename、table name、
 SVN URL、script code 或 SQL。报告指标包括：
 
-- `scanned_python_files`
-- `matched_program_files`
-- `unmatched_python_files`
-- `primary_target_resolved`
-- `primary_target_unresolved`
-- `primary_resolved_rate`
-- `readable_files`、`read_errors`、`decode_errors`
+- `scanned_python_files`：本次实际处理的 Python；full scan 是全部发现的 Python，
+  sample scan 是 profile-aware sample 中选出的 Python；
+- `candidate_program_files`：属于当前 profile candidate domain 的 Python，包括
+  valid 和 malformed candidate；
+- `matched_program_files`：满足完整 layout contract、可以从目录推导 target 的
+  Python；
+- `out_of_scope_python_files`：明确属于其他 layout / sibling / non-target subtree
+  的 Python；它们不属于 primary resolution denominator；
+- `unmatched_python_files`：本次处理但没有 matched 的 Python，包含 candidate
+  diagnostic 和 out-of-scope；需要结合上面两个字段阅读；
+- `primary_target_resolved`、`primary_target_unresolved`：只统计当前 candidate
+  domain；malformed candidate 属于 unresolved，out-of-scope 不属于 unresolved；
+- `primary_resolved_rate`：`resolved / (resolved + unresolved)`，即只以当前
+  candidate domain 为 denominator；
+- `readable_files`、`read_errors`、`decode_errors`：独立的 source read 结果，不
+  改变已经完成的 directory target resolution；
 - `layer_counts`
-- `unresolved_reasons`
+- `unresolved_reasons`：只记录 candidate diagnostic 和 read/decode failure，不把
+  `OUT_OF_SCOPE` 混入错误原因。
+
+因此应始终区分：`scanned != candidate != matched != out_of_scope`。
 
 ## Verification CLI
 
-Sample（每个 profile 最多扫描 20 个 Python 文件）：
+Sample（每个 profile 最多处理 20 个 profile-aware candidate Python 文件）：
+
+`--sample-only` 会先按 deterministic relative path 顺序遍历并做纯路径
+classification，只保留当前 profile 的 candidate，再取前 `sample_limit` 个。它
+不会先从整个 root 任意截断，也不会为寻找 sample 读取所有 Python source；只有
+选中的 candidate 才会调用 `tokenize.open()`。因此 DWF sample 不会因为 processing
+文件在排序上更靠前而误报 `PATH_LAYOUT_ERROR`。sample report 的
+`scanned_python_files` 是选中的 sample 数量，full scan 才对 root 下发现的 Python
+逐一处理。
 
 ```bash
 python -m tools.lineage.verify_svn_sources \
@@ -200,8 +238,10 @@ python -m tools.lineage.verify_svn_sources \
   --output artifacts/lineage_verification/svn_report.json
 ```
 
-每个 profile 会立即输出 `stage=svn_scan`，大扫描每 500 个 Python 文件输出一次
-`stage=svn_scan_progress`。错误状态会区分：
+每个 profile 会立即输出包含 `scanned`、`candidate_files`、`matched_files`、
+`out_of_scope`、`primary_resolved`、`primary_unresolved`、`primary_rate`、
+`readable` 和 `read_failed` 的 `stage=svn_scan`；大扫描每 500 个选中 Python 文件
+输出一次 `stage=svn_scan_progress`。错误状态会区分：
 
 - `CONFIG_ERROR`
 - `ROOT_NOT_FOUND`
@@ -246,16 +286,21 @@ profile=prod_svn_dwf ... status=SUCCESS
 ```
 
 如果失败，按输出的 `status` 处理，不要只看 `FAILED`：配置问题是
-`CONFIG_ERROR`；根目录问题是 `ROOT_NOT_FOUND` / `ROOT_NOT_DIRECTORY`；路径没有
-命中是 `NO_MATCHED_FILES` 或 `PATH_LAYOUT_ERROR`；文件读取问题是
-`READ_ERROR` / `DECODE_ERROR`。
+`CONFIG_ERROR`；根目录问题是 `ROOT_NOT_FOUND` / `ROOT_NOT_DIRECTORY`；当前
+profile 没有 matched candidate 是 `NO_MATCHED_FILES`；只有 candidate 存在但没有
+任何合法 match 才是 `PATH_LAYOUT_ERROR`；文件读取问题是 `READ_ERROR` /
+`DECODE_ERROR`。只有属于当前 profile candidate domain 的 malformed path 才会
+触发 layout error；仅有 out-of-scope sibling 不应被解释成 layout parse failure。
 
 ### STEP 4：确认 primary resolved rate
 
 在脱敏 JSON 中分别检查两个 profile 的：
 
 ```text
+scanned_python_files
+candidate_program_files
 matched_program_files
+out_of_scope_python_files
 primary_target_resolved
 primary_target_unresolved
 primary_resolved_rate
