@@ -39,7 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sample-only",
         action="store_true",
-        help="scan at most sample-limit Python files per profile",
+        help=(
+            "scan at most sample-limit profile-relevant candidate Python files "
+            "per profile"
+        ),
     )
     parser.add_argument(
         "--sample-limit",
@@ -86,7 +89,10 @@ def _emit_profile_result(result: SVNScanResult) -> None:
         f"profile={result.profile_name} "
         f"environment={result.environment} "
         f"status={result.status} "
+        f"scanned={result.scanned_python_files} "
+        f"candidate_files={result.candidate_program_files} "
         f"matched_files={result.matched_program_files} "
+        f"out_of_scope={result.out_of_scope_python_files} "
         f"primary_resolved={result.primary_target_resolved} "
         f"primary_unresolved={result.primary_target_unresolved} "
         f"primary_rate={result.primary_resolved_rate:.2f}% "
