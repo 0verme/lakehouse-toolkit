@@ -60,6 +60,8 @@ from .evolution import (  # pyright: ignore[reportMissingImports]
     reconcile_issue_lifecycle,
 )
 from .materialization import (  # pyright: ignore[reportMissingImports]
+    LineageEvidenceError,
+    LineagePathEnumerationError,
     MaterializationBatch,
     ProgramMaterialization,
     build_materialization_batch,
@@ -159,6 +161,8 @@ __all__ = [
     "LineageNode",
     "LineageQueryResult",
     "LineageQueryService",
+    "LineageEvidenceError",
+    "LineagePathEnumerationError",
     "MaterializationBatch",
     "MaterializationSQLiteStore",
     "ProgramMaterialization",

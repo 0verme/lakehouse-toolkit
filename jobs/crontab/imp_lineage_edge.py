@@ -110,6 +110,12 @@ class _ProgramTimingStats:
         return is_slow
 
 
+@dataclass(frozen=True, slots=True)
+class _ProgramStageTiming:
+    dag_ms: int
+    audit_ms: int
+
+
 def _emit_log(stage: str, status: str, **fields: object) -> None:
     """输出低基数且已脱敏的阶段日志。"""
 
@@ -210,7 +216,11 @@ def _iter_selected_program_sources(
     selected = set(selected_profiles)
     for provider in providers:
         provider_profile = _provider_source_profile(provider)
-        if selected and provider_profile is not None and provider_profile not in selected:
+        if (
+            selected
+            and provider_profile is not None
+            and provider_profile not in selected
+        ):
             continue
         for source in provider.iter_program_sources():
             if (
@@ -244,29 +254,47 @@ def _build_program_audit(
     *,
     observed_at: datetime,
     batch_id: str,
-    timing: _ProgramTimingStats,
+    ordinal: int,
+    diagnostic: bool,
+    stage_timings: dict[tuple[str, ...], _ProgramStageTiming],
 ) -> LineageAuditResult:
-    program_started_at = time.perf_counter()
-    dag_started_at = time.perf_counter()
-    dag = build_program_physical_dag(program_source)
-    dag_elapsed_ms = _elapsed_ms(dag_started_at)
-    audit_started_at = time.perf_counter()
-    audit = audit_program_physical_dag(
-        dag,
-        observed_at=observed_at,
-        batch_id=batch_id,
-    )
-    audit_elapsed_ms = _elapsed_ms(audit_started_at)
-    total_elapsed_ms = _elapsed_ms(program_started_at)
-    if timing.observe(total_elapsed_ms):
+    program_id = _anonymous_program_id(program_source)
+    safe_profile = _safe_profile_name(program_source.source_profile)
+    if diagnostic:
         _emit_log(
             "build_program",
-            "SLOW",
-            program_id=_anonymous_program_id(program_source),
-            build_program_physical_dag_ms=dag_elapsed_ms,
-            audit_program_physical_dag_ms=audit_elapsed_ms,
-            single_program_total_ms=total_elapsed_ms,
+            "STARTED",
+            program_id=program_id,
+            source_profile=safe_profile,
+            ordinal=ordinal,
         )
+    program_started_at = time.perf_counter()
+    try:
+        dag_started_at = time.perf_counter()
+        dag = build_program_physical_dag(program_source)
+        dag_elapsed_ms = _elapsed_ms(dag_started_at)
+        audit_started_at = time.perf_counter()
+        audit = audit_program_physical_dag(
+            dag,
+            observed_at=observed_at,
+            batch_id=batch_id,
+        )
+        audit_elapsed_ms = _elapsed_ms(audit_started_at)
+    except Exception as error:
+        _emit_log(
+            "build_program",
+            "PATHOLOGICAL",
+            program_id=program_id,
+            source_profile=safe_profile,
+            ordinal=ordinal,
+            elapsed_ms=_elapsed_ms(program_started_at),
+            exception=_exception_name(error),
+        )
+        raise
+    stage_timings[program_source.identity.key] = _ProgramStageTiming(
+        dag_ms=dag_elapsed_ms,
+        audit_ms=audit_elapsed_ms,
+    )
     return audit
 
 
@@ -281,12 +309,17 @@ def build_audits(
     progress_started_at: float | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
     timing: _ProgramTimingStats | None = None,
+    diagnostic: bool = False,
+    stage_timings: dict[tuple[str, ...], _ProgramStageTiming] | None = None,
 ) -> Iterable[LineageAuditResult]:
     """逐个复用 Builder/Auditor，并顺手累加可选 coverage。"""
 
     progress_every = _validate_progress_every(progress_every)
-    slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
-    timing = timing or _ProgramTimingStats(slow_threshold_ms)
+    _validate_slow_threshold_ms(slow_threshold_ms)
+    # ``timing`` remains a compatibility parameter; complete timing is observed
+    # after materialization so it includes the stage that previously hid the hot spot.
+    del timing
+    stage_timings = stage_timings if stage_timings is not None else {}
     total = len(program_sources) if isinstance(program_sources, Sized) else None
     processed = 0
     for program_source in program_sources:
@@ -294,7 +327,9 @@ def build_audits(
             program_source,
             observed_at=observed_at,
             batch_id=batch_id,
-            timing=timing,
+            ordinal=processed + 1,
+            diagnostic=diagnostic,
+            stage_timings=stage_timings,
         )
         dag = audit.dag
         if coverage is not None:
@@ -331,8 +366,64 @@ def build_candidate_batch(
     progress_started_at: float | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
     timing: _ProgramTimingStats | None = None,
+    diagnostic: bool = False,
 ) -> MaterializationBatch:
     """完成计算但不写库，返回可校验的 candidate batch。"""
+
+    timing = timing or _ProgramTimingStats(slow_threshold_ms)
+    stage_timings: dict[tuple[str, ...], _ProgramStageTiming] = {}
+
+    def observe_program(
+        audit: LineageAuditResult,
+        result,
+        ordinal: int,
+        materialization_ms: int,
+        error: Exception | None,
+    ) -> None:
+        program_source = audit.dag.program_source
+        program_id = _anonymous_program_id(program_source)
+        safe_profile = _safe_profile_name(program_source.source_profile)
+        stage_timing = stage_timings.get(program_source.identity.key)
+        dag_ms = stage_timing.dag_ms if stage_timing is not None else 0
+        audit_ms = stage_timing.audit_ms if stage_timing is not None else 0
+        elapsed_ms = dag_ms + audit_ms + materialization_ms
+        common_fields = {
+            "program_id": program_id,
+            "source_profile": safe_profile,
+            "ordinal": ordinal,
+            "elapsed_ms": elapsed_ms,
+            "dag_ms": dag_ms,
+            "audit_ms": audit_ms,
+            "materialization_ms": materialization_ms,
+            # Keep the Phase 7 field names as aliases for existing log consumers.
+            "build_program_physical_dag_ms": dag_ms,
+            "audit_program_physical_dag_ms": audit_ms,
+            "single_program_total_ms": elapsed_ms,
+        }
+        if error is not None:
+            _emit_log(
+                "build_program",
+                "PATHOLOGICAL",
+                **common_fields,
+                exception=_exception_name(error),
+            )
+            return
+
+        is_slow = timing.observe(elapsed_ms)
+        if result is None:
+            raise RuntimeError("program observer received no materialization result")
+        common_fields.update(
+            {
+                "physical_nodes": len(result.dag.nodes),
+                "physical_edges": len(result.dag.edges),
+                "lineage_edges": len(result.edges),
+                "issues": len(result.issues),
+            }
+        )
+        if diagnostic:
+            _emit_log("build_program", "SUCCESS", **common_fields)
+        if is_slow:
+            _emit_log("build_program", "SLOW", **common_fields)
 
     candidate = build_materialization_batch(
         build_audits(
@@ -344,11 +435,13 @@ def build_candidate_batch(
             progress_every=progress_every,
             progress_started_at=progress_started_at,
             slow_threshold_ms=slow_threshold_ms,
-            timing=timing,
+            diagnostic=diagnostic,
+            stage_timings=stage_timings,
         ),
         batch_id=batch_id,
         observed_at=observed_at,
         job_keys=job_keys,
+        program_observer=observe_program,
     )
     if coverage is not None and observe_materialized_edges:
         coverage.observe_materialized_edges(candidate.edges)
@@ -433,6 +526,7 @@ def build_incremental_candidate_batch(
     force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
+    diagnostic: bool = False,
 ) -> MaterializationBatch:
     """只重建 NEW/CHANGED，并把 candidate 合并成完整 snapshot。"""
 
@@ -508,6 +602,7 @@ def build_incremental_candidate_batch(
             progress_started_at=build_started_at,
             slow_threshold_ms=slow_threshold_ms,
             timing=timing,
+            diagnostic=diagnostic,
         )
 
         retained_edges = [
@@ -625,6 +720,7 @@ def materialize_sources(
     selected_profiles: Iterable[str] | str | None = None,
     limit: int | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
+    diagnostic: bool = False,
 ) -> PublishResult:
     """增量计算完整 candidate，再交给 SQLite adapter 做 atomic publish。
 
@@ -695,6 +791,7 @@ def materialize_sources(
         force_rebuild=force_rebuild,
         progress_every=progress_every,
         slow_threshold_ms=slow_threshold_ms,
+        diagnostic=diagnostic,
     )
 
     publish_started_at = time.perf_counter()
@@ -760,9 +857,7 @@ def load_default_providers(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Build lineage facts and emit a sanitized parser coverage report."
-        )
+        description=("Build lineage facts and emit a sanitized parser coverage report.")
     )
     parser.add_argument(
         "--db-path",
@@ -810,6 +905,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MS",
         help="log per-program SLOW timing only when total elapsed time exceeds MS",
     )
+    parser.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help="emit per-program STARTED/SUCCESS diagnostics in addition to slow logs",
+    )
     return parser
 
 
@@ -823,6 +923,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
         selected_profiles=args.profile,
         limit=args.limit,
         slow_threshold_ms=args.slow_threshold_ms,
+        diagnostic=args.diagnostic,
     )
 
 
@@ -844,6 +945,7 @@ def main(
     selected_profiles: Iterable[str] | str | None = None,
     limit: int | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
+    diagnostic: bool = False,
 ) -> int:
     """定时任务边界；异常向外传播并由进程返回 non-zero。"""
 
@@ -867,6 +969,7 @@ def main(
             selected_profiles=_format_selected_profiles(selected_profiles),
             force_rebuild=bool(force_rebuild),
             partial_snapshot=not effective_complete_snapshot,
+            diagnostic=bool(diagnostic),
         )
         resolved_scopes = (
             tuple(snapshot_scopes)
@@ -892,6 +995,7 @@ def main(
             selected_profiles=selected_profiles,
             limit=limit,
             slow_threshold_ms=slow_threshold_ms,
+            diagnostic=diagnostic,
         )
     except Exception as error:
         _emit_log(

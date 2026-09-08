@@ -233,22 +233,23 @@ program_name）排序取前 N 个，只有这 N 个进入 parser/DAG/audit。日
 
 ## Slow program 日志定位
 
-默认只输出聚合 build 日志；单程序总耗时超过 5 秒（可用
-`--slow-threshold-ms` 调整）时才输出一行：
+默认只输出聚合 build 日志；单程序完整的 DAG、audit、materialization 总耗时超过
+5 秒（可用 `--slow-threshold-ms` 调整）时才输出一行：
 
 ```text
 stage=build_program status=SLOW program_id=<stable-short-hash> \
-  build_program_physical_dag_ms=... \
-  audit_program_physical_dag_ms=... \
-  single_program_total_ms=...
+  source_profile=<safe-profile> ordinal=... elapsed_ms=... \
+  dag_ms=... audit_ms=... materialization_ms=... \
+  physical_nodes=... physical_edges=... lineage_edges=... issues=...
 ```
 
-`build_program_physical_dag_ms` 高说明优先检查 parser/Physical DAG 提取路径，
-`audit_program_physical_dag_ms` 高说明优先检查 audit 图遍历和 issue 判定；两者
-都高则以 `single_program_total_ms` 为该程序的主要耗时。`build status=SUCCESS` 的
-`slow_programs`、`max_program_elapsed_ms`、`avg_program_elapsed_ms` 用于判断是
-少数长尾还是整体变慢。`program_id` 是不含程序名的稳定短 hash，可在同一受控
-sample 的重复运行中比对长尾，不应为定位方便而把源码、SQL 或表名写进生产日志。
+`dag_ms` 高说明优先检查 parser/Physical DAG 提取路径，`audit_ms` 高说明优先检查
+Audit 图遍历和 issue 判定，`materialization_ms` 高说明优先检查 TMP collapse 和
+bounded evidence finalize。`build status=SUCCESS` 的 `slow_programs`、
+`max_program_elapsed_ms`、`avg_program_elapsed_ms` 用于判断是少数长尾还是整体变慢。
+受控 replay 需要逐程序起止日志时显式增加 `--diagnostic`，此时还会输出同样脱敏的
+`STARTED`/`SUCCESS`。`program_id` 是不含程序名的稳定短 hash，可在同一受控 sample
+的重复运行中比对长尾；不应为定位方便而把源码、SQL 或表名写进生产日志。
 
 ### `lineage_closure` decision
 
