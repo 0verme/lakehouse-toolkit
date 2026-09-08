@@ -28,9 +28,10 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v1`。它不是 Git commit SHA。凡是会改变 parser/DAG/audit/
+`lineage-pipeline-v2`。它不是 Git commit SHA。凡是会改变 parser/DAG/audit/
 materialization 结果的规则升级，都必须在同一变更中把这个 constant bump 到新的
-语义版本，并在本文记录原因。
+语义版本，并在本文记录原因。本次 v2 用于标记 Python AST 失败后的保守 legacy
+SQL literal recovery；相同 source hash 的旧 v1 facts 也必须 rebuild。
 
 ## Incremental planner
 
