@@ -272,6 +272,18 @@ class PhysicalDAGTests(unittest.TestCase):
         self.assertIsNone(dag.expected_target)
         self.assertEqual(dag.sinks, (normalize_table_name("DWM.DEMO_C"),))
 
+    def test_program_name_target_fallback_continues_incomplete_lineage(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWM.DEMO_C",
+            script_code='execute("INSERT INTO DWM.DEMO_C SELECT * FROM ODS.DEMO_A")',
+        )
+        dag = build_program_physical_dag(source)
+
+        self.assertEqual(dag.expected_target, normalize_table_name("DWM.DEMO_C"))
+        self.assertEqual(dag.sinks, (normalize_table_name("DWM.DEMO_C"),))
+
     def test_self_reference_is_kept(self):
         dag = build_program_physical_dag(
             program(
@@ -655,7 +667,10 @@ executor.do(sql)
             )
         )
         self.assertEqual(dynamic_dag.sql_candidate_count, 0)
-        self.assertEqual(dynamic_dag.sql_extraction_reason, SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value)
+        self.assertEqual(
+            dynamic_dag.sql_extraction_reason,
+            SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value,
+        )
 
     def test_format_keeps_static_sql_structure_when_values_are_dynamic(self):
         fixture_path = (

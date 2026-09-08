@@ -12,13 +12,18 @@ candidate → SQL step → write target → Physical DAG → LineageEdge
 ```
 
 报告按 `(environment, source_profile)` 聚合，只保留计数、比例和固定枚举原因。不会写入
-program name、源码、SQL、表名、连接配置或异常文本。报告字段包括：
+program name、源码、SQL、表名、连接配置或异常文本；多 step 统计只保留数量，
+不输出任何 target 或 program fingerprint。报告字段包括：
 
 - `sql_candidate_count` / `programs_with_sql_candidates`
 - `sql_step_count` / `programs_with_sql_steps`
 - `programs_with_write_target`
 - `physical_node_count` / `physical_edge_count`
 - `lineage_edge_count` / `programs_with_lineage_edges`
+- program-name aggregate：`target_resolved`、`target_unresolved`、`step_resolved`、
+  `step_missing`、`step_invalid`、`custom_suffix`
+- multi-step aggregate：`multi_step_target_count`、`max_steps_per_target`、
+  `non_contiguous_step_groups`
 - `failure_reasons` 与 `lineage_failure_reasons`
 
 `coverage_scope=ALL_PROGRAMS` 表示本次 provider snapshot 中的程序都完成了 DAG 观察；

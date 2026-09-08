@@ -15,7 +15,7 @@ from pywebio.output import (  # pyright: ignore[reportMissingImports]
 
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
-from shared.lineage.domain import parse_declared_primary_target
+from shared.lineage.domain import PROGRAM_NAME_LEGACY_MARKER, parse_program_name
 from shared.ui.pywebio_helper import (
     put_black_text,
     put_red_text,
@@ -159,9 +159,11 @@ def process_task_name(process_name: str) -> str:
 
 
 def process_target_name(process_name: str) -> str:
-    declared_target = parse_declared_primary_target(process_name)
-    if declared_target is not None:
-        return normalize_table_name(declared_target)
+    parsed = parse_program_name(process_name)
+    if parsed.logical_target is not None:
+        return normalize_table_name(parsed.logical_target)
+    if parsed.legacy_marker == PROGRAM_NAME_LEGACY_MARKER:
+        return ""
 
     parts = str(process_name or "").split(":")
     if len(parts) > 1:

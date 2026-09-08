@@ -26,7 +26,7 @@ from pywebio.output import put_table  # pyright: ignore[reportMissingImports]
 from shared.config.env import required_env
 from shared.config.metadata import table as metadata_table
 from shared.db.gaussdb import select_sql_with_profile
-from shared.lineage.domain import parse_declared_primary_target
+from shared.lineage.domain import PROGRAM_NAME_LEGACY_MARKER, parse_program_name
 from shared.ui.export_helper import put_table_exports
 from shared.ui.pywebio_helper import (
     put_black_text,
@@ -156,20 +156,28 @@ def to_plain_dwf_name(table_name: str) -> str:
 
 
 def process_task_name(process_name: str) -> str:
-    parts = str(process_name or "").split(":")
-    if len(parts) > 1:
-        name = parts[1].upper()
+    parsed = parse_program_name(process_name)
+    if parsed.legacy_marker == PROGRAM_NAME_LEGACY_MARKER:
+        target_name = parsed.logical_target
+        if target_name is None:
+            return ""
     else:
-        name = str(process_name or "").upper()
-    if "." in name:
-        name = name.split(".", 1)[1]
-    return name[4:] if name.startswith("DWS_") else name
+        parts = str(process_name or "").split(":")
+        target_name = (
+            parts[1].upper() if len(parts) > 1 else str(process_name or "").upper()
+        )
+
+    if "." in target_name:
+        target_name = target_name.split(".", 1)[1]
+    return target_name[4:] if target_name.startswith("DWS_") else target_name
 
 
 def process_target_name(process_name: str) -> str:
-    declared_target = parse_declared_primary_target(process_name)
-    if declared_target is not None:
-        return normalize_table_name(declared_target)
+    parsed = parse_program_name(process_name)
+    if parsed.logical_target is not None:
+        return normalize_table_name(parsed.logical_target)
+    if parsed.legacy_marker == PROGRAM_NAME_LEGACY_MARKER:
+        return ""
 
     parts = str(process_name or "").split(":")
     if len(parts) > 1:

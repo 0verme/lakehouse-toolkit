@@ -120,16 +120,10 @@ connection_env:
 `expected_target_column` 都会通过 `shared.config.env.safe_identifier` 校验后才
 进入查询模板。运行时数据仍由 cursor 返回，不把用户值拼接进 SQL。
 
-`primary_target_strategy` 默认是 `explicit`。只有已经核验历史命名协议的 profile
-才可以配置：
-
-```yaml
-primary_target_strategy: program_name
-program_name_target_prefix: DEMO_
-```
-
-这两个字段是独立的：`program_name_target_prefix` 是允许剥离的完整程序侧
-namespace，不会根据任意 `_`、最后一个 `_` 或 `XXX_DWM` 猜 schema。
+`primary_target_strategy` 作为兼容字段保留，但不再配置 program-name prefix。
+lineage target authority 固定为 explicit/provider target 优先，缺失时按固定
+`005:<logical_target>:<step_seq>:<opaque_suffix>` grammar 回退到第二段 logical target。
+不提供 multi-prefix abstraction；`005` 是唯一合法 legacy marker。
 
 ## Batch / streaming
 
@@ -153,18 +147,16 @@ execute
 数据无法严格解码时沿用 `errors="ignore"`。空的 `expected_target` 会变成
 `None`，不会变成字符串 `"None"`。
 
-Provider 优先使用 profile/legacy row 明确提供的结果表字段。若 profile 明确配置
-`primary_target_strategy: program_name`，才会额外尝试解析高置信格式
-`NNN:<program-target>:<revision>:<clock>` 的第二段：先由
-`extract_program_declared_target_token()` 提取 token，再由
-`normalize_declared_target_from_program_name()` 按配置前缀生成 plain
-`SCHEMA.TABLE`。例如 `005:DEMO_DWM.RESULT_A:1:00` 解析为
-`DWM.RESULT_A`，而不是 `DEMO_DWM.RESULT_A`。
+Provider 优先使用 profile/legacy row 明确提供的结果表字段；缺失时按
+`parse_program_name()` 的 target-first 规则恢复第二段 logical target。例如
+`005:DEMO_DWM.RESULT_A:1:ABCD` 得到 `DEMO_DWM.RESULT_A`，suffix `ABCD` 只产生
+informational diagnostic，不会阻断 lineage。
 
-malformed 格式、前缀不匹配或 schema/table 无法安全验证时返回 `None`。该值只是
-`expected_target` 的 declared primary result hint；它不会替换 Physical DAG 中的
-其它 formal sink，也不会把多个 sink 变成唯一结果。没有显式 target 配置时，Provider
-默认不从文件名、SQL 最后一个表、所有非 TMP 表或程序名猜测 target。
+`005:DEMO_DWM.RESULT_A` 与 `005:DEMO_DWM.RESULT_A:1` 也分别可以恢复 target，后者
+同时恢复 `step_seq=1`。target 无法安全识别时返回 `None`，不猜测其它字段。该值
+只是 `expected_target` 的 declared logical target hint；它不会替换 Physical DAG
+中的其它 formal sink，也不会把多个 sink 变成唯一结果。完整字段与 grouping 语义
+见 [`lineage_program_name.md`](lineage_program_name.md)。
 
 ## source_hash
 
@@ -186,14 +178,15 @@ ID、读取时间、batch ID 都不会进入 hash。因此相同语义输入得�
 `shared.lineage.lineage_builder.load_process_infos()`，把 legacy row 的
 `process_name` / `program_name` 和 `script_code` 转换为 `ProgramSource`，并使用
 默认 `environment="PROD"`、`source_profile="production_metadata"`。旧
-`ProcessInfo` 没有独立 target 字段时，`expected_target` 保持 `None`；需要明确
-metadata 字段时可以注入 `expected_target_getter`。若已核验历史
-`program_name` 格式，也可以在 `ProductionProvider` 上显式配置
-`primary_target_strategy="program_name"` 与 `program_name_target_prefix`。
+`ProcessInfo` 没有独立 target 字段时，Provider 仍会按固定 `005` grammar 尝试恢复
+logical target；需要明确 metadata 字段时可以注入 `expected_target_getter`，且
+explicit/provider 值优先。`program_name_target_prefix` 不再支持，避免引入
+multi-prefix abstraction。
 
 这是 adapter，不是 production metadata 查询重写：没有删除 `ProcessInfo`、没有
 复制一套 legacy SQL，也没有修改旧工具入口。旧调用方继续使用原来的 loader；新
-调用方可以单独使用 Provider contract。
+调用方可以单独使用 Provider contract。每个 raw `ProgramSource` 仍保留独立
+Program Step provenance，logical grouping 不会合并原始 source。
 
 ## 内网验收命令
 
@@ -224,7 +217,8 @@ python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --force-rebuild
 仓库只提交 example 配置，其中使用 `demo_meta`、demo 占位值和占位环境变量名。
 真实密码、Token、私钥和连接串不得提交；内网人工执行可将 `connection` 写入被
 忽略的 `*.local.yaml`，CI / Docker 应使用 `connection_env` 或外部 secret manager。
-Phase 2 不实现 Parser、Physical DAG、Audit、TMP collapse 或另一套
+Phase 2 不实现 SQL/AST extraction、Physical DAG、Audit、TMP collapse 或另一套
 materialization；SVN provider 只把 source 接入现有 pipeline，后续仍复用既有
 Physical DAG、Audit、incremental rebuild、materialization、query/viewer 和
-history/diff。
+history/diff。本页的 program-name target recovery 只属于 metadata semantic
+boundary，不替代 SQL parser。

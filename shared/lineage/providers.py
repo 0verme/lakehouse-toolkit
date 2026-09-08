@@ -111,8 +111,8 @@ class MySQLProcessProfile:
     连接来源可以是本地 ``connection`` 值、``connection_env`` 环境变量名，
     或兼容现有配置的顶层 ``*_env`` 字段。三种来源都只在 Provider 开始
     读取时归一为 ``MySQLConnectionSettings``；嵌套连接配置不会进入 profile
-    的 repr，避免直接密码被意外打印。``primary_target_strategy`` 默认只
-    使用 explicit target；程序名策略必须同时配置已核验的 prefix。
+    的 repr，避免直接密码被意外打印。``primary_target_strategy`` 只保留为
+    兼容配置字段；target authority 始终回退到固定 ``005`` program_name target。
     """
 
     name: str
@@ -455,9 +455,7 @@ def _parse_port(
     except (TypeError, ValueError) as exc:
         raise ProviderError(f"{context}: {prefix}port must be an integer") from exc
     if not 1 <= port <= 65535:
-        raise ProviderError(
-            f"{context}: {prefix}port must be between 1 and 65535"
-        )
+        raise ProviderError(f"{context}: {prefix}port must be between 1 and 65535")
     return port
 
 
@@ -722,7 +720,6 @@ class ProductionProvider:
 
 
 _PRIMARY_TARGET_STRATEGIES = frozenset({"explicit", "program_name"})
-_PRIMARY_TARGET_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*_$")
 
 
 def _normalize_primary_target_config(
@@ -739,18 +736,12 @@ def _normalize_primary_target_config(
         if not isinstance(prefix, str):
             raise ValueError("program_name_target_prefix must be a string or None")
         normalized_prefix = prefix.strip().upper() or None
-        if normalized_prefix is not None and not _PRIMARY_TARGET_PREFIX_RE.fullmatch(
-            normalized_prefix
-        ):
+        if normalized_prefix is not None:
             raise ValueError(
-                "program_name_target_prefix must be an identifier prefix ending with _"
+                "program_name_target_prefix is unsupported; "
+                "program_name grammar uses fixed marker 005"
             )
 
-    if normalized_strategy == "program_name" and normalized_prefix is None:
-        raise ValueError(
-            "program_name_target_prefix is required when "
-            "primary_target_strategy is program_name"
-        )
     return normalized_strategy, normalized_prefix
 
 
@@ -763,9 +754,8 @@ def _resolve_primary_target(
 ) -> str | None:
     if explicit_target is not None:
         return explicit_target
-    if strategy != "program_name":
-        return None
-    return parse_declared_primary_target(program_name, program_name_target_prefix)
+    del strategy, program_name_target_prefix
+    return parse_declared_primary_target(program_name)
 
 
 def _legacy_value(
@@ -836,7 +826,9 @@ def _safe_profile_reason(error: Exception) -> str:
 
     if message.startswith("Invalid SQL "):
         label = message.removeprefix("Invalid SQL ").split(":", 1)[0].strip()
-        if label and all(character.isalnum() or character == " " for character in label):
+        if label and all(
+            character.isalnum() or character == " " for character in label
+        ):
             return f"invalid SQL identifier for {label.lower()}"
 
     candidate = message
@@ -844,16 +836,17 @@ def _safe_profile_reason(error: Exception) -> str:
         candidate = candidate.removeprefix("mysql process profile ")
     if " must " in candidate:
         field_name, tail = candidate.split(" must ", 1)
-        if _FIELD_NAME_RE.fullmatch(field_name) and f"must {tail}" in _SAFE_VALIDATION_TAILS:
+        if (
+            _FIELD_NAME_RE.fullmatch(field_name)
+            and f"must {tail}" in _SAFE_VALIDATION_TAILS
+        ):
             return f"{field_name} must {tail}"
 
     return "profile fields or structure are invalid"
 
 
 def _yaml_error_location(error: Exception) -> tuple[int | None, int | None]:
-    mark = getattr(error, "problem_mark", None) or getattr(
-        error, "context_mark", None
-    )
+    mark = getattr(error, "problem_mark", None) or getattr(error, "context_mark", None)
     line = getattr(mark, "line", None)
     column = getattr(mark, "column", None)
     return (

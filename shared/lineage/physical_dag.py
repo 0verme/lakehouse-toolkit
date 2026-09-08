@@ -531,8 +531,11 @@ def _format_static_string(
                 value = positional_values[automatic_index]
             automatic_index += 1
         elif field_name.isdecimal():
-            index = int(field_name)
-            if index < len(positional_values):
+            try:
+                index = int(field_name)
+            except ValueError:
+                index = -1
+            if index >= 0 and index < len(positional_values):
                 value = positional_values[index]
         elif _FORMAT_FIELD_ROOT_RE.fullmatch(field_name):
             value = keyword_values.get(field_name, _UNRESOLVED)
@@ -1067,9 +1070,12 @@ def _edge_occurrence(
 
 
 def _normalized_expected_target(program_source: ProgramSource) -> str | None:
-    if program_source.expected_target is None:
+    """按 target authority 解析 explicit/provider 或 program-name target。"""
+
+    resolved_target = program_source.resolved_target
+    if resolved_target is None:
         return None
-    normalized = normalize_table_name(program_source.expected_target)
+    normalized = normalize_table_name(resolved_target)
     return normalized or None
 
 

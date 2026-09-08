@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -69,92 +69,191 @@ DEFAULT_TEMPORARY_ASSET_RULES: tuple[TemporaryAssetRule, ...] = (
     _default_tmp_name_rule,
 )
 
-# ``DEMO_`` is the public fixture/legacy naming namespace.  Production
-# providers must opt in explicitly with ``primary_target_strategy`` and a
-# configured prefix; this default only keeps the standalone parser compatible
-# with the documented demo format.
-DEFAULT_PROGRAM_NAME_TARGET_PREFIX = "DEMO_"
-_DECLARED_TARGET_SCHEMAS = frozenset(
-    {"DM", "DWA", "DWD", "DWF", "DWM", "DWO", "DWP", "DWE"}
-)
-_PROGRAM_NAME_SEQUENCE_RE = re.compile(r"^\d{3}$")
-_PROGRAM_NAME_REVISION_RE = re.compile(r"^\d+$")
-_PROGRAM_NAME_CLOCK_RE = re.compile(r"^\d{2}$")
+PROGRAM_NAME_LEGACY_MARKER = "005"
+PROGRAM_NAME_DEFAULT_SUFFIX = "00"
+
+# 保留这个名称只为避免旧调用方在升级时 import 失败。它不再参与解析，
+# 也不代表可以配置多个 program-name prefix；legacy grammar 只有固定 marker。
+DEFAULT_PROGRAM_NAME_TARGET_PREFIX: str | None = None
+
+_PROGRAM_NAME_STEP_RE = re.compile(r"^[1-9]\d*$")
 _DECLARED_TARGET_RE = re.compile(
     r"^(?P<schema>[A-Z][A-Z0-9_]*)\.(?P<table>[A-Z][A-Z0-9_$]*)$"
 )
-_PROGRAM_NAME_TARGET_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*_$")
 
 
-def extract_program_declared_target_token(program_name: object) -> str | None:
-    """从高置信 legacy ``program_name`` 格式提取第二段 target token。
+class ProgramNameDiagnostic(str, Enum):
+    """``program_name`` 解析产生的非审计诊断。"""
 
-    公开格式为 ``NNN:<program-target>:<revision>:<clock>``。只接受四段、
-    数字 sequence/revision/clock 和非空 target 段，避免把任意带冒号的名称
-    当成 declared target。
+    PROGRAM_NAME_TARGET_RESOLVED = "PROGRAM_NAME_TARGET_RESOLVED"
+    PROGRAM_NAME_INCOMPLETE = "PROGRAM_NAME_INCOMPLETE"
+    PROGRAM_NAME_STEP_MISSING = "PROGRAM_NAME_STEP_MISSING"
+    PROGRAM_NAME_STEP_INVALID = "PROGRAM_NAME_STEP_INVALID"
+    PROGRAM_NAME_TARGET_INVALID = "PROGRAM_NAME_TARGET_INVALID"
+    PROGRAM_NAME_SUFFIX_NONSTANDARD = "PROGRAM_NAME_SUFFIX_NONSTANDARD"
+    PROGRAM_NAME_MARKER_INVALID = "PROGRAM_NAME_MARKER_INVALID"
+    PROGRAM_NAME_FORMAT_INVALID = "PROGRAM_NAME_FORMAT_INVALID"
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramNameSemantics:
+    """从 legacy ``program_name`` 恢复出的 logical target / step 语义。
+
+    ``logical_target`` 是唯一可以参与 target authority 的 program-name
+    字段；``legacy_marker`` 和 ``opaque_suffix`` 都不参与 Dataset Identity，
+    ``step_seq`` 也只表达 expected order evidence，不表达 scheduler fact。
     """
 
-    parts = decode_code(program_name).strip().split(":")
-    if len(parts) != 4:
-        return None
+    program_name: str
+    legacy_marker: str | None
+    logical_target: str | None
+    step_seq: int | None
+    opaque_suffix: str | None
+    diagnostics: tuple[ProgramNameDiagnostic, ...] = ()
 
-    sequence, target_token, revision, clock = (part.strip() for part in parts)
-    if not _PROGRAM_NAME_SEQUENCE_RE.fullmatch(sequence):
-        return None
-    if not _PROGRAM_NAME_REVISION_RE.fullmatch(revision):
-        return None
-    if not _PROGRAM_NAME_CLOCK_RE.fullmatch(clock):
-        return None
-    if not target_token or ":" in target_token:
-        return None
-    return target_token.upper()
+    @property
+    def target_resolved(self) -> bool:
+        return self.logical_target is not None
+
+    @property
+    def step_resolved(self) -> bool:
+        return self.step_seq is not None
+
+    @property
+    def is_incomplete(self) -> bool:
+        return ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE in self.diagnostics
+
+    @property
+    def expected_processing_order(self) -> tuple[int, ...]:
+        """单个 program 只能提供自己的 step；不会伪造 scheduler dependency。"""
+
+        return () if self.step_seq is None else (self.step_seq,)
 
 
-def _normalize_program_name_target_prefix(prefix: object) -> str | None:
-    normalized = decode_code(prefix).strip().upper()
-    if not normalized or not _PROGRAM_NAME_TARGET_PREFIX_RE.fullmatch(normalized):
+def _normalize_program_name_target_token(target_token: object) -> str | None:
+    token = decode_code(target_token).strip().upper()
+    match = _DECLARED_TARGET_RE.fullmatch(token)
+    if match is None:
         return None
-    return normalized
+    candidate = f"{match.group('schema')}.{match.group('table')}"
+    if is_temporary_asset(candidate):
+        return None
+    return candidate
+
+
+def _parse_positive_step(token: str) -> int | None:
+    if _PROGRAM_NAME_STEP_RE.fullmatch(token) is None:
+        return None
+    value = 0
+    for character in token:
+        value = value * 10 + (ord(character) - ord("0"))
+    return value
+
+
+def parse_program_name(program_name: object) -> ProgramNameSemantics:
+    """按固定 ``005`` grammar 以 target-first 策略解析程序名。
+
+    只要第二段是无歧义的 formal ``schema.table``，即使 step 或 suffix
+    缺失/异常也保留 target。未知字段只产生诊断，不把 lineage 自动变成
+    ``TARGET_NOT_FOUND``。
+    """
+
+    normalized_name = decode_code(program_name).strip()
+    parts = normalized_name.split(":") if normalized_name else []
+    marker = parts[0].strip().upper() if parts else None
+    diagnostics: list[ProgramNameDiagnostic] = []
+
+    if marker != PROGRAM_NAME_LEGACY_MARKER:
+        if marker is not None:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_MARKER_INVALID)
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_TARGET_INVALID)
+        if len(parts) > 4:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_FORMAT_INVALID)
+        return ProgramNameSemantics(
+            program_name=normalized_name,
+            legacy_marker=marker,
+            logical_target=None,
+            step_seq=None,
+            opaque_suffix=None,
+            diagnostics=tuple(diagnostics),
+        )
+
+    target_token = parts[1].strip() if len(parts) > 1 else ""
+    logical_target = _normalize_program_name_target_token(target_token)
+    if logical_target is None:
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_TARGET_INVALID)
+    else:
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_TARGET_RESOLVED)
+
+    step_seq: int | None = None
+    if len(parts) < 3:
+        diagnostics.extend(
+            (
+                ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE,
+                ProgramNameDiagnostic.PROGRAM_NAME_STEP_MISSING,
+            )
+        )
+    else:
+        step_token = parts[2].strip()
+        step_seq = _parse_positive_step(step_token)
+        if step_seq is None:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_STEP_INVALID)
+
+    opaque_suffix: str | None = None
+    if len(parts) < 4:
+        if ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE not in diagnostics:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
+    else:
+        opaque_suffix = parts[3].strip()
+        if not opaque_suffix:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
+        elif opaque_suffix != PROGRAM_NAME_DEFAULT_SUFFIX:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_SUFFIX_NONSTANDARD)
+
+    if len(parts) > 4:
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_FORMAT_INVALID)
+        if ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE not in diagnostics:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
+
+    return ProgramNameSemantics(
+        program_name=normalized_name,
+        legacy_marker=marker,
+        logical_target=logical_target,
+        step_seq=step_seq,
+        opaque_suffix=opaque_suffix,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+# 这些函数是已有调用方使用的语义化入口；实现统一委托给 target-first parser。
+def extract_program_declared_target_token(program_name: object) -> str | None:
+    """提取 legacy 程序名第二段的 logical target。"""
+
+    return parse_program_name(program_name).logical_target
 
 
 def normalize_declared_target_from_program_name(
     target_token: object,
     program_name_target_prefix: object = DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
 ) -> str | None:
-    """按明确配置剥离程序命名空间并返回 plain ``SCHEMA.TABLE``。
+    """验证并规范化完整的 ``schema.table`` target token。
 
-    这里只移除完整匹配的配置前缀，不根据下划线位置、最后一个 schema
-    或 ``XXX_DWM`` 等形状猜测。schema 也必须属于当前已知的 warehouse
-    schema 集合；失败时统一返回 ``None``。
+    ``program_name_target_prefix`` 仅为旧签名保留，不再参与解析；固定
+    ``005`` grammar 不支持 multi-prefix abstraction。
     """
 
-    prefix = _normalize_program_name_target_prefix(program_name_target_prefix)
-    token = decode_code(target_token).strip().upper()
-    if prefix is None or not token.startswith(prefix):
-        return None
-
-    candidate = token[len(prefix) :]
-    match = _DECLARED_TARGET_RE.fullmatch(candidate)
-    if match is None:
-        return None
-    schema = match.group("schema")
-    if schema not in _DECLARED_TARGET_SCHEMAS:
-        return None
-    return f"{schema}.{match.group('table')}"
+    del program_name_target_prefix
+    return _normalize_program_name_target_token(target_token)
 
 
 def parse_declared_primary_target(
     program_name: object,
     program_name_target_prefix: object = DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
 ) -> str | None:
-    """提取并规范化 ``program_name`` 中的 declared primary target hint。"""
+    """返回 program-name-derived logical target，不猜测其它字段。"""
 
-    target_token = extract_program_declared_target_token(program_name)
-    if target_token is None:
-        return None
-    return normalize_declared_target_from_program_name(
-        target_token, program_name_target_prefix
-    )
+    del program_name_target_prefix
+    return parse_program_name(program_name).logical_target
 
 
 def is_temporary_asset(
@@ -436,12 +535,119 @@ class ProgramSource:
             raise ValueError("source_hash must be a string or None")
 
     @property
+    def program_name_semantics(self) -> ProgramNameSemantics:
+        """返回不修改 raw ``program_name`` 的解析结果。"""
+
+        return parse_program_name(self.program_name)
+
+    @property
+    def logical_target(self) -> str | None:
+        """返回 program-name-derived target；显式 target 不在此属性中覆盖它。"""
+
+        return self.program_name_semantics.logical_target
+
+    @property
+    def step_seq(self) -> int | None:
+        """返回正整数 program step sequence。"""
+
+        return self.program_name_semantics.step_seq
+
+    @property
+    def program_step_seq(self) -> int | None:
+        """``step_seq`` 的语义别名，强调它属于 Program Step。"""
+
+        return self.step_seq
+
+    @property
+    def opaque_suffix(self) -> str | None:
+        """返回不参与 lineage identity/order 的原始 suffix。"""
+
+        return self.program_name_semantics.opaque_suffix
+
+    @property
+    def program_name_diagnostics(self) -> tuple[ProgramNameDiagnostic, ...]:
+        """返回解析诊断；这些值不是 Audit issue，也不会改变 lineage。"""
+
+        return self.program_name_semantics.diagnostics
+
+    @property
+    def resolved_target(self) -> str | None:
+        """按 explicit/provider → program-name target 的顺序返回 target。"""
+
+        explicit_target = normalize_expected_target(self.expected_target)
+        return explicit_target or self.logical_target
+
+    @property
+    def logical_processing_unit_key(self) -> tuple[str, str, str] | None:
+        """返回可用于 logical grouping 的 ``environment/profile/target`` key。"""
+
+        target = self.logical_target
+        if target is None:
+            return None
+        return (self.environment, self.source_profile, target)
+
+    @property
     def identity(self) -> ProgramIdentity:
         return ProgramIdentity(
             environment=self.environment,
             source_profile=self.source_profile,
             program_name=self.program_name,
         )
+
+
+def expected_processing_order(
+    program_sources: Iterable[ProgramSource | ProgramNameSemantics],
+) -> tuple[int, ...]:
+    """按升序返回已识别 step，作为 expected order evidence。
+
+    该函数只返回 program-name-derived 顺序，不创建或暗示 scheduler
+    dependency；无法解析的 step 被排除而不被猜测。
+    """
+
+    steps: set[int] = set()
+    for item in program_sources:
+        semantics = (
+            item.program_name_semantics if isinstance(item, ProgramSource) else item
+        )
+        if not isinstance(semantics, ProgramNameSemantics):
+            raise TypeError(
+                "program_sources must contain ProgramSource or ProgramNameSemantics"
+            )
+        if semantics.step_seq is not None:
+            steps.add(semantics.step_seq)
+    return tuple(sorted(steps))
+
+
+def group_program_sources_by_logical_target(
+    program_sources: Iterable[ProgramSource],
+) -> dict[str, tuple[ProgramSource, ...]]:
+    """按 logical target 聚合 ProgramSource，同时保留每个 raw step provenance。"""
+
+    groups: dict[str, list[ProgramSource]] = {}
+    for source in program_sources:
+        if not isinstance(source, ProgramSource):
+            raise TypeError("program_sources must contain ProgramSource values")
+        target = source.logical_target
+        if target is not None:
+            groups.setdefault(target, []).append(source)
+
+    return {
+        target: tuple(
+            sorted(
+                values,
+                key=lambda item: (
+                    item.step_seq is None,
+                    item.step_seq if item.step_seq is not None else 0,
+                    item.program_name,
+                ),
+            )
+        )
+        for target, values in sorted(groups.items())
+    }
+
+
+# 更短的兼容别名，避免调用方为 grouping 引入新的 domain hierarchy。
+group_program_steps = group_program_sources_by_logical_target
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,6 +902,10 @@ class LineageIssue:
 __all__ = [
     "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
     "DEFAULT_TEMPORARY_ASSET_RULES",
+    "PROGRAM_NAME_DEFAULT_SUFFIX",
+    "PROGRAM_NAME_LEGACY_MARKER",
+    "ProgramNameDiagnostic",
+    "ProgramNameSemantics",
     "canonicalize_dataset_name",
     "canonicalize_schema",
     "canonicalize_table",
@@ -719,5 +929,9 @@ __all__ = [
     "normalize_expected_target",
     "normalize_program_name",
     "parse_declared_primary_target",
+    "parse_program_name",
     "extract_program_declared_target_token",
+    "expected_processing_order",
+    "group_program_sources_by_logical_target",
+    "group_program_steps",
 ]
