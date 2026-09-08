@@ -11,7 +11,14 @@ from typing import cast
 from unittest.mock import patch
 
 from shared.lineage.audit import LineageAuditResult, audit_program_physical_dag
-from shared.lineage.domain import IssueType, LineageIssue, ProgramSource
+from shared.lineage.domain import (
+    IssueType,
+    LineageIssue,
+    PhysicalEdge,
+    PhysicalNode,
+    PhysicalNodeKind,
+    ProgramSource,
+)
 from shared.lineage.lineage_builder import normalize_table_name
 import shared.lineage.materialization as materialization_module
 from shared.lineage.materialization import (  # pyright: ignore[reportMissingImports]
@@ -30,7 +37,12 @@ from shared.lineage.physical_dag import (
     build_program_physical_dag,
 )
 from tests.fixtures.lineage.pathological_materialization import (
+    make_dense_pathological_dag,
     make_diamond_dag,
+    make_high_fanin_dag,
+    make_high_fanout_dag,
+    make_linear_tmp_dag,
+    make_mixed_pathological_dag,
     make_parallel_tmp_dag,
 )
 from tests.fixtures.lineage.phase5_materialization_programs import (  # pyright: ignore[reportMissingImports]
@@ -92,6 +104,128 @@ def issue_of(issues: tuple[LineageIssue, ...], issue_type: IssueType) -> Lineage
     if len(matches) != 1:
         raise AssertionError(f"expected one {issue_type.value}, got {len(matches)}")
     return matches[0]
+
+
+def evidence_items(evidence: dict[str, object], name: str) -> list[object]:
+    value = evidence.get(name)
+    if not isinstance(value, list):
+        raise AssertionError(f"evidence.{name} must be a list")
+    return value
+
+
+def legacy_collapsed_paths(
+    dag: ProgramPhysicalDAG,
+    included_nodes: set[str],
+) -> tuple[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]], ...]:
+    """Test-only copy of the pre-streaming all-path enumerator."""
+
+    node_map = materialization_module._node_map(dag)
+    adjacency_lists: dict[str, list[PhysicalEdge]] = {}
+    for edge in dag.edges:
+        adjacency_lists.setdefault(edge.source, []).append(edge)
+    adjacency: dict[str, tuple[PhysicalEdge, ...]] = {
+        source: tuple(sorted(items, key=materialization_module._physical_edge_sort_key))
+        for source, items in adjacency_lists.items()
+    }
+    formal_starts = sorted(
+        node
+        for node in included_nodes
+        if not materialization_module._is_temporary(node, node_map)
+    )
+    paths: dict[tuple[str, ...], tuple[PhysicalEdge, ...]] = {}
+    traversed_states = 0
+    for start in formal_starts:
+        pending: list[tuple[str, tuple[str, ...], tuple[PhysicalEdge, ...]]] = [
+            (start, (start,), ())
+        ]
+        while pending:
+            traversed_states += 1
+            if traversed_states > materialization_module.MAX_COLLAPSED_TRAVERSAL_STATES:
+                raise LineagePathEnumerationError(
+                    "collapsed path traversal exceeds maximum state count"
+                )
+            current, path, path_edges = pending.pop()
+            for edge in adjacency.get(current, ()):
+                next_node = edge.target
+                if next_node not in included_nodes:
+                    continue
+                if materialization_module._is_temporary(next_node, node_map):
+                    if next_node in path:
+                        continue
+                    pending.append(
+                        (next_node, path + (next_node,), path_edges + (edge,))
+                    )
+                    continue
+                completed_path = path + (next_node,)
+                if completed_path in paths:
+                    continue
+                if len(paths) >= materialization_module.MAX_COLLAPSED_PATHS:
+                    raise LineagePathEnumerationError(
+                        "collapsed physical path count exceeds maximum"
+                    )
+                paths[completed_path] = path_edges + (edge,)
+    return tuple(
+        sorted(
+            paths.items(),
+            key=lambda item: (
+                materialization_module._canonical_json(item[0]),
+                tuple(
+                    materialization_module._physical_edge_sort_key(edge)
+                    for edge in item[1]
+                ),
+            ),
+        )
+    )
+
+
+def legacy_collapse_paths_to_edges(
+    dag: ProgramPhysicalDAG,
+    audit: LineageAuditResult,
+    *,
+    batch_id: str,
+    observed_at: datetime,
+    job_key: str | None = None,
+) -> tuple:
+    """Test-only oracle copied from the pre-streaming path merge algorithm."""
+
+    grouped = {}
+    paths = legacy_collapsed_paths(
+        dag,
+        materialization_module._included_nodes(audit),
+    )
+    for path, physical_edges in paths:
+        edge = materialization_module._lineage_edge_from_path(
+            dag,
+            path,
+            physical_edges,
+            batch_id=batch_id,
+            observed_at=observed_at,
+            job_key=job_key,
+        )
+        identity = materialization_module._edge_identity(edge)
+        entry = grouped.get(identity)
+        if entry is None:
+            accumulator = materialization_module._EdgeEvidenceAccumulator()
+            grouped[identity] = (edge, accumulator)
+        else:
+            accumulator = entry[1]
+        accumulator.add_evidence(edge.evidence)
+
+    edges = [
+        replace(edge, evidence=accumulator.finalize())
+        for edge, accumulator in grouped.values()
+    ]
+    return tuple(
+        sorted(
+            edges,
+            key=lambda edge: (
+                materialization_module._edge_identity(edge),
+                edge.source_hash or "",
+                edge.evidence_type,
+                materialization_module._canonical_json(edge.evidence),
+            ),
+        )
+    )
 
 
 class LineageMaterializationTests(unittest.TestCase):
@@ -214,7 +348,7 @@ class LineageMaterializationTests(unittest.TestCase):
             evidence = cast(dict[str, object], edge.evidence)
             self.assertEqual(evidence["path_count"], path_count)
             self.assertEqual(
-                len(evidence["physical_paths"]),
+                len(evidence_items(evidence, "physical_paths")),
                 min(path_count, materialization_module.MAX_PHYSICAL_PATHS),
             )
             self.assertEqual(
@@ -222,19 +356,19 @@ class LineageMaterializationTests(unittest.TestCase):
                 path_count > materialization_module.MAX_PHYSICAL_PATHS,
             )
             self.assertLessEqual(
-                len(evidence["physical_paths"]),
+                len(evidence_items(evidence, "physical_paths")),
                 materialization_module.MAX_PHYSICAL_PATHS,
             )
             self.assertLessEqual(
-                len(evidence["physical_edge_pairs"]),
+                len(evidence_items(evidence, "physical_edge_pairs")),
                 materialization_module.MAX_PHYSICAL_EDGE_PAIRS,
             )
             self.assertLessEqual(
-                len(evidence["collapsed_tmp_nodes"]),
+                len(evidence_items(evidence, "collapsed_tmp_nodes")),
                 materialization_module.MAX_COLLAPSED_TMP_NODES,
             )
             self.assertLessEqual(
-                len(evidence["statement_indices"]),
+                len(evidence_items(evidence, "statement_indices")),
                 materialization_module.MAX_STATEMENT_INDICES,
             )
 
@@ -262,7 +396,7 @@ class LineageMaterializationTests(unittest.TestCase):
         evidence = cast(dict[str, object], first.edges[0].evidence)
         self.assertTrue(evidence["physical_paths_truncated"])
         self.assertEqual(
-            len(evidence["physical_paths"]),
+            len(evidence_items(evidence, "physical_paths")),
             materialization_module.MAX_PHYSICAL_PATHS,
         )
 
@@ -280,7 +414,7 @@ class LineageMaterializationTests(unittest.TestCase):
 
         self.assertEqual(merged["path_count"], 1000)
         self.assertEqual(
-            len(merged["physical_paths"]),
+            len(evidence_items(merged, "physical_paths")),
             materialization_module.MAX_PHYSICAL_PATHS,
         )
         self.assertTrue(merged["physical_paths_truncated"])
@@ -300,11 +434,251 @@ class LineageMaterializationTests(unittest.TestCase):
         )
         evidence = cast(dict[str, object], result.edges[0].evidence)
         self.assertEqual(evidence["path_count"], 16)
-        self.assertEqual(len(evidence["physical_paths"]), 16)
+        self.assertEqual(len(evidence_items(evidence, "physical_paths")), 16)
         self.assertFalse(evidence["physical_paths_truncated"])
 
+    def test_streaming_accumulator_preserves_all_evidence_summaries(self):
+        dag = make_parallel_tmp_dag(3)
+        result = materialize_program(
+            dag,
+            audit_dag(dag),
+            batch_id="batch-summary",
+            observed_at=OBSERVED_AT,
+        )
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+
+        self.assertEqual(evidence["path_count"], 3)
+        self.assertEqual(
+            {
+                tuple(pair)
+                for pair in evidence_items(evidence, "physical_edge_pairs")
+                if isinstance(pair, list)
+            },
+            {("ODS.DEMO_SOURCE", f"TMP_BRANCH_{index:04d}") for index in range(3)}
+            | {(f"TMP_BRANCH_{index:04d}", "DWA.DEMO_RESULT") for index in range(3)},
+        )
+        self.assertEqual(
+            set(evidence_items(evidence, "collapsed_tmp_nodes")),
+            {f"TMP_BRANCH_{index:04d}" for index in range(3)},
+        )
+        self.assertEqual(
+            set(evidence_items(evidence, "statement_indices")), set(range(6))
+        )
+        self.assertEqual(len(evidence_items(evidence, "physical_paths")), 3)
+        self.assertFalse(evidence["physical_paths_truncated"])
+        self.assertFalse(evidence["physical_edge_pairs_truncated"])
+        self.assertFalse(evidence["collapsed_tmp_nodes_truncated"])
+        self.assertFalse(evidence["statement_indices_truncated"])
+
+    def test_streaming_materialization_builds_only_final_lineage_edges(self):
+        dag = make_diamond_dag(6)
+        calls = 0
+        original_add_path = materialization_module._EdgeEvidenceAccumulator.add_path
+
+        def counted_add_path(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_add_path(self, *args, **kwargs)
+
+        with patch.object(
+            materialization_module._EdgeEvidenceAccumulator,
+            "add_path",
+            counted_add_path,
+        ):
+            with patch.object(
+                materialization_module,
+                "_lineage_edge_from_path",
+                side_effect=AssertionError("per-path LineageEdge construction"),
+            ):
+                with patch.object(
+                    materialization_module,
+                    "_edge_evidence",
+                    side_effect=AssertionError("per-path evidence construction"),
+                ):
+                    with patch.object(
+                        materialization_module._EdgeEvidenceAccumulator,
+                        "add_evidence",
+                        side_effect=AssertionError("per-path evidence merge"),
+                    ):
+                        result = materialize_program(
+                            dag,
+                            audit_dag(dag),
+                            batch_id="batch-streaming",
+                            observed_at=OBSERVED_AT,
+                        )
+
+        self.assertEqual(len(result.edges), 1)
+        self.assertEqual(calls, 64)
+        self.assertEqual(
+            cast(dict[str, object], result.edges[0].evidence)["path_count"],
+            64,
+        )
+
+    def test_streaming_output_matches_legacy_materialization_oracle(self):
+        cases = (
+            ("linear", make_linear_tmp_dag(4)),
+            ("diamond", make_diamond_dag(4)),
+            ("fanout", make_high_fanout_dag(5)),
+            ("fanin", make_high_fanin_dag(5)),
+        )
+        for name, dag in cases:
+            with self.subTest(case=name):
+                audit = audit_dag(dag, batch_id="batch-oracle")
+                result = materialize_program(
+                    dag,
+                    audit,
+                    batch_id="batch-oracle",
+                    observed_at=OBSERVED_AT,
+                )
+                self.assertEqual(
+                    result.edges,
+                    legacy_collapse_paths_to_edges(
+                        dag,
+                        audit,
+                        batch_id="batch-oracle",
+                        observed_at=OBSERVED_AT,
+                    ),
+                )
+
+    def test_duplicate_physical_edge_pairs_keep_legacy_representative(self):
+        source_name = "ODS.DEMO_DUPLICATE_SOURCE"
+        temporary_name = "TMP.DEMO_DUPLICATE"
+        target_name = "DWA.DEMO_DUPLICATE_RESULT"
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="DEMO_DUPLICATE_EDGE_PAIRS",
+            script_code="",
+            expected_target=target_name,
+            source_hash="sha256:demo-duplicate-edge-pairs",
+        )
+        dag = ProgramPhysicalDAG(
+            program_source=source,
+            nodes=(
+                PhysicalNode(source_name, source_name),
+                PhysicalNode(
+                    temporary_name,
+                    temporary_name,
+                    PhysicalNodeKind.TEMPORARY_ASSET,
+                ),
+                PhysicalNode(target_name, target_name),
+            ),
+            edges=(
+                PhysicalEdge(
+                    source_name,
+                    temporary_name,
+                    evidence={"statement_index": 1},
+                ),
+                PhysicalEdge(
+                    source_name,
+                    temporary_name,
+                    evidence={"statement_index": 99},
+                ),
+                PhysicalEdge(
+                    temporary_name,
+                    target_name,
+                    evidence={"statement_index": 2},
+                ),
+                PhysicalEdge(
+                    temporary_name,
+                    target_name,
+                    evidence={"statement_index": 98},
+                ),
+            ),
+            steps=(),
+            sinks=(target_name,),
+            expected_target=target_name,
+        )
+        audit = audit_dag(dag, batch_id="batch-duplicate-edge-pairs")
+        result = materialize_program(
+            dag,
+            audit,
+            batch_id="batch-duplicate-edge-pairs",
+            observed_at=OBSERVED_AT,
+        )
+        self.assertEqual(
+            result.edges,
+            legacy_collapse_paths_to_edges(
+                dag,
+                audit,
+                batch_id="batch-duplicate-edge-pairs",
+                observed_at=OBSERVED_AT,
+            ),
+        )
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        self.assertEqual(evidence["path_count"], 1)
+        self.assertEqual(set(evidence_items(evidence, "statement_indices")), {2, 99})
+
+    def test_dense_pathological_graph_keeps_exact_count_without_full_enumeration(self):
+        dag = make_dense_pathological_dag()
+        outgoing = {}
+        incoming = {}
+        for edge in dag.edges:
+            outgoing[edge.source] = outgoing.get(edge.source, 0) + 1
+            incoming[edge.target] = incoming.get(edge.target, 0) + 1
+        self.assertEqual((len(dag.nodes), len(dag.edges)), (43, 407))
+        self.assertEqual(max(outgoing.values()), 36)
+        self.assertEqual(max(incoming.values()), 39)
+        self.assertEqual(sum(count > 1 for count in outgoing.values()), 35)
+        self.assertEqual(sum(count > 1 for count in incoming.values()), 36)
+        self.assertEqual(len({(edge.source, edge.target) for edge in dag.edges}), 407)
+
+        audit = audit_dag(dag, batch_id="batch-dense")
+        with self.assertRaises(LineagePathEnumerationError):
+            tuple(
+                legacy_collapsed_paths(
+                    dag,
+                    materialization_module._included_nodes(audit),
+                )
+            )
+
+        with patch.object(
+            materialization_module,
+            "_collapsed_paths",
+            side_effect=AssertionError("dense graph must not enumerate all paths"),
+        ):
+            result = materialize_program(
+                dag,
+                audit,
+                batch_id="batch-dense",
+                observed_at=OBSERVED_AT,
+            )
+        reversed_dag = replace(dag, edges=tuple(reversed(dag.edges)))
+        reversed_result = materialize_program(
+            reversed_dag,
+            audit_dag(reversed_dag, batch_id="batch-dense"),
+            batch_id="batch-dense",
+            observed_at=OBSERVED_AT,
+        )
+        self.assertEqual(result.edges, reversed_result.edges)
+        self.assertEqual(len(result.edges), 1)
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        self.assertEqual(evidence["path_count"], 766097916)
+        self.assertEqual(len(evidence_items(evidence, "physical_paths")), 100)
+        self.assertTrue(evidence["physical_paths_truncated"])
+        self.assertEqual(len(evidence_items(evidence, "physical_edge_pairs")), 200)
+        self.assertTrue(evidence["physical_edge_pairs_truncated"])
+        self.assertEqual(len(evidence_items(evidence, "collapsed_tmp_nodes")), 41)
+        self.assertEqual(len(evidence_items(evidence, "statement_indices")), 200)
+        self.assertTrue(evidence["statement_indices_truncated"])
+
+    def test_mixed_pathological_graph_matches_target_shape_and_count(self):
+        dag = make_mixed_pathological_dag()
+        self.assertEqual((len(dag.nodes), len(dag.edges)), (154, 350))
+        result = materialize_program(
+            dag,
+            audit_dag(dag, batch_id="batch-mixed"),
+            batch_id="batch-mixed",
+            observed_at=OBSERVED_AT,
+        )
+        self.assertEqual(len(result.edges), 1)
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        self.assertEqual(evidence["path_count"], 20480)
+        self.assertEqual(len(evidence_items(evidence, "physical_paths")), 100)
+        self.assertTrue(evidence["physical_paths_truncated"])
+
     def test_materialization_canonicalization_scales_with_path_count(self):
-        original_canonical = materialization_module._canonical_json
+        original_canonical = materialization_module._canonical_json_safe
         measurements = []
 
         for path_count in (10, 100, 500, 1000):
@@ -319,7 +693,7 @@ class LineageMaterializationTests(unittest.TestCase):
             audit = audit_dag(dag)
             with patch.object(
                 materialization_module,
-                "_canonical_json",
+                "_canonical_json_safe",
                 counted_canonical,
             ):
                 result = materialize_program(
@@ -332,7 +706,11 @@ class LineageMaterializationTests(unittest.TestCase):
             measurements.append((path_count, calls, evidence["path_count"]))
             self.assertEqual(evidence["path_count"], path_count)
             self.assertGreater(calls, 0)
-            self.assertLessEqual(calls, path_count * 64)
+            self.assertLessEqual(
+                calls,
+                (materialization_module.MAX_PHYSICAL_PATHS + 1) * 64
+                + len(dag.edges) * 64,
+            )
 
         self.assertEqual(
             [path_count for path_count, _, _ in measurements],
@@ -355,30 +733,34 @@ class LineageMaterializationTests(unittest.TestCase):
         with self.assertRaisesRegex(LineageEvidenceError, "maximum size"):
             materialization_module._json_safe(oversized)
 
-    def test_path_enumeration_limit_fails_as_controlled_python_error(self):
+    def test_explicit_path_enumeration_limit_fails_as_controlled_python_error(self):
         dag = make_diamond_dag(3)
+        audit = audit_dag(dag)
         with patch.object(materialization_module, "MAX_COLLAPSED_PATHS", 4):
             with self.assertRaises(LineagePathEnumerationError):
-                materialize_program(
-                    dag,
-                    audit_dag(dag),
-                    batch_id="batch-path-limit",
-                    observed_at=OBSERVED_AT,
+                tuple(
+                    materialization_module._collapsed_paths(
+                        dag,
+                        materialization_module._included_nodes(audit),
+                    )
                 )
 
-    def test_path_traversal_limit_fails_before_unbounded_branch_expansion(self):
+    def test_explicit_path_traversal_limit_fails_before_unbounded_branch_expansion(
+        self,
+    ):
         dag = make_diamond_dag(4)
+        audit = audit_dag(dag)
         with patch.object(
             materialization_module,
             "MAX_COLLAPSED_TRAVERSAL_STATES",
             4,
         ):
             with self.assertRaises(LineagePathEnumerationError):
-                materialize_program(
-                    dag,
-                    audit_dag(dag),
-                    batch_id="batch-traversal-limit",
-                    observed_at=OBSERVED_AT,
+                tuple(
+                    materialization_module._collapsed_paths(
+                        dag,
+                        materialization_module._included_nodes(audit),
+                    )
                 )
 
     def test_tmp_fanout_paths_merge_into_one_direct_edge(self):
@@ -718,7 +1100,7 @@ class SQLiteMaterializationTests(unittest.TestCase):
         evidence = cast(dict[str, object], edge.evidence)
         self.assertEqual(evidence["path_count"], 1000)
         self.assertEqual(
-            len(evidence["physical_paths"]),
+            len(evidence_items(evidence, "physical_paths")),
             materialization_module.MAX_PHYSICAL_PATHS,
         )
         self.assertTrue(evidence["physical_paths_truncated"])
