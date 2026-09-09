@@ -118,11 +118,16 @@ class LineageDomainTests(unittest.TestCase):
 
     def test_program_name_parser_normalizes_confirmed_legacy_names(self):
         cases = (
-            ("005:DM.RESULT_A:1:00", "DM.RESULT_A", 1),
             ("005:DWS_DM.RESULT_A:1:00", "DM.RESULT_A", 1),
+            ("005:DWS_DWM.RESULT_A:1:00", "DWM.RESULT_A", 1),
+            ("005:DWS_DWA.RESULT_A:1:00", "DWA.RESULT_A", 1),
+            ("005:DWS_DWP.RESULT_A:1:00", "DWP.RESULT_A", 1),
+            ("005:DWS_DWD.RESULT_A:1:00", "DWD.RESULT_A", 1),
+            ("005:DWS_DWF.RESULT_A:1:00", "DWF.RESULT_A", 1),
+            ("005:DWS_DWUPRR.RESULT_A:1:00", "DWUPRR.RESULT_A", 1),
             ("005:DLK_DLO.RESULT_A:1:00", "DLO.RESULT_A", 1),
-            ("005:DWS_DM.RESULT_A:2:00", "DM.RESULT_A", 2),
-            ("005:DWS_DM.RESULT_A:1:PRC_RESULT_A", "DM.RESULT_A", 1),
+            ("005:DWS_DWM.RESULT_A:2:00", "DWM.RESULT_A", 2),
+            ("005:DWS_DWM.RESULT_A:1:PRC_RESULT_A", "DWM.RESULT_A", 1),
         )
 
         for value, expected_target, expected_step in cases:
@@ -136,8 +141,34 @@ class LineageDomainTests(unittest.TestCase):
                 )
 
         self.assertEqual(
-            normalize_legacy_program_namespace("ABC_DM.RESULT_A"),
-            "ABC_DM.RESULT_A",
+            normalize_legacy_program_namespace("DWS_ABC.RESULT_A"),
+            "DWS_ABC.RESULT_A",
+        )
+
+    def test_program_name_namespace_normalization_groups_multi_step_sources(self):
+        sources = tuple(
+            ProgramSource(
+                environment="DEV",
+                source_profile="fixture",
+                program_name=f"005:DWS_DWM.RESULT_A:{step}:00",
+                script_code="select 1",
+            )
+            for step in (2, 1)
+        )
+
+        groups = group_program_sources_by_logical_target(sources)
+
+        self.assertEqual(tuple(groups), ("DWM.RESULT_A",))
+        self.assertEqual(
+            [source.step_seq for source in groups["DWM.RESULT_A"]],
+            [1, 2],
+        )
+        self.assertEqual(
+            [source.program_name for source in groups["DWM.RESULT_A"]],
+            [
+                "005:DWS_DWM.RESULT_A:1:00",
+                "005:DWS_DWM.RESULT_A:2:00",
+            ],
         )
 
     def test_program_name_parser_keeps_ambiguous_three_part_shapes_unknown(self):

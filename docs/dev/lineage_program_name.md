@@ -20,9 +20,9 @@
 | `<step_seq>` | positive integer 的 Program Step 顺序 | 否 | 是，只有 expected evidence |
 | `<opaque_suffix>` | 不稳定的 custom metadata，规范值通常为 `00` | 否 | 否 |
 
-不提供 multi-prefix abstraction、prefix registry 或 suffix whitelist。`ABCD`、`XYZ`
-以及其它非空 suffix 都是可保留的 opaque 值，不会因为不是 `00` 而使 lineage
-失败。
+不提供可配置的 multi-prefix abstraction 或 suffix whitelist；代码只维护已确认的显式
+namespace mapping。`ABCD`、`XYZ` 以及其它非空 suffix 都是可保留的 opaque 值，
+不会因为不是 `00` 而使 lineage 失败。
 
 ## Legacy program namespace normalization
 
@@ -30,13 +30,19 @@ canonical 四段的 raw target token 只在进入 program-name target authority 
 namespace normalization。当前已确认且显式支持的 mapping 只有：
 
 ```text
-DWS_DM.<TABLE>  -> DM.<TABLE>
-DLK_DLO.<TABLE> -> DLO.<TABLE>
+DWS_DM.<TABLE>     -> DM.<TABLE>
+DWS_DWM.<TABLE>    -> DWM.<TABLE>
+DWS_DWA.<TABLE>    -> DWA.<TABLE>
+DWS_DWP.<TABLE>    -> DWP.<TABLE>
+DWS_DWD.<TABLE>    -> DWD.<TABLE>
+DWS_DWF.<TABLE>    -> DWF.<TABLE>
+DWS_DWUPRR.<TABLE> -> DWUPRR.<TABLE>
+DLK_DLO.<TABLE>    -> DLO.<TABLE>
 ```
 
 因此 `logical_target` 表示下游使用的 canonical physical `schema.table`，而完整
 raw `program_name` 仍保留原始 namespace provenance；模型不另增一个 identity 字段。
-未知 namespace（例如 `ABC_DM.<TABLE>`）保持原值，不根据 suffix、sink 或相似度猜测
+未知 namespace（例如 `DWS_ABC.<TABLE>`）保持原值，不根据 suffix、sink 或相似度猜测
 physical schema。这个 helper 只服务于 program-name-derived target，DatasetIdentity
 仍直接保留 SQL 中观察到的 physical schema。
 

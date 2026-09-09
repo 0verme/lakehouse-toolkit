@@ -85,6 +85,12 @@ _DECLARED_TARGET_RE = re.compile(
 # contract explicit until a versioned namespace registry is established.
 _LEGACY_PROGRAM_NAMESPACE_MAP = {
     "DWS_DM": "DM",
+    "DWS_DWM": "DWM",
+    "DWS_DWA": "DWA",
+    "DWS_DWP": "DWP",
+    "DWS_DWD": "DWD",
+    "DWS_DWF": "DWF",
+    "DWS_DWUPRR": "DWUPRR",
     "DLK_DLO": "DLO",
 }
 

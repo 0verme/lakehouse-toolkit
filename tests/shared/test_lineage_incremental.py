@@ -138,6 +138,28 @@ class IncrementalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.unchanged, ())
         self.assertEqual(plan.changed, (current,))
 
+    def test_expanded_namespace_registry_version_bump_rebuilds_v6_state(self):
+        current = source("PROGRAM_DEMO_EXPANDED_NAMESPACE_REGISTRY")
+        previous = (
+            replace(
+                ProgramState.from_source(
+                    current,
+                    observed_at=OBSERVED_AT,
+                    batch_id="batch-old",
+                ),
+                pipeline_version=(
+                    "lineage-pipeline-v6-program-namespace-and-"
+                    "audit-target-mismatch-semantics"
+                ),
+            ),
+        )
+
+        plan = plan_incremental([current], previous)
+
+        self.assertEqual(current.source_hash, previous[0].source_hash)
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
+
     def test_audit_target_semantics_version_bump_rebuilds_v5_state(self):
         current = source("PROGRAM_DEMO_AUDIT_VERSION_CHANGED")
         previous = (
