@@ -1,0 +1,242 @@
+{
+  "contract": "issue-39-dws-materialization",
+  "version": "0.1",
+  "status": "design-only",
+  "active_boundary": "one batch_id shared by lineage_batch, lineage_program_state, lineage_edge, lineage_business_edge, and lineage_issue",
+  "invariants": [
+    "A successful active snapshot has one shared batch_id across physical and business facts.",
+    "A fact is active only when its is_active flag and its joined lineage_batch.is_active flag are true.",
+    "A row_key is unique per physical row and may contain batch_id; a stable identity key is batch-independent.",
+    "TMP may occur in physical endpoints but never in a business endpoint.",
+    "A partial snapshot has no disappearance authority outside its declared scope.",
+    "An unverified business collapse failure fails closed and cannot replace the previous active snapshot.",
+    "A successful empty snapshot is still a published active batch with zero edge counts.",
+    "Each fact table enforces row_key primary-key uniqueness and (batch_id, stable identity) uniqueness; the writer repeats duplicate validation before active switch.",
+    "Every published business row has collapse_depth >= 1; direct formal edges are 1, the three-hop TMP example is 3, multiple safe paths use the minimum hop count, and DWS v0.1 does not persist path_count.",
+    "Physical route, TMP label, depth, derivation hash, evidence order, source hash, or pipeline version changes do not update business last_changed_at when the stable business identity is unchanged.",
+    "Retention deletes only complete retired partitions beyond the configured horizon; active and rollback-window snapshots remain protected."
+  ],
+  "states": [
+    {
+      "id": "candidate",
+      "batch_status": "CANDIDATE",
+      "active_batch": false,
+      "physical_active": false,
+      "business_active": false,
+      "meaning": "Rows are being inserted and validated inside the publish transaction; readers must not see them as current."
+    },
+    {
+      "id": "published",
+      "batch_status": "PUBLISHED",
+      "active_batch": true,
+      "physical_active": true,
+      "business_active": true,
+      "meaning": "The five tables passed same-batch validation and the snapshot is the sole current projection."
+    },
+    {
+      "id": "retired",
+      "batch_status": "RETIRED",
+      "active_batch": false,
+      "physical_active": false,
+      "business_active": false,
+      "meaning": "Historical rows remain readable by explicit batch_id but do not participate in current queries."
+    }
+  ],
+  "cases": [
+    {
+      "id": "initial_empty_success",
+      "input": "FULL complete snapshot with zero programs and zero edges",
+      "physical_result": "zero lineage_edge rows",
+      "business_result": "zero lineage_business_edge rows",
+      "issue_result": "zero or explicitly observed issues",
+      "publish": true,
+      "active_result": "new batch is active with physical_edge_count=0 and business_edge_count=0",
+      "deletion_authority": "declared full scope only",
+      "same_batch": true
+    },
+    {
+      "id": "program_build_success",
+      "input": "ProgramSource build and audit complete; physical DAG and business derivation complete",
+      "physical_result": "all direct physical edges, including TMP endpoints, are candidate rows",
+      "business_result": "safe formal source-to-target collapse rows are candidate rows",
+      "issue_result": "audit issues, if any, use the same batch_id",
+      "publish": true,
+      "active_result": "physical and business rows switch active together",
+      "same_batch": true
+    },
+    {
+      "id": "known_negative_collapse",
+      "input": "Physical graph contains a classified orphan/cycle/self-reference or unresolved path with no safe business edge",
+      "physical_result": "physical facts are retained",
+      "business_result": "affected business edge is absent; no guessed TMP/formal endpoint is emitted",
+      "issue_result": "same-batch diagnostic explains the omitted edge",
+      "publish": true,
+      "active_result": "only if the derivation returned a complete negative result; both layers still use the same batch",
+      "same_batch": true
+    },
+    {
+      "id": "business_collapse_failure",
+      "input": "Physical build succeeds but business collapse raises, times out, or cannot prove complete classification",
+      "physical_result": "may exist only inside rolled-back candidate transaction",
+      "business_result": "candidate is not promoted",
+      "issue_result": "failure may be emitted to external run observability; no half-active fact set",
+      "publish": false,
+      "active_result": "previous successful snapshot remains complete and active",
+      "same_batch": true,
+      "rollback": true
+    },
+    {
+      "id": "failed_publish",
+      "input": "Insert, validation, count check, stable-key check, or active switch fails",
+      "physical_result": "candidate lineage_edge rows rollback",
+      "business_result": "candidate lineage_business_edge rows rollback",
+      "issue_result": "candidate issue rows rollback with the batch",
+      "publish": false,
+      "active_result": "previous active batch is unchanged",
+      "same_batch": true,
+      "rollback": true
+    },
+    {
+      "id": "duplicate_program_identity",
+      "input": "Two candidate program states share environment/source_profile/program_name",
+      "physical_result": "candidate rejected before active switch",
+      "business_result": "candidate rejected before active switch",
+      "issue_result": "validation error, not a silently merged program",
+      "publish": false,
+      "active_result": "previous active batch remains readable",
+      "same_batch": true,
+      "reject_duplicate_stable_identity": true
+    },
+    {
+      "id": "duplicate_physical_edge_identity",
+      "input": "Two rows in one batch share edge_key",
+      "physical_result": "candidate rejected; repeated statement evidence must be aggregated into one row",
+      "business_result": "not evaluated for publish",
+      "issue_result": "validation error",
+      "publish": false,
+      "active_result": "previous active batch remains readable",
+      "same_batch": true,
+      "reject_duplicate_stable_identity": true
+    },
+    {
+      "id": "duplicate_business_edge_identity",
+      "input": "Two rows in one batch share business_edge_key after multi-path collapse",
+      "physical_result": "physical candidate may be valid",
+      "business_result": "candidate rejected; paths must be deduplicated into one derived row",
+      "issue_result": "validation error or diagnostic before switch",
+      "publish": false,
+      "active_result": "previous active batch remains readable",
+      "same_batch": true,
+      "reject_duplicate_stable_identity": true
+    },
+    {
+      "id": "cross_profile_isolation",
+      "input": "PARTIAL replay scopes profile_A and does not read profile_B",
+      "physical_result": "profile_A is rebuilt/rebased; profile_B physical facts are copied to the new candidate",
+      "business_result": "profile_A is rebuilt/rebased; profile_B business facts are copied to the new candidate",
+      "issue_result": "issues outside profile_A are not deleted",
+      "publish": true,
+      "active_result": "one new active batch contains both profiles without merging their program keys",
+      "same_batch": true,
+      "deletion_authority": "profile_A only if explicitly complete; never profile_B"
+    },
+    {
+      "id": "inactive_edge_contamination",
+      "input": "Historical batch N-1 and current active batch N both contain a similar endpoint",
+      "physical_result": "current physical query joins active lineage_batch and filters active flag",
+      "business_result": "current business query joins the same active lineage_batch and filters active flag",
+      "issue_result": "historical issues are excluded from current projection",
+      "publish": true,
+      "active_result": "N-1 cannot contaminate N",
+      "same_batch": true,
+      "query_requires_active_batch_join": true
+    },
+    {
+      "id": "partial_snapshot_scoped_deletion",
+      "input": "Partial or limited replay omits a previously active program",
+      "physical_result": "omitted program physical facts are rebased unless inside an explicitly complete scope",
+      "business_result": "omitted program business facts are rebased unless inside an explicitly complete scope",
+      "issue_result": "omitted program issues are rebased outside complete scope",
+      "publish": true,
+      "active_result": "absence is not interpreted as deletion outside scope",
+      "same_batch": true,
+      "deletion_authority": "none outside declared complete scope"
+    },
+    {
+      "id": "full_snapshot_scoped_disappearance",
+      "input": "FULL complete scan of environment/profile scope omits a previously active program",
+      "physical_result": "program physical facts are absent from the new active candidate in that scope",
+      "business_result": "program business facts are absent from the new active candidate in that scope",
+      "issue_result": "old issue rows remain historical; current issue projection follows candidate",
+      "publish": true,
+      "active_result": "scoped disappearance is effective; historical batch remains readable",
+      "same_batch": true,
+      "deletion_authority": "declared environment/source_profile scope"
+    },
+    {
+      "id": "incremental_reuse",
+      "input": "source_hash is non-empty and equal to active state; pipeline_version is equal",
+      "physical_result": "physical facts are rebased to the new batch without rebuilding",
+      "business_result": "business facts are rebased from the same old physical derivation",
+      "issue_result": "state and issues are rebased according to lifecycle rules",
+      "publish": true,
+      "active_result": "stable keys stay equal; row_keys change because batch_id changes",
+      "same_batch": true,
+      "rebuild": false
+    },
+    {
+      "id": "source_hash_change",
+      "input": "Same ProgramIdentity but source_hash changes or is unavailable",
+      "physical_result": "physical DAG/audit/materialization rebuild is required",
+      "business_result": "business derivation rebuild is required; no one-layer reuse",
+      "issue_result": "new diagnostics are reconciled in the same candidate",
+      "publish": true,
+      "active_result": "program_key and business_edge_key may remain stable; physical/projection metadata may change but business last_changed_at remains unchanged",
+      "same_batch": true,
+      "rebuild": true
+    },
+    {
+      "id": "pipeline_version_rebuild",
+      "input": "Same source_hash but pipeline_version changes",
+      "physical_result": "physical facts rebuild because parser/DAG/audit semantics may change",
+      "business_result": "business facts rebuild from the new physical candidate",
+      "issue_result": "fact and policy evidence is regenerated using the CLOSED Issue #36 projection contract",
+      "publish": true,
+      "active_result": "no reuse based on hash alone",
+      "same_batch": true,
+      "rebuild": true
+    },
+    {
+      "id": "tmp_rename",
+      "input": "TMP node name changes while formal business source and target stay equal",
+      "physical_result": "physical edge_key changes because physical endpoints changed",
+      "business_result": "business_edge_key stays equal; physical_derivation_hash changes if topology labels are included",
+      "issue_result": "no basename-only merge; diagnostics remain physical if affected",
+      "publish": true,
+      "active_result": "business identity is stable; derived metadata may change but last_changed_at remains unchanged",
+      "same_batch": true,
+      "stable_business_identity": true
+    },
+    {
+      "id": "physical_path_change_same_endpoint",
+      "input": "Physical route changes but business source/target remain equal",
+      "physical_result": "new direct physical facts are materialized",
+      "business_result": "one same business_edge_key is rebuilt; current collapse_depth and derivation hash are compared; path_count is not a DWS field",
+      "issue_result": "unsafe or incomplete path classification is diagnostic and may fail closed",
+      "publish": true,
+      "active_result": "business identity remains stable; current depth/derivation metadata is refreshed but last_changed_at remains unchanged",
+      "same_batch": true,
+      "stable_business_identity": true
+    },
+    {
+      "id": "restore_after_scoped_disappearance",
+      "input": "A previously disappeared ProgramIdentity appears again in a later complete scope",
+      "physical_result": "new observation is rebuilt; old physical rows remain historical",
+      "business_result": "new candidate rows use the current batch and safe current derivation",
+      "issue_result": "old issue history is not silently mutated",
+      "publish": true,
+      "active_result": "restore is not rename inference; first_seen follows #38 restore semantics",
+      "same_batch": true
+    }
+  ]
+}
