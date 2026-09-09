@@ -1,0 +1,2 @@
+# Optional research-only dependency for Issue #42; not imported by production code.
+sqlglot==30.12.0
