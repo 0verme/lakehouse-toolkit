@@ -17,8 +17,13 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from shared.lineage.audit import AuditFact, AuditPolicy, replay_audit_policy
 from shared.lineage.domain import (
+    AuditConfidence,
+    IssueDisposition,
     IssueType,
+    LEGACY_AUDIT_POLICY_VERSION,
+    LEGACY_AUDIT_RULE_VERSION,
     LineageEdge,
     LineageIssue,
     ProgramState,
@@ -36,13 +41,14 @@ from .materialization import (  # pyright: ignore[reportMissingImports]
     _canonical_json,
     _edge_identity,
     _issue_identity,
+    new_batch_id,
 )
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_MATERIALIZATION_DB_PATH = (
     ROOT_DIR / "runtime" / "sqlite" / "lineage_materialization.db"
 )
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS lineage_batch (
@@ -110,7 +116,13 @@ CREATE TABLE IF NOT EXISTS lineage_issue (
     batch_id TEXT NOT NULL REFERENCES lineage_batch(batch_id),
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
-    is_active INTEGER NOT NULL CHECK (is_active IN (0, 1))
+    is_active INTEGER NOT NULL CHECK (is_active IN (0, 1)),
+    confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+    rule_version TEXT NOT NULL DEFAULT 'audit-rule-legacy',
+    disposition TEXT NOT NULL DEFAULT 'OPEN',
+    policy_version TEXT NOT NULL DEFAULT 'audit-policy-legacy',
+    disposition_updated_at TEXT,
+    disposition_updated_by TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_lineage_issue_batch_identity
@@ -185,7 +197,9 @@ EDGE_ORDER_SQL = (
 ISSUE_SELECT_SQL = (
     "SELECT environment, source_profile, program_name, issue_type, severity, "
     "stable_key, node_key, branch_sink, message, evidence, batch_id, "
-    "first_seen_at, last_seen_at, is_active FROM lineage_issue"
+    "first_seen_at, last_seen_at, is_active, confidence, rule_version, "
+    "disposition, policy_version, disposition_updated_at, disposition_updated_by "
+    "FROM lineage_issue"
 )
 ISSUE_ORDER_SQL = (
     " ORDER BY environment, source_profile, program_name, issue_type, "
@@ -200,7 +214,9 @@ PROGRAM_STATE_ORDER_SQL = " ORDER BY environment, source_profile, program_name, 
 ACTIVE_ISSUE_SELECT_SQL = """
     SELECT environment, source_profile, program_name, issue_type, severity,
            stable_key, node_key, branch_sink, message, evidence, batch_id,
-           first_seen_at, last_seen_at, is_active
+           first_seen_at, last_seen_at, is_active, confidence, rule_version,
+           disposition, policy_version, disposition_updated_at,
+           disposition_updated_by
     FROM lineage_issue
     WHERE is_active = 1
     ORDER BY environment, source_profile, program_name, issue_type,
@@ -298,6 +314,31 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE lineage_program_state ADD COLUMN pipeline_version TEXT"
         )
 
+    issue_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(lineage_issue)").fetchall()
+    }
+    issue_migrations = (
+        ("confidence", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+        ("rule_version", "TEXT NOT NULL DEFAULT 'audit-rule-legacy'"),
+        ("disposition", "TEXT NOT NULL DEFAULT 'OPEN'"),
+        ("policy_version", "TEXT NOT NULL DEFAULT 'audit-policy-legacy'"),
+        ("disposition_updated_at", "TEXT"),
+        ("disposition_updated_by", "TEXT"),
+    )
+    for column_name, definition in issue_migrations:
+        if issue_columns and column_name not in issue_columns:
+            # Both values come from the fixed migration table above, never input.
+            # pi-lens-ignore: python-sql-injection
+            try:
+                connection.execute(
+                    f"ALTER TABLE lineage_issue ADD COLUMN {column_name} {definition}"
+                )
+            except sqlite3.Error as exc:
+                raise RuntimeError(
+                    f"failed to migrate lineage_issue column {column_name}"
+                ) from exc
+
     version_row = connection.execute("PRAGMA user_version").fetchone()
     current_version = 0 if version_row is None else int(version_row[0])
     if current_version < CURRENT_SCHEMA_VERSION:
@@ -375,6 +416,35 @@ def _batch_metadata_from_row(row: Any) -> BatchMetadata:
 
 
 def _issue_from_row(row: Any) -> LineageIssue:
+    row_length = len(row)
+    confidence = (
+        row[14]
+        if row_length > 14 and row[14] is not None
+        else AuditConfidence.UNKNOWN.value
+    )
+    rule_version = (
+        row[15]
+        if row_length > 15 and row[15] is not None
+        else LEGACY_AUDIT_RULE_VERSION
+    )
+    disposition = (
+        row[16]
+        if row_length > 16 and row[16] is not None
+        else IssueDisposition.OPEN.value
+    )
+    policy_version = (
+        row[17]
+        if row_length > 17 and row[17] is not None
+        else LEGACY_AUDIT_POLICY_VERSION
+    )
+    disposition_updated_at = (
+        None
+        if row_length <= 18 or row[18] is None
+        else _parse_datetime(str(row[18]))
+    )
+    disposition_updated_by = (
+        None if row_length <= 19 else row[19]
+    )
     return LineageIssue(
         environment=str(row[0]),
         source_profile=str(row[1]),
@@ -390,6 +460,12 @@ def _issue_from_row(row: Any) -> LineageIssue:
         first_seen_at=_parse_datetime(str(row[11])),
         last_seen_at=_parse_datetime(str(row[12])),
         is_active=bool(row[13]),
+        confidence=confidence,
+        rule_version=str(rule_version),
+        disposition=disposition,
+        policy_version=str(policy_version),
+        disposition_updated_at=disposition_updated_at,
+        disposition_updated_by=disposition_updated_by,
     )
 
 
@@ -480,6 +556,16 @@ def _issue_row(issue: LineageIssue, batch: MaterializationBatch) -> tuple[object
         _datetime_text(issue.first_seen_at or batch.observed_at),
         _datetime_text(issue.last_seen_at or batch.observed_at),
         0,
+        AuditConfidence(issue.confidence).value,
+        issue.rule_version,
+        IssueDisposition(issue.disposition).value,
+        issue.policy_version,
+        (
+            None
+            if issue.disposition_updated_at is None
+            else _datetime_text(issue.disposition_updated_at)
+        ),
+        issue.disposition_updated_by,
     )
 
 
@@ -716,8 +802,10 @@ class SQLiteMaterializationStore:
             INSERT INTO lineage_issue(
                 environment, source_profile, program_name, issue_type, severity,
                 stable_key, node_key, branch_sink, message, evidence, batch_id,
-                first_seen_at, last_seen_at, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                first_seen_at, last_seen_at, is_active, confidence, rule_version,
+                disposition, policy_version, disposition_updated_at,
+                disposition_updated_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             candidate.issue_rows,
         )
@@ -787,8 +875,11 @@ class SQLiteMaterializationStore:
                     batch.issues,
                     observed_at=batch.observed_at,
                 )
+                reconciled_issues = tuple(reconciled.current_issues) + tuple(
+                    record.issue for record in reconciled.resolved
+                )
                 prepared = _prepare_candidate(
-                    replace(batch, issues=reconciled.current_issues),
+                    replace(batch, issues=reconciled_issues),
                     instrumentation,
                 )
                 if instrumentation is not None and prepare_started_at is not None:
@@ -851,7 +942,14 @@ class SQLiteMaterializationStore:
                     (prepared.batch.batch_id,),
                 )
                 connection.execute(
-                    "UPDATE lineage_issue SET is_active = 1 WHERE batch_id = ?",
+                    """
+                    UPDATE lineage_issue
+                    SET is_active = CASE
+                        WHEN disposition = 'RESOLVED' THEN 0
+                        ELSE 1
+                    END
+                    WHERE batch_id = ?
+                    """,
                     (prepared.batch.batch_id,),
                 )
                 connection.execute(
@@ -1078,10 +1176,109 @@ class SQLiteMaterializationStore:
         current_metadata = self.get_batch_metadata(current_batch_id)
         if current_metadata is None:
             raise ValueError("current batch does not exist")
+        current_issues = tuple(
+            issue
+            for issue in self.read_issues(batch_id=current_batch_id)
+            if issue.disposition is not IssueDisposition.RESOLVED
+        )
         return reconcile_issue_lifecycle(
             self.read_issues(batch_id=previous_batch_id),
-            self.read_issues(batch_id=current_batch_id),
+            current_issues,
             observed_at=current_metadata.observed_at,
+        )
+
+    def replay_issue_policy(
+        self,
+        policy: AuditPolicy,
+        *,
+        source_batch_id: str | None = None,
+        batch_id: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> PublishResult:
+        """从既有 batch 重放 policy；不重建 parser/DAG，也不改写旧 batch。"""
+
+        if not isinstance(policy, AuditPolicy):
+            raise TypeError("policy must be an AuditPolicy")
+        source_id = source_batch_id or self.get_active_batch_id()
+        if source_id is None:
+            raise ValueError("no source batch is available for policy replay")
+        source_metadata = self.get_batch_metadata(source_id)
+        if source_metadata is None:
+            raise ValueError("source batch does not exist")
+        resolved_batch_id = batch_id or new_batch_id()
+        if not isinstance(resolved_batch_id, str) or not resolved_batch_id.strip():
+            raise ValueError("batch_id must be a non-empty string or None")
+        resolved_observed_at = observed_at or source_metadata.observed_at
+        if not isinstance(resolved_observed_at, datetime):
+            raise TypeError("observed_at must be a datetime or None")
+        return self.publish(
+            MaterializationBatch(
+                batch_id=resolved_batch_id.strip(),
+                observed_at=resolved_observed_at,
+                edges=self.read_edges(batch_id=source_id),
+                issues=replay_audit_policy(
+                    self.read_issues(batch_id=source_id),
+                    policy,
+                    batch_id=resolved_batch_id.strip(),
+                    observed_at=resolved_observed_at,
+                ),
+                program_states=self.read_program_states(batch_id=source_id),
+            )
+        )
+
+    def set_issue_disposition(
+        self,
+        stable_key: str,
+        disposition: IssueDisposition | str,
+        *,
+        source_batch_id: str | None = None,
+        batch_id: str | None = None,
+        observed_at: datetime | None = None,
+        updated_by: str | None = None,
+    ) -> PublishResult:
+        """以新 batch 记录人工 disposition，保留原 batch/history 不变。"""
+
+        if not isinstance(stable_key, str) or not stable_key.strip():
+            raise ValueError("stable_key must be a non-empty string")
+        resolved_disposition = IssueDisposition(disposition)
+        source_id = source_batch_id or self.get_active_batch_id()
+        if source_id is None:
+            raise ValueError("no source batch is available for disposition update")
+        source_metadata = self.get_batch_metadata(source_id)
+        if source_metadata is None:
+            raise ValueError("source batch does not exist")
+        issues = self.read_issues(batch_id=source_id)
+        requested_key = stable_key.strip()
+        matches: list[LineageIssue] = []
+        for issue in issues:
+            issue_key = issue.stable_key
+            if issue_key is None:
+                issue_key = AuditFact.from_issue(issue).stable_issue_identity
+            if issue_key == requested_key:
+                matches.append(issue)
+        if len(matches) != 1:
+            raise ValueError("stable_key must identify exactly one issue")
+        resolved_batch_id = batch_id or new_batch_id()
+        resolved_observed_at = observed_at or source_metadata.observed_at
+        updated = matches[0].with_disposition(
+            resolved_disposition,
+            updated_at=resolved_observed_at,
+            updated_by=updated_by,
+        )
+        if updated.stable_key is None:
+            updated = replace(updated, stable_key=requested_key)
+        updated_issues = tuple(
+            updated if issue is matches[0] else issue
+            for issue in issues
+        )
+        return self.publish(
+            MaterializationBatch(
+                batch_id=resolved_batch_id,
+                observed_at=resolved_observed_at,
+                edges=self.read_edges(batch_id=source_id),
+                issues=updated_issues,
+                program_states=self.read_program_states(batch_id=source_id),
+            )
         )
 
     def diff_lineage_batches(

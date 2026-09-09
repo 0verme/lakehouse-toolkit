@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
 
 from shared.lineage.domain import (
+    AuditConfidence,
+    IssueDisposition,
     IssueType,
     LineageIssue,
     PhysicalEdge,
@@ -24,6 +26,9 @@ from shared.lineage.domain import (
     is_temporary_asset,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
+
+AUDIT_RULE_VERSION = "audit-rule-v1"
+AUDIT_POLICY_VERSION = "audit-policy-v1"
 
 ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
     {
@@ -36,6 +41,349 @@ ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
         IssueType.MULTI_SINK_CANDIDATE: "MEDIUM",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditFact:
+    """Detector 输出的事实；不携带 severity、disposition 或 lifecycle。"""
+
+    environment: str
+    source_profile: str
+    program_name: str
+    issue_type: IssueType | str
+    message: str = ""
+    node_key: str | None = None
+    branch_sink: str | None = None
+    evidence: Mapping[str, object] | str | None = None
+    confidence: AuditConfidence | str = AuditConfidence.HIGH
+    rule_version: str = AUDIT_RULE_VERSION
+    stable_key: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("environment", "source_profile", "program_name"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+        issue_type = IssueType(self.issue_type)
+        object.__setattr__(self, "issue_type", issue_type)
+        if not isinstance(self.message, str):
+            raise TypeError("message must be a string")
+        message = self.message.strip() or issue_type.value
+        object.__setattr__(self, "message", message)
+        for field_name in ("node_key", "branch_sink"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{field_name} must be a non-empty string or None")
+            if isinstance(value, str):
+                object.__setattr__(self, field_name, value.strip())
+        if isinstance(self.evidence, Mapping):
+            object.__setattr__(self, "evidence", dict(self.evidence))
+        object.__setattr__(self, "confidence", AuditConfidence(self.confidence))
+        if not isinstance(self.rule_version, str) or not self.rule_version.strip():
+            raise ValueError("rule_version must be a non-empty string")
+        object.__setattr__(self, "rule_version", self.rule_version.strip())
+        stable_key = self.stable_key
+        if stable_key is not None and (
+            not isinstance(stable_key, str) or not stable_key.strip()
+        ):
+            raise ValueError("stable_key must be a non-empty string or None")
+        if stable_key is None:
+            cycle_nodes: Iterable[str] = ()
+            if issue_type is IssueType.CYCLE_DETECTED and isinstance(
+                self.evidence, Mapping
+            ):
+                raw_nodes = self.evidence.get("cycle_nodes", ())
+                if isinstance(raw_nodes, (list, tuple, set, frozenset)):
+                    cycle_nodes = (str(node) for node in raw_nodes)
+            stable_key = compute_lineage_issue_stable_key(
+                self.environment,
+                self.source_profile,
+                self.program_name,
+                issue_type,
+                node_key=self.node_key,
+                branch_sink=self.branch_sink,
+                cycle_nodes=cycle_nodes,
+            )
+        object.__setattr__(self, "stable_key", stable_key.strip())
+
+    @property
+    def stable_issue_identity(self) -> str:
+        """仅由 fact 语义决定的 stable issue identity。"""
+
+        if self.stable_key is None:
+            raise RuntimeError("AuditFact stable_key was not initialized")
+        return self.stable_key
+
+    @property
+    def issue_key(self) -> str:
+        """兼容 ``LineageIssue.issue_key`` 的 fact identity 别名。"""
+
+        return self.stable_issue_identity
+
+    @property
+    def fingerprint(self) -> str:
+        """兼容 ``LineageIssue.fingerprint`` 的 fact identity 别名。"""
+
+        return self.stable_issue_identity
+
+    @classmethod
+    def from_issue(cls, issue: LineageIssue) -> "AuditFact":
+        """从旧/持久化的扁平 issue 恢复 fact 部分，丢弃 policy 字段。"""
+
+        if not isinstance(issue, LineageIssue):
+            raise TypeError("issue must be a LineageIssue")
+        return cls(
+            environment=issue.environment,
+            source_profile=issue.source_profile,
+            program_name=issue.program_name,
+            issue_type=issue.issue_type,
+            message=issue.message,
+            node_key=issue.node_key,
+            branch_sink=issue.branch_sink,
+            evidence=issue.evidence,
+            confidence=issue.confidence,
+            rule_version=issue.rule_version,
+            stable_key=issue.stable_key,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditPolicyResult:
+    """一个 fact 经 policy 投影后的风险与处置结果。"""
+
+    fact: AuditFact
+    severity: str
+    disposition: IssueDisposition | str
+    policy_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fact, AuditFact):
+            raise TypeError("fact must be an AuditFact")
+        if not isinstance(self.severity, str) or not self.severity.strip():
+            raise ValueError("severity must be a non-empty string")
+        object.__setattr__(self, "severity", self.severity.strip())
+        object.__setattr__(self, "disposition", IssueDisposition(self.disposition))
+        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
+            raise ValueError("policy_version must be a non-empty string")
+        object.__setattr__(self, "policy_version", self.policy_version.strip())
+
+    @property
+    def stable_key(self) -> str:
+        return self.fact.stable_issue_identity
+
+    @property
+    def issue_type(self) -> IssueType:
+        return self.fact.issue_type
+
+    @property
+    def confidence(self) -> AuditConfidence:
+        return self.fact.confidence
+
+    @property
+    def rule_version(self) -> str:
+        return self.fact.rule_version
+
+    def to_issue(
+        self,
+        *,
+        batch_id: str | None = None,
+        observed_at: datetime | None = None,
+        first_seen_at: datetime | None = None,
+        last_seen_at: datetime | None = None,
+        is_active: bool = True,
+        disposition_updated_at: datetime | None = None,
+        disposition_updated_by: str | None = None,
+    ) -> LineageIssue:
+        """生成兼容现有 materialization/SQLite API 的扁平 projection。"""
+
+        if observed_at is not None:
+            first_seen_at = first_seen_at or observed_at
+            last_seen_at = last_seen_at or observed_at
+        return LineageIssue(
+            environment=self.fact.environment,
+            source_profile=self.fact.source_profile,
+            program_name=self.fact.program_name,
+            issue_type=self.fact.issue_type,
+            severity=self.severity,
+            message=self.fact.message,
+            node_key=self.fact.node_key,
+            branch_sink=self.fact.branch_sink,
+            evidence=self.fact.evidence,
+            batch_id=batch_id,
+            first_seen_at=first_seen_at,
+            last_seen_at=last_seen_at,
+            is_active=is_active,
+            stable_key=self.fact.stable_issue_identity,
+            confidence=self.fact.confidence,
+            rule_version=self.fact.rule_version,
+            disposition=self.disposition,
+            policy_version=self.policy_version,
+            disposition_updated_at=disposition_updated_at,
+            disposition_updated_by=disposition_updated_by,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditPolicy:
+    """独立于 detector 的 severity/disposition policy。"""
+
+    severity_by_issue_type: Mapping[IssueType | str, str] = field(default_factory=dict)
+    default_disposition: IssueDisposition | str = IssueDisposition.OPEN
+    disposition_by_issue_type: Mapping[IssueType | str, IssueDisposition | str] = field(
+        default_factory=dict
+    )
+    policy_version: str = AUDIT_POLICY_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.severity_by_issue_type, Mapping):
+            raise TypeError("severity_by_issue_type must be a mapping")
+        severity: dict[IssueType, str] = dict(ISSUE_SEVERITY_POLICY)
+        for raw_type, raw_severity in self.severity_by_issue_type.items():
+            issue_type = IssueType(raw_type)
+            if not isinstance(raw_severity, str) or not raw_severity.strip():
+                raise ValueError("severity values must be non-empty strings")
+            severity[issue_type] = raw_severity.strip()
+        if not isinstance(self.disposition_by_issue_type, Mapping):
+            raise TypeError("disposition_by_issue_type must be a mapping")
+        default_disposition = IssueDisposition(self.default_disposition)
+        dispositions: dict[IssueType, IssueDisposition] = {}
+        for raw_type, raw_disposition in self.disposition_by_issue_type.items():
+            dispositions[IssueType(raw_type)] = IssueDisposition(raw_disposition)
+        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
+            raise ValueError("policy_version must be a non-empty string")
+        object.__setattr__(self, "severity_by_issue_type", MappingProxyType(severity))
+        object.__setattr__(self, "default_disposition", default_disposition)
+        object.__setattr__(self, "disposition_by_issue_type", MappingProxyType(dispositions))
+        object.__setattr__(self, "policy_version", self.policy_version.strip())
+
+    @property
+    def version(self) -> str:
+        """policy_version 的短别名。"""
+
+        return self.policy_version
+
+    def severity_for(self, issue_type: IssueType | str) -> str:
+        return self.severity_by_issue_type[IssueType(issue_type)]
+
+    def evaluate(
+        self,
+        fact: AuditFact,
+        *,
+        disposition: IssueDisposition | str | None = None,
+    ) -> AuditPolicyResult:
+        if not isinstance(fact, AuditFact):
+            raise TypeError("fact must be an AuditFact")
+        resolved_disposition = (
+            IssueDisposition(disposition)
+            if disposition is not None
+            else self.disposition_by_issue_type.get(
+                IssueType(fact.issue_type), self.default_disposition
+            )
+        )
+        return AuditPolicyResult(
+            fact=fact,
+            severity=self.severity_for(fact.issue_type),
+            disposition=resolved_disposition,
+            policy_version=self.policy_version,
+        )
+
+    def evaluate_all(self, facts: Iterable[AuditFact]) -> tuple[AuditPolicyResult, ...]:
+        values = tuple(facts)
+        if any(not isinstance(fact, AuditFact) for fact in values):
+            raise TypeError("facts must contain AuditFact values")
+        return tuple(self.evaluate(fact) for fact in sorted(values, key=_fact_sort_key))
+
+    def project(
+        self,
+        facts: Iterable[AuditFact],
+        *,
+        batch_id: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> tuple[LineageIssue, ...]:
+        return tuple(
+            result.to_issue(batch_id=batch_id, observed_at=observed_at)
+            for result in self.evaluate_all(facts)
+        )
+
+    apply = project
+
+    def replay(
+        self,
+        values: Iterable[AuditFact | LineageIssue],
+        *,
+        batch_id: str | None = None,
+        observed_at: datetime | None = None,
+        preserve_manual_disposition: bool = True,
+    ) -> tuple[LineageIssue, ...]:
+        """在不重建 DAG 的情况下重投影 facts/issues，供 policy replay 使用。"""
+
+        projected: list[LineageIssue] = []
+        for value in values:
+            source_issue = value if isinstance(value, LineageIssue) else None
+            if source_issue is not None:
+                fact = AuditFact.from_issue(source_issue)
+            else:
+                if not isinstance(value, AuditFact):
+                    raise TypeError(
+                        "values must contain AuditFact or LineageIssue values"
+                    )
+                fact = value
+            override: IssueDisposition | str | None = None
+            if source_issue is not None and preserve_manual_disposition:
+                source_disposition = IssueDisposition(source_issue.disposition)
+                if source_disposition in (
+                    IssueDisposition.ACCEPTED,
+                    IssueDisposition.FALSE_POSITIVE,
+                    IssueDisposition.RESOLVED,
+                ) or (
+                    source_disposition is IssueDisposition.OPEN
+                    and (
+                        source_issue.disposition_updated_at is not None
+                        or source_issue.disposition_updated_by is not None
+                    )
+                ):
+                    override = source_disposition
+            result = self.evaluate(fact, disposition=override)
+            source_batch_id = source_issue.batch_id if source_issue is not None else None
+            projected.append(
+                result.to_issue(
+                    batch_id=(
+                        batch_id if batch_id is not None else source_batch_id
+                    ),
+                    observed_at=observed_at,
+                    first_seen_at=(
+                        source_issue.first_seen_at
+                        if source_issue is not None
+                        else None
+                    ),
+                    last_seen_at=(
+                        observed_at
+                        if observed_at is not None
+                        else (
+                            source_issue.last_seen_at
+                            if source_issue is not None
+                            else None
+                        )
+                    ),
+                    is_active=(source_issue.is_active if source_issue is not None else True),
+                    disposition_updated_at=(
+                        source_issue.disposition_updated_at
+                        if source_issue is not None and override is not None
+                        else None
+                    ),
+                    disposition_updated_by=(
+                        source_issue.disposition_updated_by
+                        if source_issue is not None and override is not None
+                        else None
+                    ),
+                )
+            )
+        return tuple(sorted(projected, key=_issue_sort_key))
+
+
+DEFAULT_AUDIT_POLICY = AuditPolicy()
+
 
 _EDGE_EVIDENCE_KEYS = (
     "column_number",
@@ -159,6 +507,9 @@ def select_materialization_target(
 class LineageAuditResult:
     """一次 Physical DAG audit 的结构化结果与可复用事实摘要。
 
+    ``facts`` 是 detector 的 canonical 输出；``issues`` 是为兼容现有
+    materialization/SQLite API 保留的 policy projection。两者共享 stable key，
+    但 severity、disposition 和 policy version 只存在于 projection。
     ``target_reachable_nodes`` 只表示 authoritative target 的既有事实；
     ``selected_target_reachable_nodes`` 仅为 unique hint selection 提供
     materialization branch，不把 hint 提升为 audit authority。
@@ -178,6 +529,21 @@ class LineageAuditResult:
         )
     )
     selected_target_reachable_nodes: tuple[str, ...] = ()
+    facts: tuple[AuditFact, ...] = ()
+    policy_version: str = AUDIT_POLICY_VERSION
+
+    def __post_init__(self) -> None:
+        facts = tuple(self.facts)
+        if any(not isinstance(fact, AuditFact) for fact in facts):
+            raise TypeError("facts must contain AuditFact values")
+        object.__setattr__(self, "facts", facts)
+        issues = tuple(self.issues)
+        if any(not isinstance(issue, LineageIssue) for issue in issues):
+            raise TypeError("issues must contain LineageIssue values")
+        object.__setattr__(self, "issues", issues)
+        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
+            raise ValueError("policy_version must be a non-empty string")
+        object.__setattr__(self, "policy_version", self.policy_version.strip())
 
     @property
     def authoritative_target(self) -> str | None:
@@ -201,15 +567,43 @@ class LineageAuditResult:
     def hint_match_count(self) -> int:
         return self.target_selection.hint_match_count
 
+    def apply_policy(
+        self,
+        policy: AuditPolicy | None = None,
+        *,
+        batch_id: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> tuple[LineageIssue, ...]:
+        """对同一份 facts 重新计算 policy，不重新访问 DAG 或 parser。"""
+
+        resolved_policy = policy or DEFAULT_AUDIT_POLICY
+        if not isinstance(resolved_policy, AuditPolicy):
+            raise TypeError("policy must be an AuditPolicy or None")
+        if self.issues:
+            return resolved_policy.replay(
+                self.issues,
+                batch_id=batch_id,
+                observed_at=observed_at,
+            )
+        return resolved_policy.project(
+            self.facts,
+            batch_id=batch_id,
+            observed_at=observed_at,
+        )
+
+    replay_policy = apply_policy
+
     @property
     def issue_types(self) -> tuple[IssueType, ...]:
         """按结果顺序返回 issue 类型，便于调用方做轻量统计。"""
 
+        if self.facts:
+            return tuple(IssueType(fact.issue_type) for fact in self.facts)
         return tuple(IssueType(issue.issue_type) for issue in self.issues)
 
     @property
     def has_issues(self) -> bool:
-        return bool(self.issues)
+        return bool(self.facts or self.issues)
 
 
 # 便于只关心结果对象的调用方使用短名称；正式文档使用 LineageAuditResult。
@@ -217,10 +611,55 @@ AuditResult = LineageAuditResult
 
 
 def issue_severity(issue_type: IssueType | str) -> str:
-    """返回集中定义的、对同一 ``IssueType`` 稳定的 severity。"""
+    """兼容入口：返回默认 policy 的 severity，不参与 fact detection。"""
 
-    resolved_type = IssueType(issue_type)
-    return ISSUE_SEVERITY_POLICY[resolved_type]
+    return DEFAULT_AUDIT_POLICY.severity_for(issue_type)
+
+
+def audit_fact_from_issue(issue: LineageIssue) -> AuditFact:
+    """把兼容 projection 恢复为 policy 无关的 AuditFact。"""
+
+    return AuditFact.from_issue(issue)
+
+
+def apply_audit_policy(
+    facts: Iterable[AuditFact],
+    policy: AuditPolicy | None = None,
+    *,
+    batch_id: str | None = None,
+    observed_at: datetime | None = None,
+) -> tuple[LineageIssue, ...]:
+    """对既有 facts 应用 policy；不会重新构建 Physical DAG。"""
+
+    resolved_policy = policy or DEFAULT_AUDIT_POLICY
+    if not isinstance(resolved_policy, AuditPolicy):
+        raise TypeError("policy must be an AuditPolicy or None")
+    return resolved_policy.project(
+        facts,
+        batch_id=batch_id,
+        observed_at=observed_at,
+    )
+
+
+def replay_audit_policy(
+    values: Iterable[AuditFact | LineageIssue],
+    policy: AuditPolicy | None = None,
+    *,
+    batch_id: str | None = None,
+    observed_at: datetime | None = None,
+    preserve_manual_disposition: bool = True,
+) -> tuple[LineageIssue, ...]:
+    """从 facts 或旧 projection 重放 policy，并保留人工处置语义。"""
+
+    resolved_policy = policy or DEFAULT_AUDIT_POLICY
+    if not isinstance(resolved_policy, AuditPolicy):
+        raise TypeError("policy must be an AuditPolicy or None")
+    return resolved_policy.replay(
+        values,
+        batch_id=batch_id,
+        observed_at=observed_at,
+        preserve_manual_disposition=preserve_manual_disposition,
+    )
 
 
 def _canonical_json(value: object) -> str:
@@ -521,18 +960,18 @@ def compute_lineage_issue_stable_key(
     return hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
 
 
-def _make_issue(
+def _make_fact(
     dag: ProgramPhysicalDAG,
     issue_type: IssueType,
     *,
-    observed_at: datetime,
-    batch_id: str | None,
     message: str,
     evidence: Mapping[str, object],
     node_key: str | None = None,
     branch_sink: str | None = None,
     cycle_nodes: Iterable[str] = (),
-) -> LineageIssue:
+    confidence: AuditConfidence = AuditConfidence.HIGH,
+    rule_version: str = AUDIT_RULE_VERSION,
+) -> AuditFact:
     source = dag.program_source
     stable_key = compute_lineage_issue_stable_key(
         source.environment,
@@ -543,45 +982,48 @@ def _make_issue(
         branch_sink=branch_sink,
         cycle_nodes=cycle_nodes,
     )
-    return LineageIssue(
+    return AuditFact(
         environment=source.environment,
         source_profile=source.source_profile,
         program_name=source.program_name,
         issue_type=issue_type,
-        severity=issue_severity(issue_type),
         message=message,
         node_key=node_key,
         branch_sink=branch_sink,
         evidence=dict(evidence),
-        batch_id=batch_id,
-        first_seen_at=observed_at,
-        last_seen_at=observed_at,
-        is_active=True,
+        confidence=confidence,
+        rule_version=rule_version,
         stable_key=stable_key,
     )
 
 
-def _issue_sort_key(issue: LineageIssue) -> tuple[str, str, str, str, str]:
+def _fact_sort_key(
+    fact: AuditFact | LineageIssue,
+) -> tuple[str, str, str, str, str]:
     cycle_sort_key = ""
-    if IssueType(issue.issue_type) is IssueType.CYCLE_DETECTED:
-        evidence = issue.evidence
+    if IssueType(fact.issue_type) is IssueType.CYCLE_DETECTED:
+        evidence = fact.evidence
         if isinstance(evidence, Mapping):
             cycle_nodes = evidence.get("cycle_nodes", ())
             if isinstance(cycle_nodes, (list, tuple)):
                 cycle_sort_key = "\u0000".join(str(node) for node in cycle_nodes)
     return (
-        IssueType(issue.issue_type).value,
-        issue.branch_sink or "",
-        issue.node_key or "",
+        IssueType(fact.issue_type).value,
+        fact.branch_sink or "",
+        fact.node_key or "",
         cycle_sort_key,
-        issue.stable_key or "",
+        fact.stable_key or "",
     )
 
 
-class ProgramLineageAuditor:
-    """对一个 ``ProgramPhysicalDAG`` 执行只读、确定性的 Phase 4 audit。"""
+def _issue_sort_key(issue: LineageIssue) -> tuple[str, str, str, str, str]:
+    return _fact_sort_key(issue)
 
-    def audit(
+
+class ProgramLineageAuditor:
+    """只运行 Physical DAG fact detector，不持有 severity/disposition policy。"""
+
+    def _detect(
         self,
         dag: ProgramPhysicalDAG,
         observed_at: datetime | None = None,
@@ -629,7 +1071,7 @@ class ProgramLineageAuditor:
             formal_sinks=formal_sink_candidates,
         )
 
-        issues: list[LineageIssue] = []
+        facts: list[AuditFact] = []
 
         self_edges: dict[str, PhysicalEdge] = {}
         for edge in edges:
@@ -647,12 +1089,10 @@ class ProgramLineageAuditor:
             }
             if "evidence" in edge_record:
                 evidence["statement_evidence"] = edge_record["evidence"]
-            issues.append(
-                _make_issue(
+            facts.append(
+                _make_fact(
                     dag,
                     IssueType.SELF_REFERENCE,
-                    observed_at=observed_at,
-                    batch_id=batch_id,
                     node_key=node_key,
                     message=(
                         f"Program {dag.program_source.program_name} contains a "
@@ -674,12 +1114,10 @@ class ProgramLineageAuditor:
             )
             cycle_records = [_edge_record(edge) for edge in cycle_edges]
             cycle_pairs = [[edge.source, edge.target] for edge in cycle_edges]
-            issues.append(
-                _make_issue(
+            facts.append(
+                _make_fact(
                     dag,
                     IssueType.CYCLE_DETECTED,
-                    observed_at=observed_at,
-                    batch_id=batch_id,
                     message=(
                         f"Program {dag.program_source.program_name} contains a "
                         f"cycle involving {', '.join(cycle_nodes)}."
@@ -695,12 +1133,10 @@ class ProgramLineageAuditor:
 
         if len(sinks) > 1:
             expected_text = dag.expected_target or "unknown"
-            issues.append(
-                _make_issue(
+            facts.append(
+                _make_fact(
                     dag,
                     IssueType.MULTI_SINK_CANDIDATE,
-                    observed_at=observed_at,
-                    batch_id=batch_id,
                     message=(
                         f"Program {dag.program_source.program_name} has "
                         f"{len(sinks)} candidate sinks ({', '.join(sinks)}); "
@@ -743,12 +1179,10 @@ class ProgramLineageAuditor:
             and not expected_target_written
         ):
             if actual_formal_sinks:
-                issues.append(
-                    _make_issue(
+                facts.append(
+                    _make_fact(
                         dag,
                         IssueType.TARGET_MISMATCH,
-                        observed_at=observed_at,
-                        batch_id=batch_id,
                         message=(
                             f"Program {dag.program_source.program_name} writes "
                             f"formal sink(s) {', '.join(actual_formal_sinks)} "
@@ -765,12 +1199,10 @@ class ProgramLineageAuditor:
                     )
                 )
             else:
-                issues.append(
-                    _make_issue(
+                facts.append(
+                    _make_fact(
                         dag,
                         IssueType.TARGET_NOT_FOUND,
-                        observed_at=observed_at,
-                        batch_id=batch_id,
                         message=(
                             f"Program {dag.program_source.program_name} did not "
                             f"write expected target {expected_target}; no formal "
@@ -808,12 +1240,10 @@ class ProgramLineageAuditor:
                     branch_node_kinds = {
                         node: _node_kind_value(node, node_map) for node in branch_nodes
                     }
-                    issues.append(
-                        _make_issue(
+                    facts.append(
+                        _make_fact(
                             dag,
                             IssueType.ORPHAN_BRANCH,
-                            observed_at=observed_at,
-                            batch_id=batch_id,
                             branch_sink=branch_sink,
                             message=(
                                 f"Program {dag.program_source.program_name} has an "
@@ -833,15 +1263,61 @@ class ProgramLineageAuditor:
                         )
                     )
 
-        issues.sort(key=_issue_sort_key)
+        facts.sort(key=_fact_sort_key)
         return LineageAuditResult(
             dag=dag,
-            issues=tuple(issues),
+            issues=(),
             expected_target=expected_target,
             target_reachable_nodes=target_reachable_nodes,
             orphan_branch_sinks=orphan_branch_sinks,
             target_selection=target_selection,
             selected_target_reachable_nodes=selected_target_reachable_nodes,
+            facts=tuple(facts),
+        )
+
+    def detect_facts(
+        self,
+        dag: ProgramPhysicalDAG,
+        observed_at: datetime | None = None,
+        batch_id: str | None = None,
+    ) -> tuple[AuditFact, ...]:
+        """只运行 detector，返回不含 severity/disposition 的 facts。"""
+
+        return self._detect(
+            dag,
+            observed_at=observed_at,
+            batch_id=batch_id,
+        ).facts
+
+    detect = detect_facts
+
+    def audit(
+        self,
+        dag: ProgramPhysicalDAG,
+        observed_at: datetime | None = None,
+        batch_id: str | None = None,
+        *,
+        policy: AuditPolicy | None = None,
+    ) -> LineageAuditResult:
+        if policy is not None and not isinstance(policy, AuditPolicy):
+            raise TypeError("policy must be an AuditPolicy or None")
+        if observed_at is None:
+            resolved_observed_at = datetime.now(timezone.utc)
+        elif not isinstance(observed_at, datetime):
+            raise TypeError("observed_at must be a datetime or None")
+        else:
+            resolved_observed_at = observed_at
+        detected = self._detect(dag, observed_at=resolved_observed_at)
+        resolved_policy = policy or DEFAULT_AUDIT_POLICY
+        issues = resolved_policy.project(
+            detected.facts,
+            batch_id=batch_id,
+            observed_at=resolved_observed_at,
+        )
+        return replace(
+            detected,
+            issues=issues,
+            policy_version=resolved_policy.policy_version,
         )
 
     def __call__(
@@ -849,14 +1325,32 @@ class ProgramLineageAuditor:
         dag: ProgramPhysicalDAG,
         observed_at: datetime | None = None,
         batch_id: str | None = None,
+        *,
+        policy: AuditPolicy | None = None,
     ) -> LineageAuditResult:
-        return self.audit(dag, observed_at=observed_at, batch_id=batch_id)
+        return self.audit(
+            dag,
+            observed_at=observed_at,
+            batch_id=batch_id,
+            policy=policy,
+        )
+
+
+def detect_audit_facts(
+    dag: ProgramPhysicalDAG,
+    observed_at: datetime | None = None,
+) -> tuple[AuditFact, ...]:
+    """只运行 Audit fact detector，不读取或应用 severity/disposition policy。"""
+
+    return ProgramLineageAuditor().detect_facts(dag, observed_at=observed_at)
 
 
 def audit_program_physical_dag(
     dag: ProgramPhysicalDAG,
     observed_at: datetime | None = None,
     batch_id: str | None = None,
+    *,
+    policy: AuditPolicy | None = None,
 ) -> LineageAuditResult:
     """审计一个程序 Physical DAG；未传时间时在入口统一生成一次。"""
 
@@ -864,18 +1358,29 @@ def audit_program_physical_dag(
         dag,
         observed_at=observed_at,
         batch_id=batch_id,
+        policy=policy,
     )
 
 
 __all__ = [
+    "AUDIT_POLICY_VERSION",
+    "AUDIT_RULE_VERSION",
+    "AuditFact",
+    "AuditPolicy",
+    "AuditPolicyResult",
     "AuditResult",
+    "DEFAULT_AUDIT_POLICY",
     "ISSUE_SEVERITY_POLICY",
     "LineageAuditResult",
     "ProgramLineageAuditor",
     "TargetSelectionMode",
     "TargetSelectionResult",
+    "apply_audit_policy",
+    "audit_fact_from_issue",
     "audit_program_physical_dag",
     "compute_lineage_issue_stable_key",
+    "detect_audit_facts",
     "issue_severity",
+    "replay_audit_policy",
     "select_materialization_target",
 ]

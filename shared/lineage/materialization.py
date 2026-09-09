@@ -20,6 +20,7 @@ from typing import Any
 from uuid import uuid4
 
 from shared.lineage.audit import (
+    AuditPolicy,
     LineageAuditResult,
     audit_program_physical_dag,
 )
@@ -1234,6 +1235,7 @@ def materialize_program(
     audit_result: LineageAuditResult | None = None,
     *,
     issues: Iterable[LineageIssue] | None = None,
+    policy: AuditPolicy | None = None,
     batch_id: str | None = None,
     observed_at: datetime | None = None,
     job_key: str | None = None,
@@ -1255,6 +1257,8 @@ def materialize_program(
             raise TypeError("audit_result must be a LineageAuditResult or None")
         if audit_result.dag != dag:
             raise ValueError("audit_result must describe the supplied dag")
+    if policy is not None and not isinstance(policy, AuditPolicy):
+        raise TypeError("policy must be an AuditPolicy or None")
 
     resolved_batch_id = _resolve_batch_id(batch_id)
     resolved_observed_at = _resolve_observed_at(observed_at)
@@ -1262,7 +1266,18 @@ def materialize_program(
         dag,
         observed_at=resolved_observed_at,
         batch_id=resolved_batch_id,
+        policy=policy,
     )
+    if audit_result is not None and policy is not None:
+        audit = replace(
+            audit,
+            issues=audit.apply_policy(
+                policy,
+                batch_id=resolved_batch_id,
+                observed_at=resolved_observed_at,
+            ),
+            policy_version=policy.policy_version,
+        )
     if job_key is not None and (not isinstance(job_key, str) or not job_key.strip()):
         raise ValueError("job_key must be a non-empty string or None")
     normalized_job_key = job_key.strip() if isinstance(job_key, str) else None
@@ -1303,6 +1318,7 @@ def collapse_tmp_edges(
     dag: ProgramPhysicalDAG,
     audit_result: LineageAuditResult | None = None,
     *,
+    policy: AuditPolicy | None = None,
     batch_id: str | None = None,
     observed_at: datetime | None = None,
     job_key: str | None = None,
@@ -1312,6 +1328,7 @@ def collapse_tmp_edges(
     return materialize_program(
         dag,
         audit_result,
+        policy=policy,
         batch_id=batch_id,
         observed_at=observed_at,
         job_key=job_key,
@@ -1342,6 +1359,7 @@ def materialize_batch(
     batch_id: str | None = None,
     observed_at: datetime | None = None,
     job_keys: Mapping[str, str] | None = None,
+    policy: AuditPolicy | None = None,
     program_observer: Callable[
         [LineageAuditResult, ProgramMaterialization | None, int, int, Exception | None],
         None,
@@ -1350,6 +1368,8 @@ def materialize_batch(
 ) -> MaterializationBatch:
     """对多个既有 Audit 结果做完整、确定性的 candidate 计算。"""
 
+    if policy is not None and not isinstance(policy, AuditPolicy):
+        raise TypeError("policy must be an AuditPolicy or None")
     resolved_batch_id = _resolve_batch_id(batch_id)
     resolved_observed_at = _resolve_observed_at(observed_at)
     all_edges: list[LineageEdge] = []
@@ -1362,6 +1382,7 @@ def materialize_batch(
             result = materialize_program(
                 audit.dag,
                 audit,
+                policy=policy,
                 batch_id=resolved_batch_id,
                 observed_at=resolved_observed_at,
                 job_key=_job_key_for(audit.dag.program_source.program_name, job_keys),

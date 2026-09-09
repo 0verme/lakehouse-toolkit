@@ -25,7 +25,12 @@ except ModuleNotFoundError:
 # ruff: noqa: E402, I001
 ensure_project_root_on_path()
 
-from shared.lineage.audit import LineageAuditResult, audit_program_physical_dag  # noqa: E402
+from shared.lineage.audit import (  # noqa: E402
+    AuditPolicy,
+    LineageAuditResult,
+    audit_program_physical_dag,
+    replay_audit_policy,
+)
 from shared.lineage.coverage import (  # noqa: E402
     DEFAULT_COVERAGE_REPORT_PATH,
     LineageCoverageAccumulator,
@@ -291,6 +296,7 @@ def _build_program_audit(
     *,
     observed_at: datetime,
     batch_id: str,
+    policy: AuditPolicy | None,
     ordinal: int,
     diagnostic: bool,
     stage_timings: dict[tuple[str, ...], _ProgramStageTiming],
@@ -315,6 +321,7 @@ def _build_program_audit(
             dag,
             observed_at=observed_at,
             batch_id=batch_id,
+            policy=policy,
         )
         audit_elapsed_ms = _elapsed_ms(audit_started_at)
     except Exception as error:
@@ -342,6 +349,7 @@ def build_audits(
     observed_at: datetime,
     coverage: LineageCoverageAccumulator | None = None,
     count_program_totals: bool = True,
+    policy: AuditPolicy | None = None,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     progress_started_at: float | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
@@ -363,6 +371,7 @@ def build_audits(
             program_source,
             observed_at=observed_at,
             batch_id=batch_id,
+            policy=policy,
             ordinal=processed,
             diagnostic=diagnostic,
             stage_timings=stage_timings,
@@ -397,6 +406,7 @@ def build_candidate_batch(
     coverage: LineageCoverageAccumulator | None = None,
     count_program_totals: bool = True,
     observe_materialized_edges: bool = True,
+    policy: AuditPolicy | None = None,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     progress_started_at: float | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
@@ -474,6 +484,7 @@ def build_candidate_batch(
                 observed_at=observed_at,
                 coverage=coverage,
                 count_program_totals=count_program_totals,
+                policy=policy,
                 progress_every=progress_every,
                 progress_started_at=progress_started_at,
                 slow_threshold_ms=slow_threshold_ms,
@@ -573,6 +584,7 @@ def build_incremental_candidate_batch(
     ]
     | None = None,
     coverage: LineageCoverageAccumulator | None = None,
+    policy: AuditPolicy | None = None,
     force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
@@ -582,6 +594,8 @@ def build_incremental_candidate_batch(
 
     progress_every = _validate_progress_every(progress_every)
     slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
+    if policy is not None and not isinstance(policy, AuditPolicy):
+        raise TypeError("policy must be an AuditPolicy or None")
     sources = tuple(program_sources)
     if coverage is not None:
         coverage.observe_sources(sources)
@@ -648,6 +662,7 @@ def build_incremental_candidate_batch(
             coverage=coverage,
             count_program_totals=False,
             observe_materialized_edges=False,
+            policy=policy,
             progress_every=progress_every,
             progress_started_at=build_started_at,
             slow_threshold_ms=slow_threshold_ms,
@@ -691,6 +706,13 @@ def build_incremental_candidate_batch(
                     observed_now=observed_now,
                 )
             )
+        retained_issues = list(
+            replay_audit_policy(
+                retained_issues,
+                policy=policy,
+                batch_id=batch_id,
+            )
+        )
         broken_issues = detect_broken_lineage_branches(
             previous_edges,
             fresh_edges,
@@ -698,6 +720,7 @@ def build_incremental_candidate_batch(
             rebuilt.issues,
             observed_at=observed_at,
             batch_id=batch_id,
+            policy=policy,
         )
         issue_by_identity = {
             issue_identity_key(issue): issue
@@ -776,6 +799,7 @@ def materialize_sources(
     ]
     | None = None,
     coverage: LineageCoverageAccumulator | None = None,
+    policy: AuditPolicy | None = None,
     force_rebuild: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     selected_profiles: Iterable[str] | str | None = None,
@@ -793,6 +817,8 @@ def materialize_sources(
     selected_profiles = _normalize_selected_profiles(selected_profiles)
     limit = _validate_limit(limit)
     slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
+    if policy is not None and not isinstance(policy, AuditPolicy):
+        raise TypeError("policy must be an AuditPolicy or None")
     # ``--limit`` is always partial.  A profile-only run can be a complete
     # snapshot because its deletion authority is restricted to that profile.
     controlled_partial_replay = limit is not None
@@ -859,6 +885,7 @@ def materialize_sources(
         complete_snapshot=effective_complete_snapshot,
         snapshot_scopes=resolved_snapshot_scopes,
         coverage=coverage,
+        policy=policy,
         force_rebuild=force_rebuild,
         progress_every=progress_every,
         slow_threshold_ms=slow_threshold_ms,

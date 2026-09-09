@@ -1,15 +1,27 @@
 # Lineage Phase 4：Physical DAG 审计与异常检测
 
 Phase 4 只消费 Phase 3 的 `ProgramPhysicalDAG`，把已经确认的程序事实转换为
-结构化 `LineageIssue`。它是只读观察者，不重新解析 `ProgramSource.script_code`，
-也不修复或重写 Physical 图。
+结构化 `AuditFact`；兼容 facade 再将 fact 投影为 `LineageIssue`。它是只读观察者，
+不重新解析 `ProgramSource.script_code`，也不修复或重写 Physical 图。
+
+完整的 Fact / Policy / lifecycle contract 见
+[`lineage_audit_policy.md`](lineage_audit_policy.md)。核心边界是：
+
+```text
+Physical DAG → AuditFact → AuditPolicy → LineageIssue projection → persistence/history
+```
 
 ## API
 
 ```python
-from shared.lineage import audit_program_physical_dag, build_program_physical_dag
+from shared.lineage import (
+    ProgramLineageAuditor,
+    audit_program_physical_dag,
+    build_program_physical_dag,
+)
 
 physical_dag = build_program_physical_dag(program_source)
+facts = ProgramLineageAuditor().detect_facts(physical_dag)
 audit = audit_program_physical_dag(physical_dag, observed_at=observed_at)
 ```
 
@@ -24,7 +36,8 @@ audit = ProgramLineageAuditor().audit(physical_dag, observed_at=observed_at)
 `LineageAuditResult` 是 frozen result，包含：
 
 - `dag`：原样返回的输入 `ProgramPhysicalDAG`；
-- `issues`：按稳定排序返回的 `tuple[LineageIssue, ...]`；
+- `facts`：detector 按稳定排序返回的 `tuple[AuditFact, ...]`；
+- `issues`：为兼容现有调用方按 policy 投影的 `tuple[LineageIssue, ...]`；
 - `expected_target`：本次审计使用的标准化 target；
 - `target_reachable_nodes`：能够沿 `source → target` 方向到达 expected target
   的节点，按名称排序；
@@ -41,7 +54,7 @@ adjacency 都是调用期间建立的内部索引，PhysicalEdge 的方向仍然
 expected target、当前变成 orphan 时生成的派生 issue，不是本次 Audit detector 新增的
 规则：
 
-| IssueType | 触发语义 | Severity |
+| IssueType | 触发语义 | 默认 policy severity |
 | --- | --- | --- |
 | `ORPHAN_BRANCH` | 已知且实际写入的 expected target 存在时，某个 terminal branch 无法到达该 target | `MEDIUM` |
 | `MULTI_SINK_CANDIDATE` | `dag.sinks` 中有多个终止写入候选 | `MEDIUM` |
@@ -51,8 +64,9 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 | `SELF_REFERENCE` | 存在 `A → A` 的 PhysicalEdge | `HIGH` |
 | `LINEAGE_BRANCH_BROKEN` | 既有有效 target 分支在后续 snapshot 中断裂，由 evolution/history 派生 | `HIGH` |
 
-Severity 由 `ISSUE_SEVERITY_POLICY` 集中定义，并通过 `issue_severity()` 查询；
-同一 `IssueType` 不会由不同 detector 随意赋予不同等级。
+默认 severity 由兼容用的 `ISSUE_SEVERITY_POLICY` 集中定义，并通过
+`AuditPolicy` / `issue_severity()` 查询；它不是 detector fact。不同 policy 可以
+对同一 facts 使用不同 severity 或 disposition，而不改变 fact 集合和 stable identity。
 
 ## Sink 与 target 规则
 
@@ -134,8 +148,9 @@ SCC 再生成 `CYCLE_DETECTED`。多节点 SCC 中若同时含有 self edge，�
 
 ## Stable key 与 lifecycle
 
-`LineageIssue.stable_key` 是由 `compute_lineage_issue_stable_key()` 计算的
-SHA-256 hex identity，不使用 Python `hash()`、时间或 message 文案。
+`AuditFact.stable_key`（以及兼容 projection 的 `LineageIssue.stable_key`）是由
+`compute_lineage_issue_stable_key()` 计算的 SHA-256 hex identity，不使用 Python
+`hash()`、时间、message、evidence、confidence、rule_version、severity 或 disposition。
 
 - Program-level：`environment + source_profile + program_name + issue_type`；
 - `SELF_REFERENCE`：再加 `node_key`；
@@ -144,19 +159,23 @@ SHA-256 hex identity，不使用 Python `hash()`、时间或 message 文案。
 
 因此 sink 列表或 evidence 更新不会仅仅因为 message/evidence 变化而自动创建新的
 program-level identity；不同 branch、self node、cycle SCC 会得到不同 key。
-`issue_key` 和 `fingerprint` 是该字段的兼容别名。
+`AuditFact.issue_key`、`AuditFact.fingerprint`、`LineageIssue.issue_key` 和
+`LineageIssue.fingerprint` 都是该字段的兼容别名。
 
-Audit 入口只生成一次默认 `observed_at`。每条新产生的 issue 都初始化为：
+Audit policy projection 入口只生成一次默认 `observed_at`。每条新 projection 都
+初始化为：
 
 ```text
 first_seen_at = observed_at
 last_seen_at  = observed_at
 is_active     = True
+disposition   = OPEN
+policy_version = 当前 policy version
 ```
 
-调用方可以注入固定的 `datetime`，便于测试和批次边界控制。本阶段不读取历史
-issue、不继承旧 timestamp、不做 inactive reconciliation、30 天判断或 diff；
-这些需要后续 Persistence/History Phase。
+调用方可以注入固定的 `datetime`，便于测试和批次边界控制。fact detector 不读取
+历史 issue；Persistence/History 负责继承人工 disposition、inactive reconciliation
+和 `RESOLVED` 投影。`IssueLifecycleStatus` 与 `IssueDisposition` 是两个不同维度。
 
 ## Evidence 与阶段边界
 
@@ -169,6 +188,8 @@ Phase 4 明确不实现：
 - TMP Collapse；
 - `LineageEdge` materialization；
 - `lineage_edge` / `lineage_issue` 数据库表或 batch publish；
+- UI、工单、通知或人工 disposition workflow；policy replay 只提供纯函数和
+  SQLite reference adapter 入口；
 - upstream/downstream query、Blast Radius、Viewer、closure；
 - incremental、history、diff 或长期 orphan lifecycle。
 

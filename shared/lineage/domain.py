@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 
@@ -36,6 +36,29 @@ class IssueType(str, Enum):
     CYCLE_DETECTED = "CYCLE_DETECTED"
     SELF_REFERENCE = "SELF_REFERENCE"
     LINEAGE_BRANCH_BROKEN = "LINEAGE_BRANCH_BROKEN"
+
+
+class AuditConfidence(str, Enum):
+    """Audit detector 对证据充分性的离散判断，不是统计概率。"""
+
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
+
+
+class IssueDisposition(str, Enum):
+    """业务处置状态；它不改变 detector 发现的事实或 stable identity。"""
+
+    OPEN = "OPEN"
+    ACCEPTED = "ACCEPTED"
+    FALSE_POSITIVE = "FALSE_POSITIVE"
+    RESOLVED = "RESOLVED"
+
+
+# SQLite/reference adapter 读取没有新增 policy 字段的旧行时使用这些值。
+LEGACY_AUDIT_RULE_VERSION = "audit-rule-legacy"
+LEGACY_AUDIT_POLICY_VERSION = "audit-policy-legacy"
 
 
 TemporaryAssetRule = Callable[[str], bool]
@@ -908,7 +931,12 @@ class LineageEdge:
 
 @dataclass(frozen=True, slots=True)
 class LineageIssue:
-    """Physical DAG 审计事实及其可追踪生命周期。"""
+    """AuditFact 的兼容 persistence projection 及其可追踪生命周期。
+
+    ``severity``、``disposition`` 和 ``policy_version`` 来自 policy；
+    ``issue_type``、``confidence``、``rule_version``、evidence 和 stable key
+    来自 detector fact。保留该扁平对象是为了兼容现有 materialization/SQLite API。
+    """
 
     environment: str
     source_profile: str
@@ -924,6 +952,12 @@ class LineageIssue:
     last_seen_at: datetime | None = None
     is_active: bool = True
     stable_key: str | None = None
+    confidence: AuditConfidence | str = AuditConfidence.UNKNOWN
+    rule_version: str = LEGACY_AUDIT_RULE_VERSION
+    disposition: IssueDisposition | str = IssueDisposition.OPEN
+    policy_version: str = LEGACY_AUDIT_POLICY_VERSION
+    disposition_updated_at: datetime | None = None
+    disposition_updated_by: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("environment", "source_profile", "program_name"):
@@ -937,10 +971,49 @@ class LineageIssue:
         if self.stable_key is not None:
             _require_text(self.stable_key, "stable_key")
         object.__setattr__(self, "issue_type", IssueType(self.issue_type))
+        object.__setattr__(self, "confidence", AuditConfidence(self.confidence))
+        object.__setattr__(self, "disposition", IssueDisposition(self.disposition))
+        for field_name in ("rule_version", "policy_version"):
+            value = getattr(self, field_name)
+            _require_text(value, field_name)
+            object.__setattr__(self, field_name, value.strip())
+        if self.disposition_updated_at is not None and not isinstance(
+            self.disposition_updated_at, datetime
+        ):
+            raise TypeError("disposition_updated_at must be a datetime or None")
+        if self.disposition_updated_by is not None:
+            _require_text(self.disposition_updated_by, "disposition_updated_by")
+
+    def with_disposition(
+        self,
+        disposition: IssueDisposition | str,
+        *,
+        updated_at: datetime | None = None,
+        updated_by: str | None = None,
+    ) -> "LineageIssue":
+        """返回带人工处置记录的新 projection，不改写当前/历史 row。"""
+
+        resolved = IssueDisposition(disposition)
+        if updated_at is not None and not isinstance(updated_at, datetime):
+            raise TypeError("updated_at must be a datetime or None")
+        if updated_by is not None:
+            _require_text(updated_by, "updated_by")
+        return replace(
+            self,
+            disposition=resolved,
+            disposition_updated_at=updated_at,
+            disposition_updated_by=updated_by,
+        )
 
     @property
     def issue_key(self) -> str | None:
         """兼容调用方对稳定 issue identity 的另一种命名。"""
+
+        return self.stable_key
+
+    @property
+    def stable_issue_identity(self) -> str | None:
+        """stable issue identity 的显式名称；不包含 policy/lifecycle 字段。"""
 
         return self.stable_key
 
@@ -963,8 +1036,12 @@ __all__ = [
     "canonicalize_table",
     "compute_source_hash",
     "decode_code",
+    "AuditConfidence",
     "DatasetIdentity",
+    "IssueDisposition",
     "IssueType",
+    "LEGACY_AUDIT_POLICY_VERSION",
+    "LEGACY_AUDIT_RULE_VERSION",
     "LineageEdge",
     "LineageIssue",
     "PhysicalEdge",
