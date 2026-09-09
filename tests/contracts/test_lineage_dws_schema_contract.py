@@ -13,14 +13,12 @@ TABLE_NAMES = (
     "lineage_batch",
     "lineage_program_state",
     "lineage_edge",
-    "lineage_business_edge",
     "lineage_issue",
 )
 ORIENTATIONS = {
     "lineage_batch": "ROW",
     "lineage_program_state": "ROW",
     "lineage_edge": "COLUMN",
-    "lineage_business_edge": "ROW",
     "lineage_issue": "ROW",
 }
 
@@ -39,11 +37,12 @@ class DwsSchemaContractTests(unittest.TestCase):
         cls.doc = DOC_PATH.read_text(encoding="utf-8")
         cls.matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
 
-    def test_ddl_declares_exactly_the_five_qualified_tables(self):
+    def test_ddl_declares_exactly_the_four_v01_tables(self):
         tables = tuple(
             re.findall(r"^CREATE TABLE ([^\s(]+) \(", self.ddl, re.MULTILINE)
         )
         self.assertEqual(tables, tuple(f"dwp.{name}" for name in TABLE_NAMES))
+        self.assertNotIn("lineage_business_edge", self.ddl)
         self.assertNotRegex(
             self.ddl,
             r"(?im)^\s*CREATE TABLE\s+(?:dwp\.)?lineage_closure\b",
@@ -70,7 +69,6 @@ class DwsSchemaContractTests(unittest.TestCase):
             "lineage_batch": ("row_key", "batch_id"),
             "lineage_program_state": ("row_key", "program_key"),
             "lineage_edge": ("row_key", "edge_key"),
-            "lineage_business_edge": ("row_key", "business_edge_key"),
             "lineage_issue": ("row_key", "stable_issue_key"),
         }
         for table_name, keys in required_keys.items():
@@ -79,27 +77,45 @@ class DwsSchemaContractTests(unittest.TestCase):
                 with self.subTest(table=table_name, key=key):
                     self.assertRegex(block, rf"\b{re.escape(key)}\b")
 
-    def test_physical_and_business_columns_have_distinct_endpoint_contracts(self):
-        physical = table_block(self.ddl, "lineage_edge")
-        business = table_block(self.ddl, "lineage_business_edge")
+    def test_lineage_edge_requires_formal_dataset_identity_endpoints(self):
+        edge = table_block(self.ddl, "lineage_edge")
+        self.assertIn("source_dataset_key      VARCHAR(128) NOT NULL", edge)
+        self.assertIn("target_dataset_key      VARCHAR(128) NOT NULL", edge)
+        self.assertIn("ck_lineage_edge_formal_endpoints", edge)
+        self.assertNotIn("source_node_kind", edge)
+        self.assertNotIn("target_node_kind", edge)
+        self.assertNotIn("TEMPORARY_ASSET", edge)
+        self.assertNotIn("physical_derivation_hash", edge)
+        self.assertNotIn("collapse_depth", edge)
 
-        self.assertIn("source_node_kind", physical)
-        self.assertIn("target_node_kind", physical)
-        self.assertIn("source_dataset_key", physical)
-        self.assertIn("target_dataset_key", physical)
-        self.assertIn("TEMPORARY_ASSET", physical)
-
-        self.assertIn("source_dataset_key      VARCHAR(128) NOT NULL", business)
-        self.assertIn("target_dataset_key      VARCHAR(128) NOT NULL", business)
-        self.assertRegex(
-            business,
-            r"collapse_depth\s+INTEGER NOT NULL",
-        )
-        self.assertIn("CHECK (collapse_depth >= 1)", business)
-        self.assertNotRegex(business, r"\bpath_count\b")
-        self.assertIn("physical_derivation_hash", business)
-        self.assertNotIn("source_node_kind", business)
-        self.assertNotIn("target_node_kind", business)
+    def test_lineage_edge_preserves_direct_evidence_and_lifecycle_contract(self):
+        edge = table_block(self.ddl, "lineage_edge")
+        for field in (
+            "environment",
+            "source_profile",
+            "program_key",
+            "program_name",
+            "source_table",
+            "target_table",
+            "evidence_type",
+            "evidence_json",
+            "source_hash",
+            "pipeline_version",
+            "batch_id",
+            "observed_at",
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ):
+            with self.subTest(field=field):
+                self.assertRegex(edge, rf"\b{field}\b")
+        batch = table_block(self.ddl, "lineage_batch")
+        self.assertIn("edge_count", batch)
+        self.assertNotIn("physical_edge_count", batch)
+        self.assertNotIn("business_edge_count", batch)
 
     def test_lineage_issue_reuses_issue36_fact_policy_and_manual_audit_contract(self):
         issue = table_block(self.ddl, "lineage_issue")
@@ -119,21 +135,6 @@ class DwsSchemaContractTests(unittest.TestCase):
         self.assertNotIn("issue_layer", issue)
         self.assertNotIn("lifecycle_status", issue)
 
-    def test_business_edge_has_required_lifecycle_fields(self):
-        business = table_block(self.ddl, "lineage_business_edge")
-        for field in (
-            "batch_id",
-            "observed_at",
-            "first_seen_at",
-            "last_seen_at",
-            "last_changed_at",
-            "is_active",
-            "created_at",
-            "updated_at",
-        ):
-            with self.subTest(field=field):
-                self.assertRegex(business, rf"\b{field}\b")
-
     def test_all_create_and_index_statements_are_schema_qualified(self):
         statements = (
             line.strip()
@@ -148,16 +149,17 @@ class DwsSchemaContractTests(unittest.TestCase):
             with self.subTest(statement=statement):
                 self.assertIn("dwp.", statement)
 
-    def test_design_doc_preserves_physical_business_closure_boundary(self):
+    def test_design_doc_preserves_runtime_boundary_and_issue36_contract(self):
         for phrase in (
-            "Physical lineage：`lineage_edge`",
-            "Business lineage：`lineage_business_edge`",
-            "Closure：Issue #40",
-            "TMP / intermediate table",
-            "source of truth",
-            "同一 batch",
+            "ProgramPhysicalDAG",
+            "formal direct `LineageEdge`",
+            "TMP",
+            "Issue #40",
             "Issue #36",
-            "建议独立 Issue",
+            "DWS v0.1",
+            "不创建 `dwp.lineage_business_edge`",
+            "SQLite → DWS compatibility matrix",
+            "DISTRIBUTE BY HASH (row_key)",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, self.doc)
@@ -166,11 +168,13 @@ class DwsSchemaContractTests(unittest.TestCase):
         required_ids = {
             "initial_empty_success",
             "program_build_success",
-            "business_collapse_failure",
+            "tmp_chain_collapse",
+            "formal_boundary_stop",
+            "known_negative_materialization",
+            "lineage_materialization_failure",
             "failed_publish",
             "duplicate_program_identity",
-            "duplicate_physical_edge_identity",
-            "duplicate_business_edge_identity",
+            "duplicate_lineage_edge_identity",
             "cross_profile_isolation",
             "inactive_edge_contamination",
             "partial_snapshot_scoped_deletion",
@@ -183,16 +187,18 @@ class DwsSchemaContractTests(unittest.TestCase):
         }
         cases = {case["id"]: case for case in self.matrix["cases"]}
         self.assertTrue(required_ids.issubset(cases))
+        self.assertNotIn("lineage_business_edge", json.dumps(self.matrix))
         for case in cases.values():
             with self.subTest(case=case["id"]):
                 self.assertTrue(case["same_batch"])
                 self.assertIsInstance(case["publish"], bool)
-                self.assertIn("physical_result", case)
-                self.assertIn("business_result", case)
+                self.assertIn("program_physical_dag_result", case)
+                self.assertIn("lineage_edge_result", case)
+                self.assertIn("issue_result", case)
 
     def test_lifecycle_matrix_encodes_fail_closed_and_scoped_deletion(self):
         cases = {case["id"]: case for case in self.matrix["cases"]}
-        collapse_failure = cases["business_collapse_failure"]
+        collapse_failure = cases["lineage_materialization_failure"]
         self.assertFalse(collapse_failure["publish"])
         self.assertTrue(collapse_failure["rollback"])
         self.assertIn("previous", collapse_failure["active_result"])
@@ -212,13 +218,11 @@ class DwsSchemaContractTests(unittest.TestCase):
         cases = {case["id"]: case for case in self.matrix["cases"]}
         empty = cases["initial_empty_success"]
         self.assertTrue(empty["publish"])
-        self.assertIn("zero", empty["physical_result"])
-        self.assertIn("zero", empty["business_result"])
+        self.assertIn("zero", empty["lineage_edge_result"])
 
         for case_id in (
             "duplicate_program_identity",
-            "duplicate_physical_edge_identity",
-            "duplicate_business_edge_identity",
+            "duplicate_lineage_edge_identity",
         ):
             with self.subTest(case=case_id):
                 self.assertTrue(cases[case_id]["reject_duplicate_stable_identity"])
@@ -229,41 +233,34 @@ class DwsSchemaContractTests(unittest.TestCase):
             cases["inactive_edge_contamination"]["query_requires_active_batch_join"]
         )
 
-    def test_frozen_business_lifecycle_semantics(self):
-        business = table_block(self.ddl, "lineage_business_edge")
-        self.assertRegex(business, r"collapse_depth\s+INTEGER NOT NULL")
-        self.assertNotRegex(business, r"\bpath_count\b")
-        self.assertIn("last_changed_at", business)
+    def test_frozen_lineage_edge_lifecycle_semantics(self):
         invariants = "\n".join(self.matrix["invariants"])
         for invariant in (
-            "Every published business row has collapse_depth >= 1",
-            "does not persist path_count",
-            "do not update business last_changed_at",
+            "formal direct endpoints",
+            "TMP endpoints are forbidden",
+            "do not update lineage-edge last_changed_at",
         ):
             with self.subTest(invariant=invariant):
                 self.assertIn(invariant, invariants)
-        for case_id in ("tmp_rename", "physical_path_change_same_endpoint"):
+        for case_id in ("tmp_chain_collapse", "formal_boundary_stop"):
             self.assertIn(
-                "last_changed_at remains unchanged",
+                "TMP",
                 next(
-                    case["active_result"]
+                    case["input"]
                     for case in self.matrix["cases"]
                     if case["id"] == case_id
                 ),
             )
+        for case_id in ("tmp_rename", "physical_path_change_same_endpoint"):
+            case = next(case for case in self.matrix["cases"] if case["id"] == case_id)
+            self.assertTrue(case["stable_lineage_identity"])
+            self.assertIn("last_changed_at remains unchanged", case["active_result"])
 
-    def test_lifecycle_matrix_covers_derived_rebuild_without_identity_guessing(self):
-        cases = {case["id"]: case for case in self.matrix["cases"]}
-        for case_id in ("source_hash_change", "pipeline_version_rebuild"):
-            with self.subTest(case=case_id):
-                self.assertTrue(cases[case_id]["rebuild"])
-                self.assertTrue(cases[case_id]["same_batch"])
-
-        self.assertTrue(cases["tmp_rename"]["stable_business_identity"])
-        self.assertTrue(
-            cases["physical_path_change_same_endpoint"]["stable_business_identity"]
-        )
-        self.assertIn("derivation", cases["tmp_rename"]["business_result"])
+    def test_dws_v01_does_not_reintroduce_removed_semantic_split(self):
+        self.assertNotIn("lineage_business_edge", self.ddl)
+        self.assertNotIn("lineage_business_edge", json.dumps(self.matrix))
+        self.assertIn("semantic drift", self.doc)
+        self.assertIn("raw PhysicalEdge DWS writer", self.doc)
 
 
 if __name__ == "__main__":

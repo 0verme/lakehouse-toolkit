@@ -260,6 +260,13 @@ class LineageMaterializationTests(unittest.TestCase):
         )
 
         self.assertEqual(edge_pairs(result), {("ODS.DEMO_A", EXPECTED_RESULT)})
+        self.assertTrue(
+            all(
+                edge.source_dataset_identity is not None
+                and edge.target_dataset_identity is not None
+                for edge in result.edges
+            )
+        )
         evidence = cast(dict[str, object], result.edges[0].evidence)
         self.assertEqual(evidence["collapsed_tmp_nodes"], ["TMP_1", "TMP_2", "TMP_3"])
 
@@ -296,6 +303,15 @@ class LineageMaterializationTests(unittest.TestCase):
             },
         )
         self.assertNotIn(("ODS.DEMO_A", EXPECTED_RESULT), edge_pairs(result))
+        self.assertTrue(
+            all(
+                edge.source_dataset_identity is not None
+                and edge.target_dataset_identity is not None
+                for edge in result.edges
+            )
+        )
+        self.assertNotIn("TMP_1", {edge.source_table for edge in result.edges})
+        self.assertNotIn("TMP_1", {edge.target_table for edge in result.edges})
 
     def test_multiple_formal_boundaries_each_stop_collapse(self):
         result = materialize_program(
@@ -481,32 +497,34 @@ class LineageMaterializationTests(unittest.TestCase):
             calls += 1
             return original_add_path(self, *args, **kwargs)
 
-        with patch.object(
-            materialization_module._EdgeEvidenceAccumulator,
-            "add_path",
-            counted_add_path,
-        ):
-            with patch.object(
+        with (
+            patch.object(
+                materialization_module._EdgeEvidenceAccumulator,
+                "add_path",
+                counted_add_path,
+            ),
+            patch.object(
                 materialization_module,
                 "_lineage_edge_from_path",
                 side_effect=AssertionError("per-path LineageEdge construction"),
-            ):
-                with patch.object(
-                    materialization_module,
-                    "_edge_evidence",
-                    side_effect=AssertionError("per-path evidence construction"),
-                ):
-                    with patch.object(
-                        materialization_module._EdgeEvidenceAccumulator,
-                        "add_evidence",
-                        side_effect=AssertionError("per-path evidence merge"),
-                    ):
-                        result = materialize_program(
-                            dag,
-                            audit_dag(dag),
-                            batch_id="batch-streaming",
-                            observed_at=OBSERVED_AT,
-                        )
+            ),
+            patch.object(
+                materialization_module,
+                "_edge_evidence",
+                side_effect=AssertionError("per-path evidence construction"),
+            ),
+            patch.object(
+                materialization_module._EdgeEvidenceAccumulator,
+                "add_evidence",
+                side_effect=AssertionError("per-path evidence merge"),
+            ),
+        ):
+            result = materialize_program(
+                dag,
+                audit_dag(dag),
+                batch_id="batch-streaming",
+                observed_at=OBSERVED_AT,
+            )
 
         self.assertEqual(len(result.edges), 1)
         self.assertEqual(calls, 64)
@@ -753,18 +771,20 @@ class LineageMaterializationTests(unittest.TestCase):
     ):
         dag = make_diamond_dag(4)
         audit = audit_dag(dag)
-        with patch.object(
-            materialization_module,
-            "MAX_COLLAPSED_TRAVERSAL_STATES",
-            4,
+        with (
+            patch.object(
+                materialization_module,
+                "MAX_COLLAPSED_TRAVERSAL_STATES",
+                4,
+            ),
+            self.assertRaises(LineagePathEnumerationError),
         ):
-            with self.assertRaises(LineagePathEnumerationError):
-                tuple(
-                    materialization_module._collapsed_paths(
-                        dag,
-                        materialization_module._included_nodes(audit),
-                    )
+            tuple(
+                materialization_module._collapsed_paths(
+                    dag,
+                    materialization_module._included_nodes(audit),
                 )
+            )
 
     def test_tmp_fanout_paths_merge_into_one_direct_edge(self):
         result = materialize_program(
@@ -936,7 +956,7 @@ class LineageMaterializationTests(unittest.TestCase):
                     source_profile="fixture",
                     program_name=program_name,
                     script_code=(
-                        f'execute("INSERT INTO {expected_target} '
+                        f'execute("INSERT INTO {expected_target} '  # noqa: S608
                         f'SELECT * FROM {source_table}")'
                     ),
                     source_hash=f"sha256:{program_name.lower()}",

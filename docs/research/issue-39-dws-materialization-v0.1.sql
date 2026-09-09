@@ -8,11 +8,14 @@
 -- database czcb, schema dwp. Every production object reference is explicit:
 -- no search_path and no dependency on current_schema (which is public).
 --
+-- DWS v0.1 stores the current LineageEdge semantic: a formal direct edge after
+-- the existing program-scoped TMP collapse. ProgramPhysicalDAG remains the
+-- runtime physical fact graph and is not a second raw-edge DWS table.
+--
 -- Key generation, candidate validation, active switching, retention and
 -- partition-boundary provisioning are writer/deployment responsibilities.
--- The DDL intentionally keeps the five tables independent of any dataset
--- registry. Business endpoints must be validated against DatasetIdentity before
--- insertion; SQL name-prefix checks are not a substitute for that validation.
+-- DatasetIdentity validation happens before insertion; SQL name-prefix checks
+-- are not a substitute for that validation.
 
 -- ---------------------------------------------------------------------------
 -- 0. Control table: one snapshot consistency boundary
@@ -29,8 +32,7 @@ CREATE TABLE dwp.lineage_batch (
     publish_status           VARCHAR(16) NOT NULL DEFAULT 'CANDIDATE',
     published_at            TIMESTAMP(6) WITH TIME ZONE,
     program_count           BIGINT NOT NULL DEFAULT 0,
-    physical_edge_count     BIGINT NOT NULL DEFAULT 0,
-    business_edge_count     BIGINT NOT NULL DEFAULT 0,
+    edge_count              BIGINT NOT NULL DEFAULT 0,
     issue_count             BIGINT NOT NULL DEFAULT 0,
     is_active               BOOLEAN NOT NULL DEFAULT FALSE,
     created_at              TIMESTAMP(6) WITH TIME ZONE NOT NULL,
@@ -49,8 +51,7 @@ CREATE TABLE dwp.lineage_batch (
     CONSTRAINT ck_lineage_batch_counts
         CHECK (
             program_count >= 0
-            AND physical_edge_count >= 0
-            AND business_edge_count >= 0
+            AND edge_count >= 0
             AND issue_count >= 0
         )
 )
@@ -69,8 +70,8 @@ COMMENT ON COLUMN dwp.lineage_batch.batch_id IS
     'Stable identity of one candidate/published snapshot; not scheduler execution.';
 COMMENT ON COLUMN dwp.lineage_batch.snapshot_scope IS
     'Canonical JSON text for environment/source_profile complete-snapshot scope.';
-COMMENT ON COLUMN dwp.lineage_batch.business_edge_count IS
-    'Count of lineage_business_edge rows in the same batch; must not be inferred from physical edges.';
+COMMENT ON COLUMN dwp.lineage_batch.edge_count IS
+    'Count of dwp.lineage_edge rows in the same batch; it is not a raw physical-edge count.';
 
 -- ---------------------------------------------------------------------------
 -- 1. Program state: #38 ProgramIdentity across materialization snapshots
@@ -129,7 +130,7 @@ COMMENT ON COLUMN dwp.lineage_program_state.last_changed_at IS
     'Changes on source-content or pipeline semantic change; last_seen changes on every observation.';
 
 -- ---------------------------------------------------------------------------
--- 2. Physical direct lineage: source of truth, TMP endpoints allowed
+-- 2. Formal direct lineage: current LineageEdge semantic
 -- ---------------------------------------------------------------------------
 CREATE TABLE dwp.lineage_edge (
     row_key                 VARCHAR(128) NOT NULL,
@@ -138,12 +139,10 @@ CREATE TABLE dwp.lineage_edge (
     source_profile          VARCHAR(256) NOT NULL,
     program_key             VARCHAR(128) NOT NULL,
     program_name            VARCHAR(512) NOT NULL,
+    source_dataset_key      VARCHAR(128) NOT NULL,
     source_table            VARCHAR(512) NOT NULL,
+    target_dataset_key      VARCHAR(128) NOT NULL,
     target_table            VARCHAR(512) NOT NULL,
-    source_node_kind        VARCHAR(32) NOT NULL,
-    target_node_kind        VARCHAR(32) NOT NULL,
-    source_dataset_key      VARCHAR(128),
-    target_dataset_key      VARCHAR(128),
     evidence_type           VARCHAR(128) NOT NULL,
     evidence_json           TEXT,
     source_hash             VARCHAR(128),
@@ -159,13 +158,13 @@ CREATE TABLE dwp.lineage_edge (
     CONSTRAINT pk_lineage_edge PRIMARY KEY (row_key),
     CONSTRAINT uq_lineage_edge_batch_key
         UNIQUE (batch_id, edge_key),
-    CONSTRAINT ck_lineage_edge_node_kind
+    CONSTRAINT ck_lineage_edge_formal_endpoints
         CHECK (
-            source_node_kind IN ('FORMAL_ASSET', 'TEMPORARY_ASSET', 'UNRESOLVED')
-            AND target_node_kind IN ('FORMAL_ASSET', 'TEMPORARY_ASSET', 'UNRESOLVED')
+            LENGTH(TRIM(source_table)) > 0
+            AND LENGTH(TRIM(target_table)) > 0
+            AND LENGTH(TRIM(source_dataset_key)) > 0
+            AND LENGTH(TRIM(target_dataset_key)) > 0
         ),
-    CONSTRAINT ck_lineage_edge_endpoints
-        CHECK (LENGTH(TRIM(source_table)) > 0 AND LENGTH(TRIM(target_table)) > 0),
     CONSTRAINT ck_lineage_edge_identity
         CHECK (
             LENGTH(TRIM(environment)) > 0
@@ -200,96 +199,18 @@ CREATE INDEX dwp.ix_lineage_edge_stable_key
     ON dwp.lineage_edge (edge_key);
 
 COMMENT ON TABLE dwp.lineage_edge IS
-    'Issue #39 physical direct edge source of truth; TMP, cycles and self-reference are retained.';
-COMMENT ON COLUMN dwp.lineage_edge.source_table IS
-    'Physical node label, not necessarily a DatasetIdentity; preserve schema and TMP label.';
+    'Issue #39 formal direct LineageEdge after program-scoped TMP collapse; TMP is never an endpoint.';
+COMMENT ON COLUMN dwp.lineage_edge.edge_key IS
+    'Stable formal direct-edge identity; independent of batch, time and evidence.';
 COMMENT ON COLUMN dwp.lineage_edge.source_dataset_key IS
-    'Nullable DatasetIdentity projection; NULL for TMP or unresolved physical nodes.';
+    'Non-null DatasetIdentity projection; the writer must reject TMP or unresolved endpoints.';
+COMMENT ON COLUMN dwp.lineage_edge.target_dataset_key IS
+    'Non-null DatasetIdentity projection; the writer must reject TMP or unresolved endpoints.';
 COMMENT ON COLUMN dwp.lineage_edge.evidence_json IS
-    'Bounded deterministic provenance JSON text; never full script or connection data.';
+    'Bounded deterministic collapse/path provenance JSON; never full script or connection data.';
 
 -- ---------------------------------------------------------------------------
--- 3. Derived business lineage: formal endpoints only, same batch as physical
--- ---------------------------------------------------------------------------
-CREATE TABLE dwp.lineage_business_edge (
-    row_key                 VARCHAR(128) NOT NULL,
-    business_edge_key       VARCHAR(128) NOT NULL,
-    environment             VARCHAR(128) NOT NULL,
-    source_profile          VARCHAR(256) NOT NULL,
-    program_key             VARCHAR(128) NOT NULL,
-    program_name            VARCHAR(512) NOT NULL,
-    source_dataset_key      VARCHAR(128) NOT NULL,
-    source_table            VARCHAR(512) NOT NULL,
-    target_dataset_key      VARCHAR(128) NOT NULL,
-    target_table            VARCHAR(512) NOT NULL,
-    collapse_depth          INTEGER NOT NULL,
-    physical_derivation_hash VARCHAR(128) NOT NULL,
-    source_hash             VARCHAR(128),
-    pipeline_version        VARCHAR(256),
-    batch_id                VARCHAR(128) NOT NULL,
-    observed_at             TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-    first_seen_at           TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-    last_seen_at            TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-    last_changed_at         TIMESTAMP(6) WITH TIME ZONE,
-    is_active               BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at              TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-    updated_at              TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-    CONSTRAINT pk_lineage_business_edge PRIMARY KEY (row_key),
-    CONSTRAINT uq_lineage_business_edge_batch_key
-        UNIQUE (batch_id, business_edge_key),
-    CONSTRAINT ck_lineage_business_edge_formal_endpoints
-        CHECK (
-            LENGTH(TRIM(source_table)) > 0
-            AND LENGTH(TRIM(target_table)) > 0
-            AND source_dataset_key IS NOT NULL
-            AND target_dataset_key IS NOT NULL
-        ),
-    CONSTRAINT ck_lineage_business_edge_depth
-        CHECK (collapse_depth >= 1),
-    CONSTRAINT ck_lineage_business_edge_identity
-        CHECK (
-            LENGTH(TRIM(environment)) > 0
-            AND LENGTH(TRIM(source_profile)) > 0
-            AND LENGTH(TRIM(program_key)) > 0
-            AND LENGTH(TRIM(business_edge_key)) > 0
-        )
-)
-WITH (ORIENTATION = ROW)
-DISTRIBUTE BY HASH (row_key)
-PARTITION BY RANGE (observed_at)
-(
-    PARTITION p_lineage_business_edge_seed
-        VALUES LESS THAN (TIMESTAMP WITH TIME ZONE '2099-01-01 00:00:00+00'),
-    PARTITION p_lineage_business_edge_max
-        VALUES LESS THAN (MAXVALUE)
-);
-
-CREATE INDEX dwp.ix_lineage_business_edge_source_active
-    ON dwp.lineage_business_edge (
-        environment, source_profile, source_table, batch_id, is_active
-    );
-CREATE INDEX dwp.ix_lineage_business_edge_target_active
-    ON dwp.lineage_business_edge (
-        environment, source_profile, target_table, batch_id, is_active
-    );
-CREATE INDEX dwp.ix_lineage_business_edge_program
-    ON dwp.lineage_business_edge (
-        environment, source_profile, program_key, batch_id, is_active
-    );
-CREATE INDEX dwp.ix_lineage_business_edge_stable_key
-    ON dwp.lineage_business_edge (business_edge_key);
-
-COMMENT ON TABLE dwp.lineage_business_edge IS
-    'Issue #39 derived formal business edge; never a physical source of truth and never a TMP endpoint.';
-COMMENT ON COLUMN dwp.lineage_business_edge.collapse_depth IS
-    'Frozen physical direct-edge hop count; direct formal edge is 1 and every business row is >= 1.';
-COMMENT ON COLUMN dwp.lineage_business_edge.physical_derivation_hash IS
-    'Hash of canonical contributing physical edges; derived metadata, not part of business_edge_key or last_changed_at semantics.';
-COMMENT ON COLUMN dwp.lineage_business_edge.last_changed_at IS
-    'Business semantic-change timestamp; physical route, TMP label, depth, hash, source hash or pipeline version changes do not update it when identity is unchanged.';
-
--- ---------------------------------------------------------------------------
--- 4. Issues: Issue #36 fact/policy projection and lifecycle history
+-- 3. Issues: Issue #36 fact/policy projection and lifecycle history
 -- ---------------------------------------------------------------------------
 CREATE TABLE dwp.lineage_issue (
     row_key                 VARCHAR(128) NOT NULL,
@@ -385,24 +306,28 @@ COMMENT ON COLUMN dwp.lineage_issue.disposition_updated_by IS
     'Optional manual disposition provenance actor; not part of stable_issue_key.';
 
 -- ---------------------------------------------------------------------------
--- 5. Publish/query notes (not executable migration)
+-- 4. Publish/query notes (not executable migration)
 -- ---------------------------------------------------------------------------
--- A writer must validate all five tables with the same batch_id before switching:
+-- A writer must validate all four tables with the same batch_id before switching:
 --   dwp.lineage_batch
 --   dwp.lineage_program_state
 --   dwp.lineage_edge
---   dwp.lineage_business_edge
 --   dwp.lineage_issue
 --
--- Active business query shape (parameters remain bound values):
+-- The runtime sequence is:
+--   ProgramSource -> ProgramPhysicalDAG -> Phase 5 TMP collapse
+--   -> formal LineageEdge rows -> dwp.lineage_edge
 --
--- SELECT be.source_table, be.target_table, be.program_key
--- FROM dwp.lineage_business_edge AS be
+-- Active formal-lineage query shape (parameters remain bound values):
+--
+-- SELECT e.source_table, e.target_table, e.program_key
+-- FROM dwp.lineage_edge AS e
 -- JOIN dwp.lineage_batch AS b
---   ON b.batch_id = be.batch_id AND b.is_active = TRUE
--- WHERE be.is_active = TRUE
---   AND be.environment = :environment;
+--   ON b.batch_id = e.batch_id AND b.is_active = TRUE
+-- WHERE e.is_active = TRUE
+--   AND e.environment = :environment;
 --
--- No closure table is created by Issue #39. No unqualified table name,
+-- No raw physical-edge DWS writer, closure table, unqualified table name,
 -- current_schema lookup, search_path mutation, production migration, or runtime
--- imp_lineage_edge change is part of this design draft.
+-- imp_lineage_edge change is part of this design draft. Issue #40 owns the
+-- future cross-program/global N-hop lineage_closure design.
