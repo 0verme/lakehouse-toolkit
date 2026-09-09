@@ -823,6 +823,36 @@ class LineageMaterializationTests(unittest.TestCase):
         self.assertNotIn(IssueType.TARGET_MISMATCH, issue_types)
         self.assertNotIn(IssueType.ORPHAN_BRANCH, issue_types)
 
+    def test_ambiguous_three_part_program_name_materializes_physical_lineage(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DWM.RESULT_A:00",
+            script_code=(
+                'execute("INSERT INTO TMP_X SELECT * FROM ODS.SOURCE")\n'
+                'execute("INSERT INTO DWM.RESULT_A SELECT * FROM TMP_X")'
+            ),
+            source_hash="sha256:ambiguous-program-name",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            batch_id="batch-ambiguous-program-name",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            {(edge.source, edge.target) for edge in dag.edges},
+            {("ODS.SOURCE", "TMP_X"), ("TMP_X", "DWM.RESULT_A")},
+        )
+        self.assertGreater(len(dag.edges), 0)
+        self.assertIsNone(dag.expected_target)
+        self.assertEqual(edge_pairs(result), {("ODS.SOURCE", "DWM.RESULT_A")})
+        self.assertGreater(len(result.edges), 0)
+        issue_types = {issue.issue_type for issue in result.issues}
+        self.assertNotIn(IssueType.TARGET_MISMATCH, issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, issue_types)
+
     def test_cycle_and_self_reference_have_visited_protection(self):
         cycle = materialize_program(
             build_dag(CYCLE_PROGRAM, expected_target=None),

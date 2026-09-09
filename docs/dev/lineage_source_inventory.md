@@ -195,15 +195,17 @@ WHERE script_code IS NOT NULL
 
 旧 builder 的 target 处理是另外一层：
 
-- `process_target_name()` 对固定 `005:<logical_target>:<step_seq>:<opaque_suffix>`
-  格式复用 target-first parser，再转换为旧 graph 的 schema identity；
+- `process_target_name()` 对严格四段的固定
+  `005:<logical_target>:<step_seq>:<opaque_suffix>` canonical 格式复用 parser，再转换为旧
+  graph 的 schema identity；三段 legacy name 保持 unresolved；
 - 固定 marker 格式的 target 无法安全识别时不再从第二段盲猜；
 - 其它非 canonical legacy 名称仍按既有兼容逻辑处理；
 - `process_task_name()` 与 `build_target_map()` 只使用已经安全恢复的 target。
 
 `parse_declared_primary_target()` 的结果是 declared logical target hint，不是唯一
-sink。Provider 的 authority 顺序是 explicit/provider target → program-name target →
-existing Physical evidence；`005`、step 和 suffix 不进入 Dataset Identity。完整
+sink。Provider 的 authority 顺序是 explicit/provider target → canonical program-name
+target → existing Physical evidence；非 canonical shape 不授予 target authority；`005`、
+step 和 suffix 不进入 Dataset Identity。完整
 语义见 [`lineage_program_name.md`](lineage_program_name.md)。
 
 ### 3.3 Duplicated Historical Readers

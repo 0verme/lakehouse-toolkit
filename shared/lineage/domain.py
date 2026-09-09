@@ -93,6 +93,7 @@ class ProgramNameDiagnostic(str, Enum):
     PROGRAM_NAME_SUFFIX_NONSTANDARD = "PROGRAM_NAME_SUFFIX_NONSTANDARD"
     PROGRAM_NAME_MARKER_INVALID = "PROGRAM_NAME_MARKER_INVALID"
     PROGRAM_NAME_FORMAT_INVALID = "PROGRAM_NAME_FORMAT_INVALID"
+    PROGRAM_NAME_FORMAT_UNSUPPORTED = "PROGRAM_NAME_FORMAT_UNSUPPORTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,11 +152,11 @@ def _parse_positive_step(token: str) -> int | None:
 
 
 def parse_program_name(program_name: object) -> ProgramNameSemantics:
-    """按固定 ``005`` grammar 以 target-first 策略解析程序名。
+    """按固定 ``005`` grammar 以 conservative 策略解析程序名。
 
-    只要第二段是无歧义的 formal ``schema.table``，即使 step 或 suffix
-    缺失/异常也保留 target。未知字段只产生诊断，不把 lineage 自动变成
-    ``TARGET_NOT_FOUND``。
+    只有严格四段形态才足以授予 program-name target authority。三段及其它
+    非 canonical 形态即使第二段看起来像 ``schema.table``，也只保留格式诊断，
+    不猜测 logical target 或 step，避免把未知 legacy grammar 变成错误 target。
     """
 
     normalized_name = decode_code(program_name).strip()
@@ -179,41 +180,40 @@ def parse_program_name(program_name: object) -> ProgramNameSemantics:
         )
 
     target_token = parts[1].strip() if len(parts) > 1 else ""
-    logical_target = _normalize_program_name_target_token(target_token)
-    if logical_target is None:
+    candidate_target = _normalize_program_name_target_token(target_token)
+    if candidate_target is None:
         diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_TARGET_INVALID)
-    else:
+
+    if len(parts) != 4:
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_FORMAT_UNSUPPORTED)
+        if len(parts) < 4:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
+        else:
+            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_FORMAT_INVALID)
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_STEP_MISSING)
+        return ProgramNameSemantics(
+            program_name=normalized_name,
+            legacy_marker=marker,
+            logical_target=None,
+            step_seq=None,
+            opaque_suffix=None,
+            diagnostics=tuple(diagnostics),
+        )
+
+    logical_target = candidate_target
+    if logical_target is not None:
         diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_TARGET_RESOLVED)
 
-    step_seq: int | None = None
-    if len(parts) < 3:
-        diagnostics.extend(
-            (
-                ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE,
-                ProgramNameDiagnostic.PROGRAM_NAME_STEP_MISSING,
-            )
-        )
-    else:
-        step_token = parts[2].strip()
-        step_seq = _parse_positive_step(step_token)
-        if step_seq is None:
-            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_STEP_INVALID)
+    step_token = parts[2].strip()
+    step_seq = _parse_positive_step(step_token)
+    if step_seq is None:
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_STEP_INVALID)
 
-    opaque_suffix: str | None = None
-    if len(parts) < 4:
-        if ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE not in diagnostics:
-            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
-    else:
-        opaque_suffix = parts[3].strip()
-        if not opaque_suffix:
-            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
-        elif opaque_suffix != PROGRAM_NAME_DEFAULT_SUFFIX:
-            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_SUFFIX_NONSTANDARD)
-
-    if len(parts) > 4:
-        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_FORMAT_INVALID)
-        if ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE not in diagnostics:
-            diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
+    opaque_suffix = parts[3].strip()
+    if not opaque_suffix:
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE)
+    elif opaque_suffix != PROGRAM_NAME_DEFAULT_SUFFIX:
+        diagnostics.append(ProgramNameDiagnostic.PROGRAM_NAME_SUFFIX_NONSTANDARD)
 
     return ProgramNameSemantics(
         program_name=normalized_name,
@@ -227,7 +227,7 @@ def parse_program_name(program_name: object) -> ProgramNameSemantics:
 
 # 这些函数是已有调用方使用的语义化入口；实现统一委托给 target-first parser。
 def extract_program_declared_target_token(program_name: object) -> str | None:
-    """提取 legacy 程序名第二段的 logical target。"""
+    """仅从 canonical 四段 legacy 程序名提取 logical target。"""
 
     return parse_program_name(program_name).logical_target
 
@@ -573,7 +573,7 @@ class ProgramSource:
 
     @property
     def resolved_target(self) -> str | None:
-        """按 explicit/provider → program-name target 的顺序返回 target。"""
+        """按 explicit/provider → canonical program-name target 返回 target。"""
 
         explicit_target = normalize_expected_target(self.expected_target)
         return explicit_target or self.logical_target
