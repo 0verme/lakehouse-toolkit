@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from typing import cast
 from unittest.mock import patch
 
+import shared.lineage.materialization as materialization_module
 from shared.lineage.audit import LineageAuditResult, audit_program_physical_dag
 from shared.lineage.domain import (
     IssueType,
@@ -20,7 +21,6 @@ from shared.lineage.domain import (
     ProgramSource,
 )
 from shared.lineage.lineage_builder import normalize_table_name
-import shared.lineage.materialization as materialization_module
 from shared.lineage.materialization import (  # pyright: ignore[reportMissingImports]
     LineageEvidenceError,
     LineagePathEnumerationError,
@@ -736,14 +736,16 @@ class LineageMaterializationTests(unittest.TestCase):
     def test_explicit_path_enumeration_limit_fails_as_controlled_python_error(self):
         dag = make_diamond_dag(3)
         audit = audit_dag(dag)
-        with patch.object(materialization_module, "MAX_COLLAPSED_PATHS", 4):
-            with self.assertRaises(LineagePathEnumerationError):
-                tuple(
-                    materialization_module._collapsed_paths(
-                        dag,
-                        materialization_module._included_nodes(audit),
-                    )
+        with (
+            patch.object(materialization_module, "MAX_COLLAPSED_PATHS", 4),
+            self.assertRaises(LineagePathEnumerationError),
+        ):
+            tuple(
+                materialization_module._collapsed_paths(
+                    dag,
+                    materialization_module._included_nodes(audit),
                 )
+            )
 
     def test_explicit_path_traversal_limit_fails_before_unbounded_branch_expansion(
         self,
@@ -852,6 +854,52 @@ class LineageMaterializationTests(unittest.TestCase):
         issue_types = {issue.issue_type for issue in result.issues}
         self.assertNotIn(IssueType.TARGET_MISMATCH, issue_types)
         self.assertNotIn(IssueType.TARGET_NOT_FOUND, issue_types)
+
+    def test_program_name_namespace_normalization_materializes_physical_lineage(self):
+        cases = (
+            (
+                "005:DWS_DM.RESULT_A:1:00",
+                "DM.RESULT_A",
+                "DLO.SOURCE_A",
+            ),
+            (
+                "005:DLK_DLO.RESULT_A:1:00",
+                "DLO.RESULT_A",
+                "ODS.SOURCE_A",
+            ),
+        )
+
+        for program_name, expected_target, source_table in cases:
+            with self.subTest(program_name=program_name):
+                source = ProgramSource(
+                    environment="DEV",
+                    source_profile="fixture",
+                    program_name=program_name,
+                    script_code=(
+                        f'execute("INSERT INTO {expected_target} '
+                        f'SELECT * FROM {source_table}")'
+                    ),
+                    source_hash=f"sha256:{program_name.lower()}",
+                )
+                self.assertEqual(source.logical_target, expected_target)
+                self.assertEqual(source.resolved_target, expected_target)
+
+                dag = build_program_physical_dag(source)
+                audit = audit_dag(dag, batch_id="batch-namespace")
+                result = materialize_program(
+                    dag,
+                    audit_result=audit,
+                    batch_id="batch-namespace",
+                    observed_at=OBSERVED_AT,
+                )
+
+                self.assertEqual(dag.expected_target, expected_target)
+                self.assertEqual(dag.edge_pairs, {(source_table, expected_target)})
+                issue_types = {issue.issue_type for issue in audit.issues}
+                self.assertNotIn(IssueType.TARGET_MISMATCH, issue_types)
+                self.assertNotIn(IssueType.TARGET_NOT_FOUND, issue_types)
+                self.assertEqual(edge_pairs(result), {(source_table, expected_target)})
+                self.assertGreater(len(result.edges), 0)
 
     def test_cycle_and_self_reference_have_visited_protection(self):
         cycle = materialize_program(
