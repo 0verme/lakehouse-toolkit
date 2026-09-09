@@ -91,13 +91,16 @@ source = upstream
  target = downstream
 ```
 
-节点身份复用 `shared.lineage.lineage_builder.normalize_table_name`。因此仓库
-既有规则会继续生效，例如 `DWM.DEMO_A` 的 canonical 名称是
-`DWS_DWM.DEMO_A`，带反引号、双引号、大小写变化的同一名称会合并为一个节点。
+节点身份复用 `shared.lineage.lineage_builder.normalize_table_name`。Canonical
+normalization 只清理格式，不改写 SQL 中观察到的物理 schema；例如 `DWM.DEMO_A`
+仍然是 `DWM.DEMO_A`，显式写出的 `DWS_DWM.DEMO_A` 也保持不变。带反引号、
+双引号、大小写变化的同一名称会合并为一个节点。
 
-`table_name_aliases` 继续服务于 registry/lookup 侧；Physical 节点不会用短名
-alias 去合并节点，否则会错误合并 `ODS.A` 和 `DWM.A`。不同 schema 的资产始终
-按不同 canonical 名称保留。
+`table_name_aliases` 继续服务于 registry/lookup 侧，可以为 legacy matching
+提供 `DWM.DEMO_A` 与 `DWS_DWM.DEMO_A` 的兼容匹配，但不参与 Dataset Identity
+或 Physical 节点的 canonical 改写。Physical 节点不会用短名 alias 去合并节点，
+否则会错误合并 `ODS.A` 和 `DWM.A`。不同 schema 的资产始终按不同 canonical
+名称保留。
 
 SQL comment 使用共享的 `strip_sql_comments`。该 helper 会忽略引号中的
 `--`、`/*` 文本；SQL literal 还会在 `FROM/JOIN/USING` 扫描前被遮盖。CTE 名称

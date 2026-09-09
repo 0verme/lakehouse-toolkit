@@ -48,6 +48,25 @@ class DatasetIdentityContractTests(unittest.TestCase):
         self.assertEqual(canonical.to_dict()["canonical_schema"], "DWM")
         self.assertEqual(canonical.to_dict()["canonical_table"], "TABLE_A")
 
+    def test_identity_preserves_the_physical_schema_namespace(self):
+        for dataset_name in ("DWF.A", "DWM.B", "DWUPRR.C", "DWS_DWF.D"):
+            with self.subTest(dataset_name=dataset_name):
+                identity = DatasetIdentity.from_name("DEV200", dataset_name)
+                self.assertIsNotNone(identity)
+                if identity is None:
+                    self.fail("expected a qualified DatasetIdentity")
+                self.assertEqual(identity.canonical_name, dataset_name)
+
+        edge = LineageEdge(
+            environment="DEV200",
+            source_profile="fixture",
+            source_table="DWF.A",
+            target_table="DWM.B",
+        )
+        self.assertEqual(edge.source_table, "DWF.A")
+        self.assertEqual(edge.target_table, "DWM.B")
+        self.assertEqual(edge.source_dataset_identity.canonical_name, "DWF.A")
+
     def test_source_profile_is_provenance_not_dataset_identity(self):
         first = LineageEdge(
             environment="DEV200",

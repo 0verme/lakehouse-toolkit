@@ -38,6 +38,38 @@ def node_names(dag):
 
 
 class PhysicalDAGTests(unittest.TestCase):
+    def test_sql_physical_dag_preserves_sql_schema_namespace(self):
+        dag = build_program_physical_dag(
+            program(
+                '''
+                execute("""
+                INSERT INTO DWS_DWM.RESULT_A
+                SELECT *
+                FROM DWF.TABLE_A a
+                JOIN DWM.TABLE_B b ON a.id = b.id
+                JOIN DWUPRR.TABLE_C c ON a.id = c.id
+                JOIN DWS_DWF.TABLE_X x ON a.id = x.id
+                """)
+                ''',
+                expected_target=None,
+            )
+        )
+
+        expected_target = "DWS_DWM.RESULT_A"
+        expected_sources = {
+            "DWF.TABLE_A",
+            "DWM.TABLE_B",
+            "DWUPRR.TABLE_C",
+            "DWS_DWF.TABLE_X",
+        }
+        self.assertEqual({edge.source for edge in dag.edges}, expected_sources)
+        self.assertEqual(
+            edge_pairs(dag),
+            {(source, expected_target) for source in expected_sources},
+        )
+        self.assertNotIn("DWS_DWF.TABLE_A", node_names(dag))
+        self.assertNotIn("DWS_DWM.TABLE_B", node_names(dag))
+
     def test_core_fixture_keeps_every_program_step_and_tmp_node(self):
         fixture_path = ROOT_DIR / "tests" / "fixtures" / "lineage" / "phase3_program.py"
         dag = build_program_physical_dag(
@@ -318,7 +350,7 @@ class PhysicalDAGTests(unittest.TestCase):
         )
         self.assertEqual(dag.sinks, ())
 
-    def test_quoted_case_and_schema_aliases_share_normalized_nodes(self):
+    def test_quoted_identifiers_normalize_without_merging_schema_names(self):
         dag = build_program_physical_dag(
             program(
                 """
@@ -331,14 +363,28 @@ class PhysicalDAGTests(unittest.TestCase):
 
         self.assertEqual(
             node_names(dag),
-            {normalize_table_name("DWM.DEMO_A"), normalize_table_name("DWM.DEMO_B")},
+            {"DWM.DEMO_A", "DWM.DEMO_B", "DWS_DWM.DEMO_A"},
         )
-        self.assertEqual(len(dag.edges), 1)
-        evidence = cast(dict[str, object], dag.edges[0].evidence)
-        self.assertIsInstance(evidence, dict)
-        self.assertEqual(evidence["statement_indices"], [0, 1, 2])
-        occurrences = cast(list[object], evidence["occurrences"])
-        self.assertEqual(len(occurrences), 3)
+        self.assertEqual(
+            edge_pairs(dag),
+            {
+                ("DWM.DEMO_B", "DWM.DEMO_A"),
+                ("DWM.DEMO_B", "DWS_DWM.DEMO_A"),
+            },
+        )
+        self.assertEqual(len(dag.edges), 2)
+
+        dwm_edge = next(edge for edge in dag.edges if edge.target == "DWM.DEMO_A")
+        dwm_evidence = cast(dict[str, object], dwm_edge.evidence)
+        self.assertIsInstance(dwm_evidence, dict)
+        self.assertEqual(dwm_evidence["statement_indices"], [0, 2])
+        dwm_occurrences = cast(list[object], dwm_evidence["occurrences"])
+        self.assertEqual(len(dwm_occurrences), 2)
+
+        dws_edge = next(edge for edge in dag.edges if edge.target == "DWS_DWM.DEMO_A")
+        dws_evidence = cast(dict[str, object], dws_edge.evidence)
+        self.assertIsInstance(dws_evidence, dict)
+        self.assertEqual(dws_evidence["statement_indices"], [1])
 
     def test_unqualified_asset_names_are_supported_without_alias_nodes(self):
         dag = build_program_physical_dag(

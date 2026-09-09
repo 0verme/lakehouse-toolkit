@@ -207,15 +207,15 @@ class LineageDiffTests(unittest.TestCase):
 
         self.assertEqual(
             {(item.source_table, item.target_table) for item in result.unchanged_edges},
-            {("DWS_DWA.DEMO_X", "DWS_DM.DEMO_COMMON")},
+            {("DWA.DEMO_X", "DM.DEMO_COMMON")},
         )
         self.assertEqual(
             {(item.source_table, item.target_table) for item in result.only_in_dev},
-            {("DWS_DWA.DEMO_X", "DWS_DM.DEMO_DEV_ONLY")},
+            {("DWA.DEMO_X", "DM.DEMO_DEV_ONLY")},
         )
         self.assertEqual(
             {(item.source_table, item.target_table) for item in result.only_in_prod},
-            {("DWS_DWA.DEMO_X", "DWS_DM.DEMO_PROD_ONLY")},
+            {("DWA.DEMO_X", "DM.DEMO_PROD_ONLY")},
         )
 
     def test_store_history_api_reads_old_batch_and_compares_batches(self):
@@ -243,7 +243,7 @@ class LineageDiffTests(unittest.TestCase):
 
         self.assertEqual(
             result.added_edges,
-            (BusinessLineageEdge("DEV", "DWS_DWM.DEMO_B", "DWS_DWA.DEMO_C"),),
+            (BusinessLineageEdge("DEV", "DWM.DEMO_B", "DWA.DEMO_C"),),
         )
         self.assertEqual(len(old_edges), 1)
         self.assertEqual(

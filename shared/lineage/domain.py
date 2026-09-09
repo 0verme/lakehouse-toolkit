@@ -390,8 +390,9 @@ class DatasetIdentity:
     """Dataset Identity Contract V1 的 physical dataset value object。
 
     Identity 只有 ``environment + canonical_schema + canonical_table``；不含
-    ``source_profile``、platform、catalog 或其它数据库层级。TMP 和缺失
-    schema 的引用不能构成此对象。
+    ``source_profile``、platform、catalog 或其它数据库层级。canonicalization
+    只清理格式并保留 SQL 中观察到的物理 schema，不做 namespace 推断或改写。
+    TMP 和缺失 schema 的引用不能构成此对象。
     """
 
     environment: str
