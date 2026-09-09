@@ -18,8 +18,8 @@ mysql_process_profiles:
     script_code_column: script_code
     # demo_meta.processes 没有固定的 expected target 字段；不填即为 None。
     expected_target_column: null
-    # explicit/provider target 优先；缺失时按固定 005 program_name grammar
-    # 恢复第二段 logical target。此处字段保留为兼容配置。
+    # explicit/provider target 优先；缺失时仅按严格四段的固定 005 grammar
+    # 恢复第二段 logical target，三段 legacy name 保持 unknown。此处字段保留为兼容配置。
     primary_target_strategy: program_name
     batch_size: 200
 

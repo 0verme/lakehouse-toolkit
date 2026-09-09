@@ -100,22 +100,22 @@ class IncrementalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.unchanged, ())
         self.assertEqual(plan.changed, (current,))
 
-    def test_pipeline_version_change_is_changed(self):
+    def test_pr64_state_with_same_hash_is_rebuilt_after_target_authority_fix(self):
         current = source("PROGRAM_DEMO_VERSION_CHANGED")
         previous = (
-            ProgramState.from_source(
-                current,
-                observed_at=OBSERVED_AT,
-                batch_id="batch-old",
+            replace(
+                ProgramState.from_source(
+                    current,
+                    observed_at=OBSERVED_AT,
+                    batch_id="batch-old",
+                ),
+                pipeline_version="lineage-pipeline-v3-program-name-sql-recovery",
             ),
         )
 
-        plan = plan_incremental(
-            [current],
-            previous,
-            pipeline_version="lineage-pipeline-v999",
-        )
+        plan = plan_incremental([current], previous)
 
+        self.assertEqual(current.source_hash, previous[0].source_hash)
         self.assertEqual(plan.unchanged, ())
         self.assertEqual(plan.changed, (current,))
 

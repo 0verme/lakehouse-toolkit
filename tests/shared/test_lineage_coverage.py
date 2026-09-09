@@ -108,10 +108,11 @@ class LineageCoverageTests(unittest.TestCase):
                 script_code="select 1",
             )
             for program_name in (
-                "005:DEMO_DWM.RESULT_A:3:00",
-                "005:DEMO_DWM.RESULT_A:5:XYZ",
-                "005:DEMO_DWM.RESULT_A",
-                "005:DEMO_DWM.RESULT_B:0:00",
+                "005:DWM.RESULT_A:3:00",
+                "005:DWM.RESULT_A:5:XYZ",
+                "005:DWS_DWM.RESULT_A:00",
+                "005:DWM.RESULT_B:00",
+                "005:DWM.RESULT_B:0:00",
                 "005::1:00",
             )
         )
@@ -119,10 +120,10 @@ class LineageCoverageTests(unittest.TestCase):
         coverage.observe_sources(sources)
 
         profile = coverage.report(generated_at="2026-01-05T10:11:12+00:00").profiles[0]
-        self.assertEqual(profile.target_resolved, 4)
-        self.assertEqual(profile.target_unresolved, 1)
+        self.assertEqual(profile.target_resolved, 3)
+        self.assertEqual(profile.target_unresolved, 3)
         self.assertEqual(profile.step_resolved, 3)
-        self.assertEqual(profile.step_missing, 1)
+        self.assertEqual(profile.step_missing, 2)
         self.assertEqual(profile.step_invalid, 1)
         self.assertEqual(profile.custom_suffix, 1)
         self.assertEqual(profile.multi_step_target_count, 1)

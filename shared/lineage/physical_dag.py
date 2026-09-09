@@ -1070,7 +1070,7 @@ def _edge_occurrence(
 
 
 def _normalized_expected_target(program_source: ProgramSource) -> str | None:
-    """按 target authority 解析 explicit/provider 或 program-name target。"""
+    """只消费 explicit/provider 或 canonical program-name target authority。"""
 
     resolved_target = program_source.resolved_target
     if resolved_target is None:

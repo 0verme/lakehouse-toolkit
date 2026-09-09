@@ -28,12 +28,12 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v3-program-name-sql-recovery`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v4-program-name-target-authority`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
-bump 到新的语义版本，并在本文记录原因。本次 v3 同时固化固定 `005` program_name
-的 logical target、step sequence、opaque suffix、target-first recovery，以及 Python
-AST 失败后的保守 legacy SQL literal recovery；相同 source hash 的旧 v1/v2 facts
-也必须 rebuild。
+bump 到新的语义版本，并在本文记录原因。本次 v4 收紧固定 `005` program_name 的
+`target authority`：只有严格四段 canonical shape 才恢复 logical target，ambiguous
+三段保持 unknown；同时保留 v3 的 step/suffix 语义和 Python AST 失败后的保守 legacy
+SQL literal recovery。相同 source hash 的旧 v3 facts 也必须 rebuild。
 
 ## Incremental planner
 

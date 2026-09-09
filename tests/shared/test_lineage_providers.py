@@ -351,7 +351,7 @@ class LineageProviderTests(unittest.TestCase):
             primary_target_strategy="program_name",
         )
         cursor = FakeCursor(
-            [("005:DEMO_DWM.RESULT_A:1:00", "insert into DWM.RESULT_A select 1")]
+            [("005:DWM.RESULT_A:1:00", "insert into DWM.RESULT_A select 1")]
         )
         connection = FakeConnection(cursor)
 
@@ -363,8 +363,35 @@ class LineageProviderTests(unittest.TestCase):
                 ).iter_program_sources()
             )
 
-        self.assertEqual(source.expected_target, "DEMO_DWM.RESULT_A")
-        self.assertEqual(source.logical_target, "DEMO_DWM.RESULT_A")
+        self.assertEqual(source.expected_target, "DWM.RESULT_A")
+        self.assertEqual(source.logical_target, "DWM.RESULT_A")
+
+    def test_ambiguous_three_part_program_name_does_not_become_expected_target(self):
+        profile = make_profile(
+            expected_target_column=None,
+            primary_target_strategy="program_name",
+        )
+        cursor = FakeCursor(
+            [
+                (
+                    "005:DWS_DWM.RESULT_A:00",
+                    "insert into DWM.RESULT_A select 1",
+                )
+            ]
+        )
+        connection = FakeConnection(cursor)
+
+        with patch.dict(os.environ, environment_for(profile), clear=False):
+            source = next(
+                MySQLProcessProvider(
+                    profile,
+                    connection_factory=lambda settings: connection,
+                ).iter_program_sources()
+            )
+
+        self.assertIsNone(source.expected_target)
+        self.assertIsNone(source.logical_target)
+        self.assertIsNone(source.step_seq)
 
     def test_program_name_custom_suffix_does_not_block_target(self):
         profile = make_profile(

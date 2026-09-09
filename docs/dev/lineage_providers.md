@@ -121,9 +121,10 @@ connection_env:
 进入查询模板。运行时数据仍由 cursor 返回，不把用户值拼接进 SQL。
 
 `primary_target_strategy` 作为兼容字段保留，但不再配置 program-name prefix。
-lineage target authority 固定为 explicit/provider target 优先，缺失时按固定
-`005:<logical_target>:<step_seq>:<opaque_suffix>` grammar 回退到第二段 logical target。
-不提供 multi-prefix abstraction；`005` 是唯一合法 legacy marker。
+lineage target authority 固定为 explicit/provider target 优先，缺失时仅按严格四段的
+canonical `005:<logical_target>:<step_seq>:<opaque_suffix>` grammar 使用第二段
+logical target。三段及其它非 canonical legacy name 保持 unknown。不提供 multi-prefix
+abstraction；`005` 是唯一合法 legacy marker。
 
 ## Batch / streaming
 
@@ -147,16 +148,16 @@ execute
 数据无法严格解码时沿用 `errors="ignore"`。空的 `expected_target` 会变成
 `None`，不会变成字符串 `"None"`。
 
-Provider 优先使用 profile/legacy row 明确提供的结果表字段；缺失时按
-`parse_program_name()` 的 target-first 规则恢复第二段 logical target。例如
-`005:DEMO_DWM.RESULT_A:1:ABCD` 得到 `DEMO_DWM.RESULT_A`，suffix `ABCD` 只产生
-informational diagnostic，不会阻断 lineage。
+Provider 优先使用 profile/legacy row 明确提供的结果表字段；缺失时仅按
+`parse_program_name()` 的 conservative 规则恢复 canonical 四段的第二段
+logical target。例如 `005:DEMO_DWM.RESULT_A:1:ABCD` 得到 `DEMO_DWM.RESULT_A`，suffix
+`ABCD` 只产生 informational diagnostic，不会阻断 lineage。
 
-`005:DEMO_DWM.RESULT_A` 与 `005:DEMO_DWM.RESULT_A:1` 也分别可以恢复 target，后者
-同时恢复 `step_seq=1`。target 无法安全识别时返回 `None`，不猜测其它字段。该值
-只是 `expected_target` 的 declared logical target hint；它不会替换 Physical DAG
-中的其它 formal sink，也不会把多个 sink 变成唯一结果。完整字段与 grouping 语义
-见 [`lineage_program_name.md`](lineage_program_name.md)。
+`005:DEMO_DWM.RESULT_A` 与 `005:DEMO_DWM.RESULT_A:00` 都是非 canonical 的
+ambiguous shape，不恢复 target 或 step。target 无法安全识别时返回 `None`，不猜测
+其它字段。该值只是 `expected_target` 的 declared logical target hint；它不会替换
+Physical DAG 中的其它 formal sink，也不会把多个 sink 变成唯一结果。完整字段与
+grouping 语义见 [`lineage_program_name.md`](lineage_program_name.md)。
 
 ## source_hash
 
@@ -179,9 +180,9 @@ ID、读取时间、batch ID 都不会进入 hash。因此相同语义输入得�
 `process_name` / `program_name` 和 `script_code` 转换为 `ProgramSource`，并使用
 默认 `environment="PROD"`、`source_profile="production_metadata"`。旧
 `ProcessInfo` 没有独立 target 字段时，Provider 仍会按固定 `005` grammar 尝试恢复
-logical target；需要明确 metadata 字段时可以注入 `expected_target_getter`，且
-explicit/provider 值优先。`program_name_target_prefix` 不再支持，避免引入
-multi-prefix abstraction。
+canonical logical target；三段及其它非 canonical name 保持 unknown。需要明确 metadata
+字段时可以注入 `expected_target_getter`，且 explicit/provider 值优先。
+`program_name_target_prefix` 不再支持，避免引入 multi-prefix abstraction。
 
 这是 adapter，不是 production metadata 查询重写：没有删除 `ProcessInfo`、没有
 复制一套 legacy SQL，也没有修改旧工具入口。旧调用方继续使用原来的 loader；新

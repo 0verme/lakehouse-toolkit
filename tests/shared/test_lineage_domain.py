@@ -56,14 +56,14 @@ class LineageDomainTests(unittest.TestCase):
         source = ProgramSource(
             environment="DEV",
             source_profile="fixture",
-            program_name="005:DEMO_DWM.RESULT_A:3:00",
+            program_name="005:DWS_DWM.RESULT_A:00",
             script_code="select 1",
-            expected_target="DEMO_DWA.EXPLICIT_TARGET",
+            expected_target="DWM.EXPLICIT_TARGET",
         )
 
-        self.assertEqual(source.logical_target, "DEMO_DWM.RESULT_A")
-        self.assertEqual(source.resolved_target, "DEMO_DWA.EXPLICIT_TARGET")
-        self.assertEqual(source.step_seq, 3)
+        self.assertIsNone(source.logical_target)
+        self.assertEqual(source.resolved_target, "DWM.EXPLICIT_TARGET")
+        self.assertIsNone(source.step_seq)
 
     def test_program_identity_and_logical_processing_unit_keep_distinct_boundaries(
         self,
@@ -71,17 +71,19 @@ class LineageDomainTests(unittest.TestCase):
         first = ProgramSource(
             environment="DEV",
             source_profile="fixture",
-            program_name="005:DEMO_DWM.RESULT_A:3:00",
+            program_name="005:DWM.RESULT_A:3:00",
             script_code="select 1",
         )
         second = ProgramSource(
             environment="DEV",
             source_profile="fixture",
-            program_name="005:DEMO_DWM.RESULT_A:4:XYZ",
+            program_name="005:DWM.RESULT_A:4:XYZ",
             script_code="select 1",
         )
 
         self.assertNotEqual(first.identity, second.identity)
+        self.assertEqual(first.resolved_target, "DWM.RESULT_A")
+        self.assertEqual(second.resolved_target, "DWM.RESULT_A")
         self.assertEqual(
             first.logical_processing_unit_key,
             second.logical_processing_unit_key,
@@ -90,10 +92,10 @@ class LineageDomainTests(unittest.TestCase):
         self.assertEqual(second.opaque_suffix, "XYZ")
 
     def test_program_name_target_first_parser_keeps_direct_dataset_name(self):
-        parsed = parse_program_name("005:DEMO_DWM.RESULT_A:1:00")
+        parsed = parse_program_name("005:DWM.RESULT_A:1:00")
 
         self.assertEqual(parsed.legacy_marker, "005")
-        self.assertEqual(parsed.logical_target, "DEMO_DWM.RESULT_A")
+        self.assertEqual(parsed.logical_target, "DWM.RESULT_A")
         self.assertEqual(parsed.step_seq, 1)
         self.assertEqual(parsed.opaque_suffix, "00")
         self.assertEqual(
@@ -101,41 +103,50 @@ class LineageDomainTests(unittest.TestCase):
             (ProgramNameDiagnostic.PROGRAM_NAME_TARGET_RESOLVED,),
         )
         self.assertEqual(
-            parse_declared_primary_target("005:DEMO_DWM.RESULT_A:1:00"),
-            "DEMO_DWM.RESULT_A",
+            parse_declared_primary_target("005:DWM.RESULT_A:1:00"),
+            "DWM.RESULT_A",
         )
         self.assertEqual(
-            extract_program_declared_target_token("005:DEMO_DWM.RESULT_A:1:00"),
-            "DEMO_DWM.RESULT_A",
+            extract_program_declared_target_token("005:DWM.RESULT_A:1:00"),
+            "DWM.RESULT_A",
         )
         self.assertEqual(
-            normalize_declared_target_from_program_name("DEMO_DWM.RESULT_A"),
-            "DEMO_DWM.RESULT_A",
+            normalize_declared_target_from_program_name("DWM.RESULT_A"),
+            "DWM.RESULT_A",
         )
 
-    def test_program_name_parser_recovers_target_from_incomplete_fields(self):
-        target_only = parse_program_name("005:DEMO_DWM.RESULT_A")
-        self.assertEqual(target_only.logical_target, "DEMO_DWM.RESULT_A")
-        self.assertIsNone(target_only.step_seq)
-        self.assertIn(
-            ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE,
-            target_only.diagnostics,
-        )
-        self.assertIn(
-            ProgramNameDiagnostic.PROGRAM_NAME_STEP_MISSING,
-            target_only.diagnostics,
-        )
+    def test_program_name_parser_keeps_ambiguous_three_part_shapes_unknown(self):
+        for value in (
+            "005:DWS_DWM.RESULT_A:00",
+            "005:DWM.RESULT_A:00",
+            "005:ABC_DWM.RESULT_A:00",
+        ):
+            with self.subTest(value=value):
+                parsed = parse_program_name(value)
+                self.assertIsNone(parsed.logical_target)
+                self.assertIsNone(parsed.step_seq)
+                self.assertIsNone(parsed.opaque_suffix)
+                self.assertIn(
+                    ProgramNameDiagnostic.PROGRAM_NAME_FORMAT_UNSUPPORTED,
+                    parsed.diagnostics,
+                )
+                self.assertIn(
+                    ProgramNameDiagnostic.PROGRAM_NAME_STEP_MISSING,
+                    parsed.diagnostics,
+                )
+                self.assertNotIn(
+                    ProgramNameDiagnostic.PROGRAM_NAME_TARGET_RESOLVED,
+                    parsed.diagnostics,
+                )
+                self.assertNotIn(
+                    ProgramNameDiagnostic.PROGRAM_NAME_STEP_INVALID,
+                    parsed.diagnostics,
+                )
 
-        missing_suffix = parse_program_name("005:DEMO_DWM.RESULT_A:1")
-        self.assertEqual(missing_suffix.logical_target, "DEMO_DWM.RESULT_A")
-        self.assertEqual(missing_suffix.step_seq, 1)
-        self.assertIn(
-            ProgramNameDiagnostic.PROGRAM_NAME_INCOMPLETE,
-            missing_suffix.diagnostics,
-        )
+        self.assertIsNone(parse_declared_primary_target("005:ABC_DWM.RESULT_A:00"))
 
-        custom_suffix = parse_program_name("005:DEMO_DWM.RESULT_A:1:ABCD")
-        self.assertEqual(custom_suffix.logical_target, "DEMO_DWM.RESULT_A")
+        custom_suffix = parse_program_name("005:DWM.RESULT_A:1:ABCD")
+        self.assertEqual(custom_suffix.logical_target, "DWM.RESULT_A")
         self.assertEqual(custom_suffix.step_seq, 1)
         self.assertIn(
             ProgramNameDiagnostic.PROGRAM_NAME_SUFFIX_NONSTANDARD,
@@ -174,29 +185,28 @@ class LineageDomainTests(unittest.TestCase):
                 script_code="select 1",
             )
             for name in (
-                "005:DEMO_DWM.RESULT_A:4:XYZ",
-                "005:DEMO_DWM.RESULT_A:3:00",
-                "005:DEMO_DWM.RESULT_A",
-                "005:DEMO_DWM.RESULT_B:1:00",
+                "005:DWM.RESULT_A:2:00",
+                "005:DWM.RESULT_A:1:00",
+                "005:DWM.RESULT_A:00",
+                "005:DWM.RESULT_B:1:00",
             )
         )
         groups = group_program_sources_by_logical_target(sources)
 
-        self.assertEqual(tuple(groups), ("DEMO_DWM.RESULT_A", "DEMO_DWM.RESULT_B"))
+        self.assertEqual(tuple(groups), ("DWM.RESULT_A", "DWM.RESULT_B"))
         self.assertEqual(
-            [source.step_seq for source in groups["DEMO_DWM.RESULT_A"]],
-            [3, 4, None],
+            [source.step_seq for source in groups["DWM.RESULT_A"]],
+            [1, 2],
         )
         self.assertEqual(
-            expected_processing_order(groups["DEMO_DWM.RESULT_A"]),
-            (3, 4),
+            expected_processing_order(groups["DWM.RESULT_A"]),
+            (1, 2),
         )
         self.assertEqual(
-            [source.program_name for source in groups["DEMO_DWM.RESULT_A"]],
+            [source.program_name for source in groups["DWM.RESULT_A"]],
             [
-                "005:DEMO_DWM.RESULT_A:3:00",
-                "005:DEMO_DWM.RESULT_A:4:XYZ",
-                "005:DEMO_DWM.RESULT_A",
+                "005:DWM.RESULT_A:1:00",
+                "005:DWM.RESULT_A:2:00",
             ],
         )
 

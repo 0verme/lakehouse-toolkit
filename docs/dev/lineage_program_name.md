@@ -24,7 +24,7 @@
 以及其它非空 suffix 都是可保留的 opaque 值，不会因为不是 `00` 而使 lineage
 失败。
 
-## Target-first / conservative recovery
+## Conservative recovery
 
 解析入口为 `parse_program_name()`，结果通过 `ProgramSource` 的以下只读属性暴露：
 
@@ -37,17 +37,20 @@ program_name_diagnostics
 resolved_target
 ```
 
-只要第二段能安全识别为 formal `schema.table`，其它字段异常不会清空 target：
+只有严格四段、固定 marker、合法 formal target 的 canonical 形态才授予
+program-name target authority：
 
 ```text
-005:DEMO_DWM.RESULT_A       -> target=DEMO_DWM.RESULT_A, step=None
-005:DEMO_DWM.RESULT_A:1     -> target=DEMO_DWM.RESULT_A, step=1
+005:DEMO_DWM.RESULT_A:1:00  -> target=DEMO_DWM.RESULT_A, step=1
+005:DEMO_DWM.RESULT_A:2:00  -> target=DEMO_DWM.RESULT_A, step=2
 005:DEMO_DWM.RESULT_A:1:ABCD -> target=DEMO_DWM.RESULT_A, step=1
 ```
 
-`005::1:00`、`005:INVALID:1:00` 和非固定 marker 的格式不会猜测 target，返回
-`logical_target=None`。它们是 program-name target unresolved，不等同于由于缺少
-字段而产生的 `TARGET_NOT_FOUND`。
+三段及其它非 canonical 形态（例如 `005:DWS_DWM.RESULT_A:00`、
+`005:DWM.RESULT_A:00`）即使第二段看起来像 formal `schema.table`，也不会猜测
+logical target 或 step，而是返回 `logical_target=None`、`step_seq=None` 并记录
+`PROGRAM_NAME_FORMAT_UNSUPPORTED` 等格式诊断。它们是 program-name target
+unresolved，不等同于由于缺少 SQL graph evidence 而产生的 `TARGET_NOT_FOUND`。
 
 第三段只接受正整数，不设固定最大值，也不要求从 `1` 开始或连续。`0`、负数、
 小数和非数字值只产生 `PROGRAM_NAME_STEP_INVALID`；target 仍可保留。
@@ -63,16 +66,17 @@ PROGRAM_NAME_TARGET_INVALID
 PROGRAM_NAME_SUFFIX_NONSTANDARD
 PROGRAM_NAME_MARKER_INVALID
 PROGRAM_NAME_FORMAT_INVALID
+PROGRAM_NAME_FORMAT_UNSUPPORTED
 ```
 
 这些诊断用于 data-quality evidence，不改变 `IssueType` severity/disposition。
 
 ## Target authority
 
-当 `ProgramSource.expected_target` 有 explicit/provider 值时，它优先；否则使用
-`program_name` 的 `logical_target`；两者都没有时保持 unknown，并继续使用已有的
-Physical DAG evidence。程序名 target 只影响 expected target hint，不替代 Physical
-DAG 中的其它 formal sinks。
+当 `ProgramSource.expected_target` 有 explicit/provider 值时，它优先；否则仅使用
+canonical 四段 `program_name` 的 `logical_target`；两者都没有时保持 unknown，并
+继续使用已有的 Physical DAG evidence。程序名 target 只影响 expected target hint，
+不替代 Physical DAG 中的其它 formal sinks。
 
 因此：
 
@@ -83,7 +87,8 @@ explicit/provider target
 ```
 
 这条顺序不会因为 `step_seq` 或 suffix 改变。`005`、step 和 suffix 均不进入
-`DatasetIdentity`；`ProgramIdentity` 仍保留完整 raw `program_name`。
+`DatasetIdentity`；`ProgramIdentity` 仍保留完整 raw `program_name`。非 canonical
+program name 不会因为存在可解析的第二段而获得 target authority。
 
 ## Logical processing unit 与 Program Step
 

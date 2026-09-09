@@ -112,7 +112,8 @@ class MySQLProcessProfile:
     或兼容现有配置的顶层 ``*_env`` 字段。三种来源都只在 Provider 开始
     读取时归一为 ``MySQLConnectionSettings``；嵌套连接配置不会进入 profile
     的 repr，避免直接密码被意外打印。``primary_target_strategy`` 只保留为
-    兼容配置字段；target authority 始终回退到固定 ``005`` program_name target。
+    兼容配置字段；target authority 仅从 explicit/provider 值或固定 ``005`` 的
+    canonical 四段 program_name target 获取，ambiguous legacy name 保持 unknown。
     """
 
     name: str
@@ -625,9 +626,9 @@ class ProductionProvider:
     """将现有 production metadata loader 适配为 ``ProgramSource``。
 
     默认只使用旧 ``ProcessInfo.process_name`` 和 ``script_code``。旧对象没有
-    独立 expected target 字段时保持 ``None``；调用方可注入 getter 提供明确的
-    metadata 字段。程序名 target 只有在调用方显式启用 strategy 和 prefix 时
-    才会作为 declared primary hint 解析。
+    独立 expected target 字段时，只有 canonical 四段 program_name 才会提供 target
+    hint；ambiguous legacy name 保持 ``None``。调用方可注入 getter 提供明确的
+    metadata 字段，explicit/provider target 始终优先。
     """
 
     def __init__(

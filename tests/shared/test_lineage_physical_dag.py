@@ -304,17 +304,18 @@ class PhysicalDAGTests(unittest.TestCase):
         self.assertIsNone(dag.expected_target)
         self.assertEqual(dag.sinks, (normalize_table_name("DWM.DEMO_C"),))
 
-    def test_program_name_target_fallback_continues_incomplete_lineage(self):
+    def test_ambiguous_program_name_target_stays_unknown(self):
         source = ProgramSource(
             environment="DEV",
             source_profile="fixture",
-            program_name="005:DWM.DEMO_C",
+            program_name="005:DWM.DEMO_C:00",
             script_code='execute("INSERT INTO DWM.DEMO_C SELECT * FROM ODS.DEMO_A")',
         )
         dag = build_program_physical_dag(source)
 
-        self.assertEqual(dag.expected_target, normalize_table_name("DWM.DEMO_C"))
+        self.assertIsNone(dag.expected_target)
         self.assertEqual(dag.sinks, (normalize_table_name("DWM.DEMO_C"),))
+        self.assertGreater(len(dag.edges), 0)
 
     def test_self_reference_is_kept(self):
         dag = build_program_physical_dag(

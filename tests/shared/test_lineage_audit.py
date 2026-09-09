@@ -191,6 +191,31 @@ class LineageAuditTests(unittest.TestCase):
             {issue.issue_type for issue in result.issues},
         )
 
+    def test_ambiguous_three_part_program_name_does_not_create_target_issue(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DWM.RESULT_A:00",
+            script_code=(
+                'execute("INSERT INTO TMP_X SELECT * FROM ODS.SOURCE")\n'
+                'execute("INSERT INTO DWM.RESULT_A SELECT * FROM TMP_X")'
+            ),
+        )
+        dag = build_program_physical_dag(source)
+        result = audit_program_physical_dag(dag)
+
+        self.assertGreater(len(dag.edges), 0)
+        self.assertIsNone(dag.expected_target)
+        self.assertIsNone(result.expected_target)
+        self.assertNotIn(
+            IssueType.TARGET_MISMATCH,
+            {issue.issue_type for issue in result.issues},
+        )
+        self.assertNotIn(
+            IssueType.TARGET_NOT_FOUND,
+            {issue.issue_type for issue in result.issues},
+        )
+
     def test_target_not_found_does_not_turn_every_branch_into_orphan(self):
         result = audit_program_physical_dag(build_dag(TARGET_NOT_FOUND_PROGRAM))
 
