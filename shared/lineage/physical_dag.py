@@ -24,6 +24,7 @@ from shared.lineage.domain import (
 )
 from shared.lineage.lineage_builder import normalize_table_name, strip_sql_comments
 
+from .parser_backend import ParserBackend, analyze_sql
 from .sql_parser import (  # pyright: ignore[reportMissingImports]
     split_sql_statements,
 )
@@ -947,17 +948,18 @@ def _classify_statement(sanitized_sql: str) -> _StatementTarget:
     return _StatementTarget("unknown", None, None)
 
 
-def _parse_statement(
+def _parse_statement_with_ctes(
     statement: str,
     statement_index: int,
     line_number: int | None,
     column_number: int | None,
-) -> SQLStep:
+) -> tuple[SQLStep, tuple[str, ...]]:
     comment_free = strip_sql_comments(statement)
     sanitized = _mask_sql_string_literals(comment_free)
+    cte_names = _cte_names(sanitized)
     target_info = _classify_statement(sanitized)
     source_items = (
-        _find_sources(sanitized, _cte_names(sanitized))
+        _find_sources(sanitized, cte_names)
         if target_info.statement_type
         in {"insert", "merge", "create_table", "create_view", "update", "select"}
         else ()
@@ -974,50 +976,81 @@ def _parse_statement(
         evidence["line_number"] = line_number
     if column_number is not None:
         evidence["column_number"] = column_number
-    return SQLStep(
-        statement_index=statement_index,
-        statement_type=target_info.statement_type,
-        target=target_info.target,
-        sources=sources,
-        raw_target=target_info.raw_target,
-        raw_sources=raw_sources,
-        line_number=line_number,
-        column_number=column_number,
-        is_temporary=target_info.is_temporary,
-        insert_mode=target_info.insert_mode,
-        evidence=evidence,
+    return (
+        SQLStep(
+            statement_index=statement_index,
+            statement_type=target_info.statement_type,
+            target=target_info.target,
+            sources=sources,
+            raw_target=target_info.raw_target,
+            raw_sources=raw_sources,
+            line_number=line_number,
+            column_number=column_number,
+            is_temporary=target_info.is_temporary,
+            insert_mode=target_info.insert_mode,
+            evidence=evidence,
+        ),
+        tuple(sorted(cte_names)),
     )
 
 
-def _parse_sql_candidates(
+def _parse_statement(
+    statement: str,
+    statement_index: int,
+    line_number: int | None,
+    column_number: int | None,
+) -> SQLStep:
+    """兼容内部调用方，只返回原有 SQLStep。"""
+
+    step, _ = _parse_statement_with_ctes(
+        statement,
+        statement_index,
+        line_number,
+        column_number,
+    )
+    return step
+
+
+def _parse_sql_candidates_with_ctes(
     candidates: Iterable[_SQLCandidate],
-) -> tuple[SQLStep, ...]:
+) -> tuple[tuple[SQLStep, ...], tuple[tuple[str, ...], ...]]:
     steps: list[SQLStep] = []
+    ctes: list[tuple[str, ...]] = []
     statement_index = 0
     for candidate in candidates:
         comment_free = strip_sql_comments(candidate.text)
         for statement in split_sql_statements(comment_free):
             if not statement.strip():
                 continue
-            steps.append(
-                _parse_statement(
-                    statement,
-                    statement_index,
-                    candidate.line_number,
-                    candidate.column_number,
-                )
+            step, statement_ctes = _parse_statement_with_ctes(
+                statement,
+                statement_index,
+                candidate.line_number,
+                candidate.column_number,
             )
+            steps.append(step)
+            ctes.append(statement_ctes)
             statement_index += 1
-    return tuple(steps)
+    return tuple(steps), tuple(ctes)
 
 
-def extract_sql_steps(script_code: str) -> tuple[SQLStep, ...]:
+def _parse_sql_candidates(
+    candidates: Iterable[_SQLCandidate],
+) -> tuple[SQLStep, ...]:
+    steps, _ = _parse_sql_candidates_with_ctes(candidates)
+    return steps
+
+
+def extract_sql_steps(
+    script_code: str,
+    *,
+    backend: ParserBackend | None = None,
+) -> tuple[SQLStep, ...]:
     """从 raw SQL 或已知 Python SQL execution context 提取 SQL steps。"""
 
     if not isinstance(script_code, str) or not script_code.strip():
         return ()
-    extraction = _extract_python_candidates_with_reason(script_code)
-    return _parse_sql_candidates(extraction.candidates)
+    return analyze_sql(script_code, backend=backend).steps
 
 
 def _merge_edge_evidence(
@@ -1079,14 +1112,18 @@ def _normalized_expected_target(program_source: ProgramSource) -> str | None:
     return normalized or None
 
 
-def build_program_physical_dag(program_source: ProgramSource) -> ProgramPhysicalDAG:
+def build_program_physical_dag(
+    program_source: ProgramSource,
+    *,
+    backend: ParserBackend | None = None,
+) -> ProgramPhysicalDAG:
     """将一个 ``ProgramSource`` 转为保留 TMP/self/cycle 的 Physical 图。"""
 
     if not isinstance(program_source, ProgramSource):
         raise TypeError("program_source must be a ProgramSource")
 
-    extraction = _extract_python_candidates_with_reason(program_source.script_code)
-    steps = _parse_sql_candidates(extraction.candidates)
+    analysis = analyze_sql(program_source.script_code, backend=backend)
+    steps = analysis.steps
     nodes: dict[str, PhysicalNode] = {}
     edges: dict[tuple[str, str], PhysicalEdge] = {}
     written_targets: list[str] = []
@@ -1149,31 +1186,42 @@ def build_program_physical_dag(program_source: ProgramSource) -> ProgramPhysical
         steps=steps,
         sinks=sinks,
         expected_target=expected_target,
-        sql_candidate_count=len(extraction.candidates),
-        sql_extraction_reason=extraction.reason.value,
+        sql_candidate_count=analysis.candidate_count,
+        sql_extraction_reason=analysis.extraction_reason,
     )
 
 
 class ProgramPhysicalDAGBuilder:
     """面向后续调用方的轻量 builder facade。"""
 
+    def __init__(self, backend: ParserBackend | None = None) -> None:
+        self.backend = backend
+
     def build(self, program_source: ProgramSource) -> ProgramPhysicalDAG:
-        return build_program_physical_dag(program_source)
+        return build_program_physical_dag(program_source, backend=self.backend)
 
     def __call__(self, program_source: ProgramSource) -> ProgramPhysicalDAG:
         return self.build(program_source)
 
 
-def build_physical_dag(program_source: ProgramSource) -> ProgramPhysicalDAG:
+def build_physical_dag(
+    program_source: ProgramSource,
+    *,
+    backend: ParserBackend | None = None,
+) -> ProgramPhysicalDAG:
     """``build_program_physical_dag`` 的简短兼容入口。"""
 
-    return build_program_physical_dag(program_source)
+    return build_program_physical_dag(program_source, backend=backend)
 
 
-def extract_program_sql_steps(script_code: str) -> tuple[SQLStep, ...]:
+def extract_program_sql_steps(
+    script_code: str,
+    *,
+    backend: ParserBackend | None = None,
+) -> tuple[SQLStep, ...]:
     """``extract_sql_steps`` 的语义化兼容入口。"""
 
-    return extract_sql_steps(script_code)
+    return extract_sql_steps(script_code, backend=backend)
 
 
 __all__ = [

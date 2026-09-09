@@ -4,6 +4,9 @@ Phase 3 将一个 `ProgramSource` 的 `script_code` 转换为程序内部的
 Physical 图。这里记录的是程序可以静态确认的事实，不判断结果是否符合
 `expected_target`，也不把 TMP 折叠成正式资产之间的直连关系。
 
+SQL parser 的最小 backend 边界、Legacy adapter、失败语义和 cache 约定见
+[`lineage_parser_backend.md`](lineage_parser_backend.md)。
+
 ## API
 
 实现位于 `shared/lineage/physical_dag.py`：
