@@ -893,6 +893,38 @@ class LineageMaterializationTests(unittest.TestCase):
             [IssueType.SELF_REFERENCE],
         )
 
+    def test_expected_target_self_reference_materializes_without_audit_gate(self):
+        dag = build_dag(
+            """
+            execute("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_A")
+            execute("INSERT OVERWRITE TABLE DWA.DEMO_RESULT SELECT * FROM DWA.DEMO_RESULT")
+            """
+        )
+        audit = audit_dag(dag)
+
+        self.assertEqual(
+            [issue.issue_type for issue in audit.issues],
+            [IssueType.SELF_REFERENCE],
+        )
+        result = materialize_program(
+            dag,
+            audit,
+            batch_id="batch-self-reference-target",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            edge_pairs(result),
+            {
+                ("ODS.DEMO_A", EXPECTED_RESULT),
+                (EXPECTED_RESULT, EXPECTED_RESULT),
+            },
+        )
+        self.assertEqual(
+            [issue.issue_type for issue in result.issues],
+            [IssueType.SELF_REFERENCE],
+        )
+
     def test_materialization_does_not_mutate_physical_dag(self):
         dag = build_dag(ORPHAN_BRANCH_PROGRAM)
         before = (dag.nodes, dag.edges, dag.steps, dag.sinks, dag.expected_target)
