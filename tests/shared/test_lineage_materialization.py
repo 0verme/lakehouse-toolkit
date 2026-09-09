@@ -863,6 +863,16 @@ class LineageMaterializationTests(unittest.TestCase):
                 "DLO.SOURCE_A",
             ),
             (
+                "005:DWS_DWM.RESULT_A:1:00",
+                "DWM.RESULT_A",
+                "DLO.SOURCE_A",
+            ),
+            (
+                "005:DWS_DWUPRR.RESULT_A:1:00",
+                "DWUPRR.RESULT_A",
+                "DWM.SOURCE_A",
+            ),
+            (
                 "005:DLK_DLO.RESULT_A:1:00",
                 "DLO.RESULT_A",
                 "ODS.SOURCE_A",

@@ -378,6 +378,16 @@ class LineageProviderTests(unittest.TestCase):
                 "insert into DM.RESULT_A select 1",
             ),
             (
+                "005:DWS_DWM.RESULT_A:1:00",
+                "DWM.RESULT_A",
+                "insert into DWM.RESULT_A select 1",
+            ),
+            (
+                "005:DWS_DWUPRR.RESULT_A:1:00",
+                "DWUPRR.RESULT_A",
+                "insert into DWUPRR.RESULT_A select 1",
+            ),
+            (
                 "005:DLK_DLO.RESULT_A:1:00",
                 "DLO.RESULT_A",
                 "insert into DLO.RESULT_A select 1",
