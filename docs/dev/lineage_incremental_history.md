@@ -28,13 +28,17 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v5-program-namespace-normalization`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v6-program-namespace-and-audit-target-mismatch-semantics`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
-bump 到新的语义版本，并在本文记录原因。本次 v5 在固定 `005` canonical 四段
-`program_name` 的 target authority 前规范化已确认的 legacy namespace
-`DWS_DM -> DM` 与 `DLK_DLO -> DLO`；ambiguous 三段仍保持 unknown，step/suffix
-语义以及 Python AST 失败后的保守 legacy SQL literal recovery 不变。相同 source hash
-的旧 v4 facts 也必须 rebuild，避免复用 namespace normalization 前的 expected target。
+bump 到新的语义版本，并在本文记录原因。本次 v6 同时包含两项语义升级：在固定 `005`
+canonical 四段 `program_name` 的 target authority 前规范化已确认的 legacy namespace
+`DWS_DM -> DM` 与 `DLK_DLO -> DLO`；以及将 `expected_target_written` 与
+`expected_target_is_sink` 作为独立 Audit facts。expected target 已写入但因
+self-reference、downstream 或其它 branch 不是 graph-terminal sink 时，不再机械生成
+`TARGET_MISMATCH`；expected target 未写入且存在其它 formal sink 的真正 mismatch
+仍然保留。ambiguous 三段仍保持 unknown，step/suffix 语义以及 Python AST 失败后的
+保守 legacy SQL literal recovery 不变。相同 source hash 的旧 v4/v5 facts 都必须
+rebuild，避免复用 namespace normalization 或 audit target semantics 变更前的旧 facts。
 
 ## Incremental planner
 

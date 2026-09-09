@@ -575,31 +575,23 @@ class ProgramLineageAuditor:
             )
 
         expected_target = dag.expected_target
+        expected_target_written = (
+            expected_target is not None and expected_target in written_targets
+        )
+        expected_target_is_sink = (
+            expected_target is not None and expected_target in sinks
+        )
         actual_formal_sinks = list(formal_sinks)
-        if expected_target is not None and expected_target not in sinks:
-            if expected_target in written_targets:
-                issues.append(
-                    _make_issue(
-                        dag,
-                        IssueType.TARGET_MISMATCH,
-                        observed_at=observed_at,
-                        batch_id=batch_id,
-                        message=(
-                            f"Program {dag.program_source.program_name} writes "
-                            f"expected target {expected_target}, but it is not a "
-                            "final sink."
-                        ),
-                        evidence={
-                            "expected_target": expected_target,
-                            "actual_formal_sinks": actual_formal_sinks,
-                            "all_sinks": list(sinks),
-                            "written_targets": list(written_targets),
-                            "expected_target_written": True,
-                            "expected_target_is_sink": False,
-                        },
-                    )
-                )
-            elif actual_formal_sinks:
+        # ``sinks`` is a graph-terminal fact.  A written target that is not
+        # terminal must be explained by its graph facts, not relabeled as a
+        # target mismatch.  In particular, a self-loop must not imply that the
+        # expected target was written to the wrong place.
+        if (
+            expected_target is not None
+            and not expected_target_is_sink
+            and not expected_target_written
+        ):
+            if actual_formal_sinks:
                 issues.append(
                     _make_issue(
                         dag,
