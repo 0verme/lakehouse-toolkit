@@ -10,7 +10,11 @@
     "TMP may occur in physical endpoints but never in a business endpoint.",
     "A partial snapshot has no disappearance authority outside its declared scope.",
     "An unverified business collapse failure fails closed and cannot replace the previous active snapshot.",
-    "A successful empty snapshot is still a published active batch with zero edge counts."
+    "A successful empty snapshot is still a published active batch with zero edge counts.",
+    "Each fact table enforces row_key primary-key uniqueness and (batch_id, stable identity) uniqueness; the writer repeats duplicate validation before active switch.",
+    "Every published business row has collapse_depth >= 1; direct formal edges are 1, the three-hop TMP example is 3, multiple safe paths use the minimum hop count, and DWS v0.1 does not persist path_count.",
+    "Physical route, TMP label, depth, derivation hash, evidence order, source hash, or pipeline version changes do not update business last_changed_at when the stable business identity is unchanged.",
+    "Retention deletes only complete retired partitions beyond the configured horizon; active and rollback-window snapshots remain protected."
   ],
   "states": [
     {
@@ -187,7 +191,7 @@
       "business_result": "business derivation rebuild is required; no one-layer reuse",
       "issue_result": "new diagnostics are reconciled in the same candidate",
       "publish": true,
-      "active_result": "program_key and business_edge_key may remain stable while derived hashes/lifecycle timestamps change",
+      "active_result": "program_key and business_edge_key may remain stable; physical/projection metadata may change but business last_changed_at remains unchanged",
       "same_batch": true,
       "rebuild": true
     },
@@ -196,7 +200,7 @@
       "input": "Same source_hash but pipeline_version changes",
       "physical_result": "physical facts rebuild because parser/DAG/audit semantics may change",
       "business_result": "business facts rebuild from the new physical candidate",
-      "issue_result": "policy/rule evidence is regenerated without freezing #36 values",
+      "issue_result": "fact and policy evidence is regenerated using the CLOSED Issue #36 projection contract",
       "publish": true,
       "active_result": "no reuse based on hash alone",
       "same_batch": true,
@@ -209,7 +213,7 @@
       "business_result": "business_edge_key stays equal; physical_derivation_hash changes if topology labels are included",
       "issue_result": "no basename-only merge; diagnostics remain physical if affected",
       "publish": true,
-      "active_result": "business identity is stable; proposed last_changed_at changes for derived topology change",
+      "active_result": "business identity is stable; derived metadata may change but last_changed_at remains unchanged",
       "same_batch": true,
       "stable_business_identity": true
     },
@@ -217,10 +221,10 @@
       "id": "physical_path_change_same_endpoint",
       "input": "Physical route changes but business source/target remain equal",
       "physical_result": "new direct physical facts are materialized",
-      "business_result": "one same business_edge_key is rebuilt; depth/path_count/derivation hash are compared",
+      "business_result": "one same business_edge_key is rebuilt; current collapse_depth and derivation hash are compared; path_count is not a DWS field",
       "issue_result": "unsafe or incomplete path classification is diagnostic and may fail closed",
       "publish": true,
-      "active_result": "business identity remains stable; last_changed_at follows final derived-change decision",
+      "active_result": "business identity remains stable; current depth/derivation metadata is refreshed but last_changed_at remains unchanged",
       "same_batch": true,
       "stable_business_identity": true
     },

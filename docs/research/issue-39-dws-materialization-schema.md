@@ -218,70 +218,86 @@ physical fact；诊断在 `lineage_issue`，不通过 DDL `CHECK` 静默删除�
 | scope | `environment`, `source_profile` | 保留 collection profile，避免跨 profile program fact 合并 |
 | program | `program_key`, `program_name` | 该 business edge 来自哪个 static program |
 | dataset | `source_dataset_key`, `source_table`, `target_dataset_key`, `target_table` | 两端必须是明确的 formal `schema.table` |
-| collapse | `collapse_depth`, `path_count` | 派生路径摘要，见 4.4.1；不是 identity |
+| collapse | `collapse_depth` | 派生路径摘要，见 4.4.1；不是 identity；v0.1 不持久化 `path_count` |
 | derivation | `physical_derivation_hash`, `pipeline_version`, `source_hash` | 能从同 batch physical rows 重建；TMP path 不进入 stable key |
 | lifecycle | `batch_id`, `observed_at`, `first_seen_at`, `last_seen_at`, `last_changed_at`, `is_active`, `created_at`, `updated_at` | 与 physical facts 同批发布 |
 
 #### 4.4.1 collapse 与去重口径
 
-v0.1 的 proposed definition（其中带 `proposed` 的部分仍在 unresolved list 中）：
+v0.1 冻结以下定义：
 
 - 从一个程序的 physical DAG 中选择 formal source 到 formal target 的安全路径；
 - 经过 TMP 时继续遍历，遇到第一个 formal target 即形成一条 business edge；
-- direct formal-to-formal edge 的 `collapse_depth = 1`；
-- `DWF.A → TMP1 → TMP2 → DWUPRR.R` 的 `collapse_depth = 3`，即 physical
-  direct edge hop 数，**包含 source→TMP、TMP→target 的每一跳**；
-- 多条路径按 distinct physical node sequence 去重后只写一行；
-- `path_count` 如果保留，表示同一程序、同一 formal source/target、同一选定
-  snapshot 内的 distinct safe physical path 数，而不是 sample 数，也不是
-  `len(physical_paths)`；重复的 direct physical edge pair 先去重；
+- `collapse_depth` 是安全路径包含的 physical direct-edge hop 数，必须为正整数；
+  direct formal-to-formal edge 的 depth 为 `1`；
+- `DWF.A → TMP1 → TMP2 → DWUPRR.R` 的 `collapse_depth = 3`，包含
+  `source→TMP`、`TMP→TMP`、`TMP→target` 的每一跳；因此 DWS business row 的
+  `collapse_depth` 不允许为 `NULL`；
+- 多条安全路径按 distinct physical node sequence 去重后只写一行；同一 business row
+  的 `collapse_depth` 取这些安全路径中最小的 physical direct-edge hop 数，保证
+  派生结果 deterministic；
+- `path_count` **不属于 DWS v0.1**。当前 reference runtime 的 bounded evidence
+  可以继续保留自己的 `evidence.path_count`，但不能把它映射成 DWS 列，也不能用
+  bounded sample 长度代替完整 distinct path count；未来若要持久化，必须另立 contract；
 - `physical_derivation_hash` 对参与该 business edge 的 canonical physical direct
-  edge set 做 hash，供 rebuild/lifecycle 使用，但绝不进入 `business_edge_key`；
+  edge set 做 hash，作为可重建的 derived metadata，绝不进入 `business_edge_key`；
 - 不跨越另一个 formal asset 生成 transitive edge；不从 business edge 反推
   physical path；
 - cycle、self-reference、orphan、missing schema、ambiguous sink 或无法证明
-  complete collapse 时不猜测。受影响 business row 可以缺失，并在同 batch 写入
-  diagnostic issue；若 collapse 返回的是**不完整/不可验证的失败**而不是一个明确
-  的 negative result，publish gate 必须 fail closed（见第 6 节）。
+  complete collapse 时不猜测。受影响 business row 可以缺失，并在 collapse 已经
+  **完整、可验证地得出 negative result** 时随同 batch 写入 diagnostic issue；若
+  collapse 不完整、超限、抛错或无法验证，publish gate 必须 fail closed（见第 6 节）。
 
-`collapse_depth` 与 `path_count` 都不是 business identity。这样 TMP 改名不会改变
-business_edge_key；但如果 physical derivation hash、depth 或 path count 变化，
-可以在不改变 stable identity 的情况下记录 derived fact changed。
+`collapse_depth` 不是 business identity。TMP 改名或 physical route 变化不会改变
+`business_edge_key`；depth/hash 等值可以作为当前 batch 的 derived metadata，但不能
+单独触发业务关系的 semantic `last_changed_at`。
 
 #### 4.4.2 TMP 改名与 physical path 变化
 
-v0.1 proposed lifecycle：
+v0.1 冻结以下 lifecycle 口径：
 
 1. TMP 改名而 formal source/target 不变：`business_edge_key` 不变；physical
    `edge_key` 会按 physical endpoint 变化；
 2. `physical_derivation_hash` 包含参与 collapse 的 physical edge topology，因此
-   TMP 改名或 topology 变化会被识别为 derived input change；
-3. 如果 derivation hash、depth、path_count 和 pipeline version 都没有变化，纯
-   evidence 顺序变化不更新 business `last_changed_at`；
-4. 如果 derivation hash/depth/path_count 变化，则更新 business
-   `last_changed_at`；`last_seen_at` 在每个 active batch 都更新；
-5. source_hash 仅变化但 derived projection 完全一致时，program state 和
-   physical provenance 仍然 changed，business stable identity 不变；business
-   `last_changed_at` 是否跟随 source-only change，保持为 unresolved，默认不把
-   source_hash 单独当作业务关系变化。
+   TMP 改名或 topology 变化可以被识别为 derived metadata change；
+3. 纯 evidence 顺序变化不更新 business `last_changed_at`；
+4. physical route、TMP label、`collapse_depth` 或 derivation hash 变化，但同一
+   program/formal source/formal target 的 stable business identity 不变时，更新
+   当前 batch 的 projection、`last_seen_at`、`updated_at` 和 derived metadata，
+   **不更新 semantic `last_changed_at`**；
+5. `source_hash` 或 `pipeline_version` 变化会触发 physical/business rebuild，但
+   只要 business identity 与 formal endpoint 语义不变，也不更新 business
+   `last_changed_at`。该字段只表示 business identity 首次建立或 business semantic
+   projection 真正改变；stable identity 改变时以新的 business row/first observation
+   记录，不通过 physical metadata 猜测旧关系变化。
 
 ### 4.5 `dwp.lineage_issue`
 
-Issue 表覆盖 physical audit 与 business collapse diagnostic；`issue_layer` 区分
-来源层。不可验证的 publish gate failure 随 batch transaction rollback，不在这张
-事实表中留下半批 publish issue；需要保留失败运行摘要时另用 observability
-contract。关键字段：
+Issue 表保存 `AuditFact` 及其 `AuditPolicyResult` 的兼容 persistence projection，
+用于 physical audit 和已完整分类的 business-collapse diagnostic。
+不可验证的 `publish gate` failure 随 batch transaction rollback，不在这张事实表中留下
+半批 publish issue；
+需要保留失败运行摘要时另用 observability contract。关键字段：
 
-- `stable_issue_key` 是跨 batch lifecycle key，不能依赖 message、时间、severity
-  或 Python hash；
+- `stable_issue_key` 是跨 batch lifecycle key，不能依赖 message、evidence、
+  confidence、rule_version、severity、disposition、时间或 Python hash；
 - `program_key` / `program_name` 使 issue 与 ProgramIdentity 对齐；`node_key` /
   `branch_sink` 可以保留 TMP physical 证据；
-- `severity`、`disposition`、`rule_version`、`policy_version` 是为并行 Issue #36
-  预留的 nullable compatibility slots；本 Issue 不冻结 #36 最终值、枚举或通知
-  语义；
+- fact 字段使用 Issue #36 已关闭的 Audit Fact / Severity / Disposition contract：
+  `issue_type`、`confidence`、`rule_version`、message/evidence 和 stable identity；
+  `confidence` 只表示
+  `HIGH` / `MEDIUM` / `LOW` / `UNKNOWN` 的离散证据充分性，不是统计概率；
+- policy projection 字段为 `severity`、`disposition`、`policy_version`；
+  `disposition` 只使用 `OPEN`、`ACCEPTED`、`FALSE_POSITIVE`、`RESOLVED`，不把
+  policy 结果写回 fact identity；
+- `disposition_updated_at` / `disposition_updated_by` 记录人工处置 provenance，
+  可以为空；人工处置通过不可变的新 batch/history projection 记录，不原地改写旧 row；
+- `IssueLifecycleStatus` 的 `NEW` / `PERSISTING` / `RESOLVED` 是跨 snapshot 的
+  reconciliation 结果，与持久化的 `IssueDisposition` 不是同一个维度。DWS v0.1
+  不新增 `lifecycle_status` 列或新的 enum；`is_active` 与 history projection
+  继续表达当前可见性；
 - `first_seen_at` / `last_seen_at` / `last_changed_at` 与 `is_active` 用于
-  current/history。RESOLVED 可以由相邻 historical batch 推导，不能因为 active
-  switch 物理删除旧 issue；
+  current/history，不能因为 active switch 物理删除旧 issue；
 - `evidence_json` 使用 deterministic JSON text，不保存完整源码、凭据或连接串。
 
 ## 5. DWS physical design
@@ -319,8 +335,14 @@ skew；不按 `environment` / `source_profile` 分布，避免单 scope 偏斜�
   diagnostics 监控；
 - 按 source/target 查找可能需要跨 DN 访问，索引和真实 workload 再调；本 Issue
   不引入复杂 distribution key；
+- 每张事实表都冻结为：`PRIMARY KEY (row_key)`，并对同一 batch 内的 stable identity
+  建立 `UNIQUE (batch_id, stable_key)` 等价约束；`lineage_batch.batch_id` 唯一，
+  active batch 通过 filtered unique index 保证最多一个；同一 stable identity 可以
+  在不同历史 batch 重复出现；
 - `(batch_id, stable_key)` 的 logical uniqueness 不一定与 `row_key` 分布共址，
-  因此 writer/publish validation 仍是必需的，不能只依赖 DWS constraint。
+  因此 writer 必须在 active switch 前再次做 candidate duplicate validation，
+  不能只依赖 DWS constraint。constraint 与 pre-switch validation 都是本 v0.1
+  publish contract，不等待额外的 production proof 才改变语义。
 
 ### 5.3 Partition 与 retention
 
@@ -331,9 +353,14 @@ skew；不按 `environment` / `source_profile` 分布，避免单 scope 偏斜�
   partition，保证 active/history 生命周期与 retention 对齐；
 - DDL 中的 seed/max partition 只是 design placeholder，真正上线前必须由 DWS
   owner 创建目标月份边界，不得让写入落入未管理的默认分区；
-- retention 只允许删除已退休历史分区，不能删除 active batch；事实与 issue 的
-  retention 应保持可对账，#36 若要求更长 issue retention，以更长者为准；
-- failed candidate 由 transaction rollback 清理，不靠 retention 清半批。
+- retention 采用按时间分区的 rolling policy，但 v0.1 不把具体月份写死在 schema；
+  部署配置必须明确 history horizon，并至少覆盖 active batch、上一成功 snapshot
+  的 rollback window 和正在进行的对账窗口；
+- retention 只允许删除已退休且已超出 horizon 的完整历史分区，不能删除 active
+  batch；`lineage_issue` 的保留期不得短于其关联事实的对账需要，若 #36 另有更长
+  保留要求则取更长者；
+- failed candidate 由 transaction rollback 清理，不靠 retention 清半批；上述规则
+  是 v0.1 retention contract，具体 horizon 是运维配置而不是 schema 字段。
 
 ## 6. Publish / Snapshot contract
 
@@ -411,8 +438,9 @@ snapshot。若是 partial snapshot，则 scope 外事实仍必须 rebase 到 B�
   不变，`row_key` 因 batch 变化；
 - `source_hash` 变化、缺失或 pipeline version 变化：`CHANGED`，同一 ProgramIdentity
   重建 physical 与 business 两层；不能只刷新一层；
-- rebuild 输出 business key 相同但 derivation hash/depth/path_count 相同：保留
-  business first/last-changed 语义（source-only change 的最终策略见 unresolved）；
+- rebuild 输出 business key 相同：重新生成当前 batch 的 `collapse_depth` 与
+  derivation metadata，但按 4.4.2 保留 business `last_changed_at`；v0.1 不持久化
+  `path_count`；
 - pipeline semantic version 变化必须能触发 rebuild，即便 source hash 相同；
 - `job_key` 不进入 stable identity，不能用它决定 reuse。
 
@@ -474,7 +502,7 @@ SQLite 继续是 reference adapter，不是隐式 production contract。尤其�
 | `lineage_program_state` | environment、source_profile、program_name、source_hash、pipeline_version、first/last seen、last changed、batch、active | `id INTEGER AUTOINCREMENT` → `row_key`；三元组 → `program_key` | 不把 batch/runtime run 或 job key 当 program identity | DWS distribution、partition、active-batch join | 外部权威 program id 需独立 contract |
 | `lineage_edge` | environment/profile、program provenance、source/target label、evidence、source_hash、batch、observed/active | SQLite `LineageEdge` 行 → DWS `row_key`/`edge_key`；SQLite evidence text → DWS bounded text；增加 node kind/dataset key | 当前 SQLite `LineageEdge` 是 formal collapsed edge 且拒绝 TMP；DWS `lineage_edge` 是 physical direct edge，允许 TMP；不能直接 rename table 复用 | COLUMN/HASH、physical cycle/orphan preservation、physical batch contract | SQLite physical adapter / migration 另立 Issue |
 | `lineage_business_edge` | 无当前正式 SQLite production contract；只可复用未来 candidate/publish 抽象 | 新增 derived table；由同 batch physical edge 生成；需新 `row_key`/`business_edge_key`/derivation fields | 不把当前 `history.BusinessLineageEdge` diff value object 或临时验证表当 production schema；不把 query-time BFS 当 materialization | DWS formal endpoint、collapse metadata、physical derivation hash、同批 gate | SQLite reference adapter 何时实现由独立 Issue 决定 |
-| `lineage_issue` | environment/profile/program、issue type/message/evidence、stable/first/last/active、batch | `id` → `row_key`；nullable `stable_key` → production `stable_issue_key`；evidence canonicalization | #36 的 severity/disposition/policy 枚举不能在 #39 自行冻结 | issue layer 与 DWS active/history publish validation | #36 完成后的 policy alignment/backfill |
+| `lineage_issue` | environment/profile/program、issue type/message/evidence、stable/first/last/active、batch；以及 #36 fact/policy projection 字段 | `id` → `row_key`；nullable `stable_key` → production `stable_issue_key`；evidence canonicalization；旧 SQLite 缺失 policy 字段按 adapter legacy fallback 读取 | SQLite 的 `IssueLifecycleStatus` reconciliation 不是 DWS 新列；不把 runtime 旧扁平 projection 当成新的 fact/policy identity | #36 的 fact/policy 字段、人工 disposition provenance、DWS active/history publish validation | DWS adapter/backfill 的具体实现另立 Issue |
 | `lineage_closure` | 无 | 无 | 本 Issue 不创建、不把 closure 混入 business edge | 无 | Issue #40 future derived index |
 
 ## 9. Tests / contract lint scope
@@ -489,18 +517,20 @@ SQLite 继续是 reference adapter，不是隐式 production contract。尤其�
   duplicate identity 与 partial scoped deletion；
 - 不因本 Issue 重跑无关 parser 全量测试，不修改 `imp_lineage_edge` runtime。
 
-## 10. Unresolved decisions
+## 10. Frozen decisions
 
-| Decision | v0.1 proposal | 当前状态 / fallback |
-| --- | --- | --- |
-| #36 policy alignment | 保留 nullable `severity`、`disposition`、`rule_version`、`policy_version` slots | **等待 #36**；若冲突，以 #36 最终 contract 为准，不在 #39 回填猜测枚举 |
-| `collapse_depth` 定义 | distinct safe path 的 physical direct-edge hop 数；direct=1；示例链=3；多 path 初步取最小 hop | **待冻结**；在决定前可为 NULL，不能用 TMP 名称或 path sample 推导 identity |
-| `path_count` 是否进入 v0.1 | nullable `NUMERIC(38,0)`，精确 distinct safe physical path count；不安全时 NULL + issue | **待冻结**；如果真实规模/周期不支持精确统计，去掉字段或只保留 diagnostic，不以 sample 长度替代 |
-| physical path change 是否更新 business `last_changed_at` | TMP rename/topology 改变 `physical_derivation_hash`，建议更新；纯 evidence reorder 不更新 | **待业务 owner 决定**；stable business key 始终不变 |
-| source_hash-only change 的 business lifecycle | state/physical provenance changed；derived projection 不变时 business key 不变，last_changed 默认不更新 | **待确认**；不得把 source_hash 直接加入 business identity |
-| business collapse failure 的 publish 影响 | 明确 negative result 可带 issue 发布；不可验证/异常失败 fail closed 整个 batch | **待实现 Issue 决定**；无论选择哪种，physical/business 绝不能跨 batch active |
-| DWS distributed unique enforcement | DDL 写 logical unique；writer 在 candidate validation 强制检查 `(batch_id, stable_key)` | **待 GaussDB 8.1.3 non-prod proof**；不能为验证连接真实生产 |
-| history retention horizon | rolling time partitions；active 永不按 retention 删除 | **运维决策未冻结**；issue retention 不短于事实对账需要或 #36 更长策略 |
+本轮把以下语义冻结为 #39 v0.1 contract；它们不是待实现时再猜测的默认值：
+
+| Decision | v0.1 frozen contract |
+| --- | --- |
+| #36 policy alignment | 复用已 CLOSED 的 Issue #36：fact 保存 `issue_type`、`confidence`、`rule_version`、message/evidence/stable identity；policy projection 保存 `severity`、`disposition`、`policy_version`；人工处置保存 `disposition_updated_at` / `disposition_updated_by`。不把 `IssueLifecycleStatus` 当成 `IssueDisposition`，不新增 enum。 |
+| `collapse_depth` | 安全 business path 的 physical direct-edge hop 数；direct=1；`DWF.A → TMP1 → TMP2 → DWUPRR.R` 为 3；每个 DWS business row 必须为 `INTEGER >= 1`，不可验证时不写伪造 depth。 |
+| `path_count` | 不进入 DWS v0.1 `lineage_business_edge`。reference runtime 的 bounded `evidence.path_count` 与 DWS schema 有意不兼容；不得以 sample 长度填充，未来持久化必须另立 contract。 |
+| business `last_changed_at` | 只表示 business identity/semantic projection 的首次建立或真正业务语义变化。TMP rename、physical route、depth、derivation hash、evidence 顺序、source hash 或 pipeline version 变化，只更新当前 batch projection/metadata 和 `last_seen_at`，同一 stable business identity 不更新 `last_changed_at`。 |
+| business collapse failure | collapse 抛错、超限、超时、结果不完整或无法验证时 fail closed：candidate transaction 全部 rollback，旧 active snapshot 保持不变；只有完整、可验证的 negative result 才能带同 batch diagnostic publish。 |
+| DWS uniqueness | 五张表统一 `PRIMARY KEY (row_key)`；每张事实表对 `(batch_id, stable identity key)` 做 unique；`lineage_batch.batch_id` 唯一且 active batch 最多一个；writer 在 switch 前必须再次校验 duplicate stable identity。分布 key 不改变这些逻辑约束。 |
+| retention | 使用 rolling time partitions；schema 不写死具体月份。运维配置必须保留 active batch、上一成功 snapshot 的 rollback window 和对账窗口；只删除超出 horizon 的完整 retired partitions，issue retention 不短于事实对账需要或 #36 更长要求。 |
+| non-production proof | GaussDB 8.1.3 的 DDL、partition、partial unique index 和 distributed unique 行为必须在非生产环境验证；这不改变本轮已冻结的逻辑 contract，也不连接真实 DWS。 |
 
 ## 11. 建议独立 Issue：实现 business collapse / publisher
 
@@ -512,8 +542,9 @@ SQLite 继续是 reference adapter，不是隐式 production contract。尤其�
 
 1. 消费同一 candidate batch 的 physical DAG / `lineage_edge`，不重写 parser 或
    DatasetIdentity；
-2. 实现 formal boundary、TMP traversal、direct-hop depth、distinct path count、
-   deterministic `physical_derivation_hash` 和 stable business key；
+2. 实现 formal boundary、TMP traversal、direct-hop depth、deterministic
+   `physical_derivation_hash` 和 stable business key；不要把 bounded sample 当成
+   DWS `path_count`；
 3. 对 cycle、self-reference、orphan、missing schema、ambiguous sink 提供可解释
    diagnostic；禁止 basename/fuzzy guess；
 4. 实现 candidate validation 与 physical/business 同 batch atomic publish，collapse
@@ -524,11 +555,13 @@ SQLite 继续是 reference adapter，不是隐式 production contract。尤其�
 Acceptance criteria：
 
 - `DWF.A → TMP1 → TMP2 → DWUPRR.R` 产生一个 formal business edge，TMP 不在业务
-  endpoint，physical rows 三条完整保留；
-- direct formal edge 的 depth=1；path_count 不把 bounded sample 当完整计数；
-- TMP rename 不改变 `business_edge_key`，但按最终 lifecycle decision 处理 derived
-  change；
-- unsafe collapse 不产生猜测 edge，并有同 batch issue；不可验证失败不切换 active；
+  endpoint，physical rows 三条完整保留，`collapse_depth=3`；
+- direct formal edge 的 `collapse_depth=1`；DWS v0.1 不持久化 `path_count`，不得把
+  bounded sample 当完整计数；
+- TMP rename 不改变 `business_edge_key`；derived metadata 可以变化，但同一业务
+  identity 的 `last_changed_at` 不因 physical path 变化更新；
+- complete negative collapse 不产生猜测 edge，并可有同 batch issue；不可验证失败
+  整个 candidate rollback，不切换 active，也不留下半批 issue；
 - physical 与 business 永远不出现跨 batch active；失败后上一 snapshot 可完整读取。
 
 这个独立 Issue 不在本轮实现，也不包含 `lineage_closure`、parser、OpenLineage 或

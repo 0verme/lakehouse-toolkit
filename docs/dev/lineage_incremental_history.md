@@ -12,6 +12,22 @@ restore、Batch 与 runtime boundary 的完整 V1 contract 见
 > 派生 `dwp.lineage_business_edge`；两者不能跨 batch active。详见
 > [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
 > 本说明不改变现有 `imp_lineage_edge` runtime，也不创建 closure。
+>
+> **Issue #36 alignment:** #36 已 CLOSED；DWS `lineage_issue` 复用其 Audit Fact /
+> Severity / Disposition contract 的 fact/policy
+> projection：fact 保存 `issue_type`、`confidence`、`rule_version`、message/evidence
+> 和 stable identity；policy 保存 `severity`、`disposition`、`policy_version`；人工
+> 处置 provenance 使用 `disposition_updated_at` / `disposition_updated_by`。这里的
+> `IssueLifecycleStatus`（`NEW` / `PERSISTING` / `RESOLVED`）仍是跨 snapshot 的
+> reconciliation 结果，不是 `IssueDisposition`（`OPEN` / `ACCEPTED` /
+> `FALSE_POSITIVE` / `RESOLVED`）。
+>
+> DWS business projection 的 `last_changed_at` 只表示业务 identity/semantic
+> projection 的首次建立或真正变化；TMP rename、physical route、collapse depth、
+> derivation hash、source hash 或 pipeline version 变化，在 stable business identity
+> 不变时只更新当前 batch metadata/`last_seen_at`，不更新该字段。DWS history 使用
+> rolling partitions；active、上一成功 snapshot 的 rollback window 和对账窗口受
+> retention 保护，具体 horizon 属于运维配置而非 runtime adapter 默认值。
 
 ## Program identity 与 source hash
 
@@ -142,9 +158,11 @@ reconciliation：
   `PERSISTING`；
 - 当前缺失：旧历史 issue 不删除，返回 `RESOLVED` 记录及推导的 `resolved_at`。
 
-SQLite 中的旧 `lineage_issue` 行不会被回写；resolved 是由两个 historical
-snapshot 推导的。`IssueLifecycle.age_days` 可识别持续时间，因而可以查询
-`ORPHAN_BRANCH` 持续至少 30 天的 evidence，但本阶段不实现通知系统。
+SQLite 中的旧 `lineage_issue` 行不会被回写；这里的 `RESOLVED` 是由两个
+historical snapshot 推导的 `IssueLifecycleStatus`，不是自动把 policy
+`IssueDisposition` 当成同一个 enum。DWS 与 #36 保留四个 disposition 值，并把人工
+处置作为不可变的新 batch projection。`IssueLifecycle.age_days` 可识别持续时间，
+因而可以查询 `ORPHAN_BRANCH` 持续至少 30 天的 evidence，但本阶段不实现通知系统。
 
 ### `LINEAGE_BRANCH_BROKEN`
 

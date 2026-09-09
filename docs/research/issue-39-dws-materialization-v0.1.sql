@@ -222,8 +222,7 @@ CREATE TABLE dwp.lineage_business_edge (
     source_table            VARCHAR(512) NOT NULL,
     target_dataset_key      VARCHAR(128) NOT NULL,
     target_table            VARCHAR(512) NOT NULL,
-    collapse_depth          INTEGER,
-    path_count              NUMERIC(38, 0),
+    collapse_depth          INTEGER NOT NULL,
     physical_derivation_hash VARCHAR(128) NOT NULL,
     source_hash             VARCHAR(128),
     pipeline_version        VARCHAR(256),
@@ -246,9 +245,7 @@ CREATE TABLE dwp.lineage_business_edge (
             AND target_dataset_key IS NOT NULL
         ),
     CONSTRAINT ck_lineage_business_edge_depth
-        CHECK (collapse_depth IS NULL OR collapse_depth >= 1),
-    CONSTRAINT ck_lineage_business_edge_path_count
-        CHECK (path_count IS NULL OR path_count >= 1),
+        CHECK (collapse_depth >= 1),
     CONSTRAINT ck_lineage_business_edge_identity
         CHECK (
             LENGTH(TRIM(environment)) > 0
@@ -285,28 +282,28 @@ CREATE INDEX dwp.ix_lineage_business_edge_stable_key
 COMMENT ON TABLE dwp.lineage_business_edge IS
     'Issue #39 derived formal business edge; never a physical source of truth and never a TMP endpoint.';
 COMMENT ON COLUMN dwp.lineage_business_edge.collapse_depth IS
-    'Proposed physical direct-edge hop count; nullable until v0.1 depth decision is frozen.';
-COMMENT ON COLUMN dwp.lineage_business_edge.path_count IS
-    'Optional exact distinct safe physical path count; NULL means not safely computed, never a sample length.';
+    'Frozen physical direct-edge hop count; direct formal edge is 1 and every business row is >= 1.';
 COMMENT ON COLUMN dwp.lineage_business_edge.physical_derivation_hash IS
-    'Hash of canonical contributing physical edges; not part of business_edge_key.';
+    'Hash of canonical contributing physical edges; derived metadata, not part of business_edge_key or last_changed_at semantics.';
+COMMENT ON COLUMN dwp.lineage_business_edge.last_changed_at IS
+    'Business semantic-change timestamp; physical route, TMP label, depth, hash, source hash or pipeline version changes do not update it when identity is unchanged.';
 
 -- ---------------------------------------------------------------------------
--- 4. Issues: physical/business diagnostics and #36 compatibility slots
+-- 4. Issues: Issue #36 fact/policy projection and lifecycle history
 -- ---------------------------------------------------------------------------
 CREATE TABLE dwp.lineage_issue (
     row_key                 VARCHAR(128) NOT NULL,
     stable_issue_key        VARCHAR(128) NOT NULL,
-    issue_layer             VARCHAR(32) NOT NULL DEFAULT 'PHYSICAL',
     environment             VARCHAR(128) NOT NULL,
     source_profile          VARCHAR(256) NOT NULL,
     program_key             VARCHAR(128) NOT NULL,
     program_name            VARCHAR(512) NOT NULL,
     issue_type              VARCHAR(128) NOT NULL,
-    severity                VARCHAR(32),
-    disposition             VARCHAR(32),
-    rule_version            VARCHAR(256),
-    policy_version          VARCHAR(256),
+    confidence              VARCHAR(16) NOT NULL,
+    rule_version            VARCHAR(256) NOT NULL,
+    severity                VARCHAR(32) NOT NULL,
+    disposition             VARCHAR(32) NOT NULL,
+    policy_version          VARCHAR(256) NOT NULL,
     node_key                VARCHAR(512),
     branch_sink             VARCHAR(512),
     message                 TEXT NOT NULL,
@@ -315,14 +312,28 @@ CREATE TABLE dwp.lineage_issue (
     first_seen_at           TIMESTAMP(6) WITH TIME ZONE NOT NULL,
     last_seen_at            TIMESTAMP(6) WITH TIME ZONE NOT NULL,
     last_changed_at         TIMESTAMP(6) WITH TIME ZONE,
+    disposition_updated_at  TIMESTAMP(6) WITH TIME ZONE,
+    disposition_updated_by  VARCHAR(256),
     is_active               BOOLEAN NOT NULL DEFAULT FALSE,
     created_at              TIMESTAMP(6) WITH TIME ZONE NOT NULL,
     updated_at              TIMESTAMP(6) WITH TIME ZONE NOT NULL,
     CONSTRAINT pk_lineage_issue PRIMARY KEY (row_key),
     CONSTRAINT uq_lineage_issue_batch_key
         UNIQUE (batch_id, stable_issue_key),
-    CONSTRAINT ck_lineage_issue_layer
-        CHECK (issue_layer IN ('PHYSICAL', 'BUSINESS')),
+    CONSTRAINT ck_lineage_issue_type
+        CHECK (issue_type IN (
+            'ORPHAN_BRANCH',
+            'MULTI_SINK_CANDIDATE',
+            'TARGET_NOT_FOUND',
+            'TARGET_MISMATCH',
+            'CYCLE_DETECTED',
+            'SELF_REFERENCE',
+            'LINEAGE_BRANCH_BROKEN'
+        )),
+    CONSTRAINT ck_lineage_issue_confidence
+        CHECK (confidence IN ('HIGH', 'MEDIUM', 'LOW', 'UNKNOWN')),
+    CONSTRAINT ck_lineage_issue_disposition
+        CHECK (disposition IN ('OPEN', 'ACCEPTED', 'FALSE_POSITIVE', 'RESOLVED')),
     CONSTRAINT ck_lineage_issue_identity
         CHECK (
             LENGTH(TRIM(environment)) > 0
@@ -330,6 +341,11 @@ CREATE TABLE dwp.lineage_issue (
             AND LENGTH(TRIM(program_key)) > 0
             AND LENGTH(TRIM(issue_type)) > 0
             AND LENGTH(TRIM(stable_issue_key)) > 0
+            AND LENGTH(TRIM(confidence)) > 0
+            AND LENGTH(TRIM(rule_version)) > 0
+            AND LENGTH(TRIM(severity)) > 0
+            AND LENGTH(TRIM(disposition)) > 0
+            AND LENGTH(TRIM(policy_version)) > 0
         )
 )
 WITH (ORIENTATION = ROW)
@@ -352,15 +368,21 @@ CREATE INDEX dwp.ix_lineage_issue_branch
     ON dwp.lineage_issue (environment, source_profile, branch_sink, is_active);
 
 COMMENT ON TABLE dwp.lineage_issue IS
-    'Physical/business diagnostics with nullable #36 policy compatibility slots.';
-COMMENT ON COLUMN dwp.lineage_issue.severity IS
-    'Reserved compatibility slot; final severity policy belongs to Issue #36.';
-COMMENT ON COLUMN dwp.lineage_issue.disposition IS
-    'Reserved compatibility slot; final disposition policy belongs to Issue #36.';
+    'Issue #36 AuditFact plus AuditPolicyResult projection; IssueLifecycleStatus remains a derived reconciliation result.';
+COMMENT ON COLUMN dwp.lineage_issue.confidence IS
+    'Issue #36 discrete evidence sufficiency: HIGH, MEDIUM, LOW or UNKNOWN; not a probability.';
 COMMENT ON COLUMN dwp.lineage_issue.rule_version IS
-    'Reserved compatibility slot; final rule version contract belongs to Issue #36.';
+    'Issue #36 detector fact version; excluded from stable_issue_key.';
+COMMENT ON COLUMN dwp.lineage_issue.severity IS
+    'Issue #36 policy projection risk level; not a detector fact.';
+COMMENT ON COLUMN dwp.lineage_issue.disposition IS
+    'Issue #36 policy/business disposition: OPEN, ACCEPTED, FALSE_POSITIVE or RESOLVED.';
 COMMENT ON COLUMN dwp.lineage_issue.policy_version IS
-    'Reserved compatibility slot; final policy version contract belongs to Issue #36.';
+    'Issue #36 policy projection version; excluded from stable_issue_key.';
+COMMENT ON COLUMN dwp.lineage_issue.disposition_updated_at IS
+    'Optional manual disposition provenance timestamp; manual updates use a new batch.';
+COMMENT ON COLUMN dwp.lineage_issue.disposition_updated_by IS
+    'Optional manual disposition provenance actor; not part of stable_issue_key.';
 
 -- ---------------------------------------------------------------------------
 -- 5. Publish/query notes (not executable migration)

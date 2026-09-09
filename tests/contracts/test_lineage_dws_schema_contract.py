@@ -91,11 +91,33 @@ class DwsSchemaContractTests(unittest.TestCase):
 
         self.assertIn("source_dataset_key      VARCHAR(128) NOT NULL", business)
         self.assertIn("target_dataset_key      VARCHAR(128) NOT NULL", business)
-        self.assertIn("collapse_depth", business)
-        self.assertIn("path_count", business)
+        self.assertRegex(
+            business,
+            r"collapse_depth\s+INTEGER NOT NULL",
+        )
+        self.assertIn("CHECK (collapse_depth >= 1)", business)
+        self.assertNotRegex(business, r"\bpath_count\b")
         self.assertIn("physical_derivation_hash", business)
         self.assertNotIn("source_node_kind", business)
         self.assertNotIn("target_node_kind", business)
+
+    def test_lineage_issue_reuses_issue36_fact_policy_and_manual_audit_contract(self):
+        issue = table_block(self.ddl, "lineage_issue")
+        for field_pattern in (
+            r"confidence\s+VARCHAR\(16\) NOT NULL",
+            r"rule_version\s+VARCHAR\(256\) NOT NULL",
+            r"severity\s+VARCHAR\(32\) NOT NULL",
+            r"disposition\s+VARCHAR\(32\) NOT NULL",
+            r"policy_version\s+VARCHAR\(256\) NOT NULL",
+            r"disposition_updated_at\s+TIMESTAMP",
+            r"disposition_updated_by\s+VARCHAR\(256\)",
+        ):
+            with self.subTest(field=field_pattern):
+                self.assertRegex(issue, field_pattern)
+        self.assertIn("HIGH', 'MEDIUM', 'LOW', 'UNKNOWN", issue)
+        self.assertIn("OPEN', 'ACCEPTED', 'FALSE_POSITIVE', 'RESOLVED", issue)
+        self.assertNotIn("issue_layer", issue)
+        self.assertNotIn("lifecycle_status", issue)
 
     def test_business_edge_has_required_lifecycle_fields(self):
         business = table_block(self.ddl, "lineage_business_edge")
@@ -134,7 +156,7 @@ class DwsSchemaContractTests(unittest.TestCase):
             "TMP / intermediate table",
             "source of truth",
             "同一 batch",
-            "等待 #36",
+            "Issue #36",
             "建议独立 Issue",
         ):
             with self.subTest(phrase=phrase):
@@ -206,6 +228,29 @@ class DwsSchemaContractTests(unittest.TestCase):
         self.assertTrue(
             cases["inactive_edge_contamination"]["query_requires_active_batch_join"]
         )
+
+    def test_frozen_business_lifecycle_semantics(self):
+        business = table_block(self.ddl, "lineage_business_edge")
+        self.assertRegex(business, r"collapse_depth\s+INTEGER NOT NULL")
+        self.assertNotRegex(business, r"\bpath_count\b")
+        self.assertIn("last_changed_at", business)
+        invariants = "\n".join(self.matrix["invariants"])
+        for invariant in (
+            "Every published business row has collapse_depth >= 1",
+            "does not persist path_count",
+            "do not update business last_changed_at",
+        ):
+            with self.subTest(invariant=invariant):
+                self.assertIn(invariant, invariants)
+        for case_id in ("tmp_rename", "physical_path_change_same_endpoint"):
+            self.assertIn(
+                "last_changed_at remains unchanged",
+                next(
+                    case["active_result"]
+                    for case in self.matrix["cases"]
+                    if case["id"] == case_id
+                ),
+            )
 
     def test_lifecycle_matrix_covers_derived_rebuild_without_identity_guessing(self):
         cases = {case["id"]: case for case in self.matrix["cases"]}

@@ -82,8 +82,11 @@ DWM.B → DWA.C
 
 ### Bounded Evidence Contract
 
-`evidence.path_count` 是该 formal edge 发现的完整 collapsed physical path 数量，
-不是 sample 的长度。为避免一个 edge 携带无限 JSON，`physical_paths` 只保留最多 `100`
+`evidence.path_count` 是当前 SQLite/reference runtime 中该 formal edge 发现的完整
+collapsed physical path 数量，不是 sample 的长度。它是旧 `LineageEdge` evidence
+contract 的 runtime 字段，不是 Issue #39 DWS `lineage_business_edge` 的 schema
+字段；DWS v0.1 明确不持久化 `path_count`，不能把 bounded sample 映射成生产列。
+为避免一个 edge 携带无限 JSON，`physical_paths` 只保留最多 `100`
 条按稳定 traversal 顺序取得的 deterministic representative sample，并用
 `physical_paths_truncated` 标识是否还有未保存的 path；explicit fallback 仍会按 bounded
 accumulator 保留 canonical 最小 sample。`source`、`target`、程序身份、`path_count` 和
@@ -93,8 +96,8 @@ statement evidence summary 不因 sample 截断而丢失。
 `statement_indices` 默认各保留最多 `200` 个 canonical 值，并分别用
 `physical_edge_pairs_truncated`、`collapsed_tmp_nodes_truncated` 和
 `statement_indices_truncated` 表示截断。SQLite 仍将 evidence 作为 JSON 文本保存，
-因此没有额外的表迁移；consumer 必须使用 `path_count` 判断完整规模，不能用
-`len(physical_paths)` 代替。
+因此没有额外的表迁移；SQLite consumer 必须使用 runtime `path_count` 判断完整规模，
+不能用 `len(physical_paths)` 代替；DWS consumer 不得假设存在同名列。
 
 Materialization 对无环 TMP 子图使用 deterministic DAG dynamic programming：formal
 boundary 的 exact `path_count`、能参与该 boundary 的 physical edge/node summary 都由
@@ -235,19 +238,28 @@ repository 可以复用 `MaterializationBatch`，不必绑定 SQLite。
 
 ### `lineage_issue`
 
-表中保存：
+表中保存 AuditFact 与 Issue #36 policy projection 的兼容字段：
 
 ```text
 environment, source_profile, program_name
-issue_type, severity, stable_key
+issue_type, confidence, rule_version, stable_key
+severity, disposition, policy_version
 node_key, branch_sink, message, evidence
+disposition_updated_at, disposition_updated_by
 batch_id, first_seen_at, last_seen_at, is_active
 ```
+
+`confidence` 是 `HIGH` / `MEDIUM` / `LOW` / `UNKNOWN` 的离散证据充分性，不是
+统计概率；`severity`、`disposition`、`policy_version` 属于 policy projection，
+不进入 fact stable identity。`IssueLifecycleStatus` 的 `NEW` / `PERSISTING` /
+`RESOLVED` 是跨 snapshot reconciliation 结果，不等于 `IssueDisposition` 的
+`OPEN` / `ACCEPTED` / `FALSE_POSITIVE` / `RESOLVED`。
 
 索引覆盖 `stable_key`、`batch_id + is_active` 以及 environment/profile/program/
 issue_type/active scope。`evidence` 使用 `json.dumps(..., sort_keys=True,
 separators=(",", ":"))` 形式保存，不使用 pickle、`repr()` 或 Python `hash()`，也
-不会复制完整 `script_code`。
+不会复制完整 `script_code`。上述 DWS 字段语义复用已 CLOSED 的 Issue #36；本节
+不改变 SQLite runtime。
 
 ### `lineage_batch`
 
