@@ -16,7 +16,7 @@
 | 段 | 语义 | 是否进入 Dataset Identity | 是否进入 expected order |
 | --- | --- | --- | --- |
 | `005` | 固定 legacy marker；没有其它合法 prefix 枚举 | 否 | 否 |
-| `<logical_target>` | declared logical final target，必须是无歧义的 formal `schema.table` | 只作为 target authority 输入 | 否 |
+| `<logical_target>` | declared logical final target；四段时是 authoritative，三段时只作为 candidate | 四段时才作为 target authority 输入 | 否 |
 | `<step_seq>` | positive integer 的 Program Step 顺序 | 否 | 是，只有 expected evidence |
 | `<opaque_suffix>` | 不稳定的 custom metadata，规范值通常为 `00` | 否 | 否 |
 
@@ -53,6 +53,7 @@ physical schema。这个 helper 只服务于 program-name-derived target，Datas
 ```text
 program_name_semantics
 logical_target
+target_hint
 step_seq / program_step_seq
 opaque_suffix
 program_name_diagnostics
@@ -69,10 +70,20 @@ program-name target authority：
 ```
 
 三段及其它非 canonical 形态（例如 `005:DWS_DWM.RESULT_A:00`、
-`005:DWM.RESULT_A:00`）即使第二段看起来像 formal `schema.table`，也不会猜测
-logical target 或 step，而是返回 `logical_target=None`、`step_seq=None` 并记录
-`PROGRAM_NAME_FORMAT_UNSUPPORTED` 等格式诊断。它们是 program-name target
-unresolved，不等同于由于缺少 SQL graph evidence 而产生的 `TARGET_NOT_FOUND`。
+`005:DWM.RESULT_A:00`）即使第二段看起来像 formal `schema.table`，也不会授予
+logical target authority 或恢复 step；三段只额外暴露复用现有 namespace
+normalization 的 `target_hint`：
+
+```text
+005:DWS_DM.RESULT_A:00
+  logical_target=None
+  target_hint=DM.RESULT_A
+  step_seq=None
+```
+
+三段仍记录 `PROGRAM_NAME_FORMAT_UNSUPPORTED` 等格式诊断。`target_hint` 是
+candidate，不等同于 `expected_target`，也不等同于由于缺少 SQL graph evidence
+而产生的 `TARGET_NOT_FOUND`。
 
 第三段只接受正整数，不设固定最大值，也不要求从 `1` 开始或连续。`0`、负数、
 小数和非数字值只产生 `PROGRAM_NAME_STEP_INVALID`；target 仍可保留。
@@ -96,21 +107,61 @@ PROGRAM_NAME_FORMAT_UNSUPPORTED
 ## Target authority
 
 当 `ProgramSource.expected_target` 有 explicit/provider 值时，它优先；否则仅使用
-canonical 四段 `program_name` 的 `logical_target`；两者都没有时保持 unknown，并
-继续使用已有的 Physical DAG evidence。程序名 target 只影响 expected target hint，
-不替代 Physical DAG 中的其它 formal sinks。
+canonical 四段 `program_name` 的 `logical_target`；三段 `target_hint` 永远不会
+写入 `expected_target`。没有 authoritative target 时继续使用已有的 Physical DAG
+事实，不把 hint 提升为业务声明。
 
 因此：
 
 ```text
 explicit/provider target
-    -> program-name logical_target
+    -> canonical four-part program-name logical_target
         -> existing Physical DAG evidence
+
+three-part target_hint
+    -> only unique exact multi-sink materialization selection
 ```
 
-这条顺序不会因为 `step_seq` 或 suffix 改变。`005`、step 和 suffix 均不进入
+这条顺序不会因为 `step_seq` 或 suffix 改变。`005`、step、hint 和 suffix 均不进入
 `DatasetIdentity`；`ProgramIdentity` 仍保留完整 raw `program_name`。非 canonical
 program name 不会因为存在可解析的第二段而获得 target authority。
+
+## Target hint 与 multi-sink selection
+
+`target_hint` 只允许作为独立 selection fact，不能执行以下替换：
+
+```python
+if expected_target is None:
+    expected_target = target_hint
+```
+
+Audit 保留 `expected_target=None`，并在结果中分开暴露：
+
+```text
+TargetSelectionResult(
+    authoritative_target=None,
+    target_hint="DM.RESULT_A",
+    selected_target="DM.RESULT_A",
+    selection_mode="UNIQUE_HINT",
+)
+```
+
+只有以下条件全部满足时，才选择 formal sink 作为
+`selected_materialization_target`：
+
+```text
+expected_target is None
+AND formal_sinks count > 1
+AND normalized target_hint exact match formal_sinks
+AND exact match count == 1
+```
+
+无匹配或多个 exact candidate 时 `selection_mode=NONE` 且不猜。无
+authoritative target 的单 formal sink 保持原有 materialization 行为，不因 hint
+增加 gating。`MULTI_SINK_CANDIDATE` 是 graph fact，仍然保留；hint selection
+不会生成 `TARGET_MISMATCH`、`TARGET_NOT_FOUND` 或新的 authoritative
+`ORPHAN_BRANCH` 语义。Materialization 只消费 Audit/Target Selection result，
+不会重新解析 `program_name` 或复制 namespace registry。
 
 ## Logical processing unit 与 Program Step
 

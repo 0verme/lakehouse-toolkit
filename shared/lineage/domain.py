@@ -115,10 +115,11 @@ class ProgramNameSemantics:
 
     ``logical_target`` 是唯一可以参与 target authority 的 program-name
     字段；当 raw target 使用已确认的 legacy namespace wrapper 时，
-    ``logical_target`` 保存规范化后的 physical ``schema.table``。raw token
-    不单独进入 identity，仍由原始 ``program_name`` 保留 provenance。
-    ``legacy_marker`` 和 ``opaque_suffix`` 都不参与 Dataset Identity，
-    ``step_seq`` 也只表达 expected order evidence，不表达 scheduler fact。
+    ``logical_target`` 保存规范化后的 physical ``schema.table``。三段 legacy
+    shape 只把同一规范化结果暴露为 ``target_hint``，不授予 target authority。
+    raw token 不单独进入 identity，仍由原始 ``program_name`` 保留 provenance。
+    ``legacy_marker``、``target_hint`` 和 ``opaque_suffix`` 都不参与 Dataset
+    Identity；``step_seq`` 也只表达 expected order evidence，不表达 scheduler fact。
     """
 
     program_name: str
@@ -127,6 +128,7 @@ class ProgramNameSemantics:
     step_seq: int | None
     opaque_suffix: str | None
     diagnostics: tuple[ProgramNameDiagnostic, ...] = ()
+    target_hint: str | None = None
 
     @property
     def target_resolved(self) -> bool:
@@ -185,9 +187,9 @@ def parse_program_name(program_name: object) -> ProgramNameSemantics:
     """按固定 ``005`` grammar 以 conservative 策略解析程序名。
 
     只有严格四段形态才足以授予 program-name target authority；四段中的 raw
-    target 会先经过显式 legacy namespace normalization。三段及其它非 canonical
-    形态即使第二段看起来像 ``schema.table``，也只保留格式诊断，不猜测 logical
-    target 或 step，避免把未知 legacy grammar 变成错误 target。
+    target 会先经过显式 legacy namespace normalization。三段形态会把第二段同样
+    规范化为 ``target_hint``，但仍不产生 ``logical_target`` 或 ``step``，避免把
+    未知 legacy grammar 变成错误的 authoritative target。
     """
 
     normalized_name = decode_code(program_name).strip()
@@ -207,6 +209,7 @@ def parse_program_name(program_name: object) -> ProgramNameSemantics:
             logical_target=None,
             step_seq=None,
             opaque_suffix=None,
+            target_hint=None,
             diagnostics=tuple(diagnostics),
         )
 
@@ -228,6 +231,7 @@ def parse_program_name(program_name: object) -> ProgramNameSemantics:
             logical_target=None,
             step_seq=None,
             opaque_suffix=None,
+            target_hint=candidate_target if len(parts) == 3 else None,
             diagnostics=tuple(diagnostics),
         )
 
@@ -252,15 +256,22 @@ def parse_program_name(program_name: object) -> ProgramNameSemantics:
         logical_target=logical_target,
         step_seq=step_seq,
         opaque_suffix=opaque_suffix,
+        target_hint=candidate_target,
         diagnostics=tuple(diagnostics),
     )
 
 
 # 这些函数是已有调用方使用的语义化入口；实现统一委托给 target-first parser。
 def extract_program_declared_target_token(program_name: object) -> str | None:
-    """仅从 canonical 四段 legacy 程序名提取 logical target。"""
+    """仅从 canonical 四段 legacy 程序名提取 authoritative logical target。"""
 
     return parse_program_name(program_name).logical_target
+
+
+def extract_program_target_hint(program_name: object) -> str | None:
+    """提取不授予 authority 的三段/四段规范化 target candidate。"""
+
+    return parse_program_name(program_name).target_hint
 
 
 def normalize_declared_target_from_program_name(
@@ -539,7 +550,9 @@ class ProgramSource:
 
     ``environment``、``source_profile``、``program_name`` 和 ``script_code``
     是必填文本。``expected_target`` 表示 provider 当前是否能提供预期结果
-    表；未知时使用 ``None``。``source_hash`` 由 provider 在有能力时提供，
+    表；未知时使用 ``None``。``target_hint`` 由 program-name parser 暴露，
+    但绝不替代 authoritative ``expected_target``。``source_hash`` 由 provider
+    在有能力时提供，
     Phase 1 不计算、不校验算法，也不把 bytes 作为领域输入；bytes decode
     属于后续 provider 边界。
     """
@@ -580,6 +593,12 @@ class ProgramSource:
         return self.program_name_semantics.logical_target
 
     @property
+    def target_hint(self) -> str | None:
+        """返回可用于 multi-sink 消歧的 non-authoritative target candidate。"""
+
+        return self.program_name_semantics.target_hint
+
+    @property
     def step_seq(self) -> int | None:
         """返回正整数 program step sequence。"""
 
@@ -605,7 +624,7 @@ class ProgramSource:
 
     @property
     def resolved_target(self) -> str | None:
-        """按 explicit/provider → canonical program-name target 返回 target。"""
+        """按 explicit/provider → canonical program-name target 返回 authority。"""
 
         explicit_target = normalize_expected_target(self.expected_target)
         return explicit_target or self.logical_target

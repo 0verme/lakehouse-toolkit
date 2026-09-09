@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `DatasetIdentity` | 正式 physical Dataset 的稳定 identity | `environment/canonical_schema/canonical_table` 三元组；不含 `source_profile`、platform 或 catalog。 |
 | `ProgramIdentity` | static Program / Job definition 的稳定 identity | `environment/source_profile/program_name` 三元组；字段只 trim surrounding whitespace；不把没有稳定来源的 `job_key` 猜测加入。完整语义见 [`lineage_program_identity.md`](lineage_program_identity.md)。 |
-| `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示没有 explicit/provider target；`logical_target` 仅可由严格四段的固定 `005` program_name grammar 恢复，非 canonical shape 保持 unknown；`source_hash=None` 表示尚未提供 hash。 |
+| `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示没有 explicit/provider target；`logical_target` 仅可由严格四段的固定 `005` program_name grammar 恢复，三段只暴露 non-authoritative `target_hint`；`source_hash=None` 表示尚未提供 hash。 |
 | `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、`pipeline_version`、first/last seen、last changed、batch 与 active 标记；旧 state 缺少版本时按需 rebuild，不保存完整源码。 |
 | `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |
 | `PhysicalEdge` | 程序内部有向边 | `source` 是上游，`target` 是下游；允许指向 TMP，也不在此阶段吞掉自引用。 |
@@ -42,12 +42,13 @@ script_code
 ### `program_name` 语义边界
 
 `ProgramSource.program_name` 的固定 legacy marker 是 `005`。第二段是 declared
-logical target；第三段是无固定上限、可不连续的 positive-integer `step_seq`；第四段
-是 opaque suffix。解析采用 target-first recovery：target 明确时，缺失 step/suffix
-只产生 diagnostic，不把 lineage 置为 `TARGET_NOT_FOUND`。多个 raw ProgramSource
-可以共享 logical target，但必须保留各自 ProgramIdentity 与 provenance；升序 step
-只形成 expected processing order evidence，不是 scheduler dependency。详见
-[`lineage_program_name.md`](lineage_program_name.md)。
+logical target candidate；第三段是无固定上限、可不连续的 positive-integer `step_seq`；
+第四段是 opaque suffix。严格四段才产生 authoritative `logical_target`；三段只暴露
+复用现有 namespace normalization 的 non-authoritative `target_hint`，不得写入
+`expected_target`。缺失 step/suffix 只产生 diagnostic，不把 lineage 置为
+`TARGET_NOT_FOUND`。多个 raw ProgramSource 可以共享 logical target，但必须保留各自
+ProgramIdentity 与 provenance；升序 step 只形成 expected processing order evidence，
+不是 scheduler dependency。详见 [`lineage_program_name.md`](lineage_program_name.md)。
 
 ### Physical DAG
 
@@ -162,5 +163,27 @@ Blast Radius 的完整语义见 [`lineage_query.md`](lineage_query.md)。
 - `tools/search`、`tools/integrations`、`jobs`、`apps` 的现有生产/演示入口。
 
 这些入口的实际调用和方向兼容点见 [`lineage_call_graph.md`](lineage_call_graph.md)。
+
+### Target selection
+
+Audit 与 Materialization 之间使用独立的 selection fact：
+
+```text
+TargetSelectionResult(
+    authoritative_target,
+    target_hint,
+    selected_target,
+    selection_mode,
+)
+```
+
+`selected_target` 只有在 authoritative target 存在，或无 authority 且 multi-sink
+formal candidate 对 normalized hint 做到 exact unique match 时才非空。否则 selection
+保持 `NONE`。hint branch 的 reachability 单独保存在
+`selected_target_reachable_nodes`，不会伪装成 authoritative `target_reachable_nodes`。
+`target_hint` 不改变 `DatasetIdentity`，不产生
+`TARGET_MISMATCH`/`TARGET_NOT_FOUND`，也不删除 `MULTI_SINK_CANDIDATE`。Materialization
+只消费这个结果，不重新 parse `program_name` 或扩展 namespace registry。
+
 Phase 7 的增量、历史、diff、issue lifecycle 和 legacy decision 见
 [`lineage_incremental_history.md`](lineage_incremental_history.md)。

@@ -634,12 +634,14 @@ def _build_adjacency(
 
 
 def _included_nodes(audit: LineageAuditResult) -> set[str]:
-    """只使用 Audit 已给出的 target-reaching facts，不重新推断 target。"""
+    """只消费 Audit/Target Selection facts，不重新解析或猜测 target。"""
 
     if audit.expected_target is None:
-        # 没有权威 target 时，不判定任何 branch 为 orphan；只 materialize
-        # Physical 图中已经明确存在的 formal-to-formal boundary。
-        return _graph_nodes(audit.dag)
+        if audit.selected_materialization_target is None:
+            # 没有 authority 且没有 unique hint 时，不判定任何 branch 为 orphan；
+            # 只 materialize Physical 图中已经明确存在的 formal-to-formal boundary。
+            return _graph_nodes(audit.dag)
+        return set(audit.selected_target_reachable_nodes)
     return set(audit.target_reachable_nodes)
 
 
@@ -1238,9 +1240,10 @@ def materialize_program(
 ) -> ProgramMaterialization:
     """把一个 audited DAG 转换为 direct formal ``LineageEdge``。
 
-    ``audit_result`` 未提供时只调用既有 Phase 4 auditor，不在这里复制 detector。
-    已知 expected target 时只使用 ``target_reachable_nodes``；未知 target 时不猜 sink，
-    仅 materialize 图中已有的 formal-to-formal boundary。TMP 子图无环时使用
+    ``audit_result`` 未提供时只调用既有 Phase 4 auditor，不在这里复制 detector
+    或解析 ``program_name``。Target Selection 已选择 authoritative target 或 unique
+    hint 时只使用 ``target_reachable_nodes``；没有选择时不猜 sink，仅 materialize
+    图中已有的 formal-to-formal boundary。TMP 子图无环时使用
     exact DAG path-count DP 加 bounded representative sample；TMP 有环时保留
     explicit simple-path fallback 及其 controlled limits。
     """

@@ -10,8 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from types import MappingProxyType
 
 from shared.lineage.domain import (
@@ -54,15 +55,151 @@ _OCCURRENCE_EVIDENCE_KEYS = tuple(
 )
 
 
+class TargetSelectionMode(str, Enum):
+    """Materialization target 的 authority 来源。"""
+
+    NONE = "NONE"
+    AUTHORITATIVE = "AUTHORITATIVE"
+    UNIQUE_HINT = "UNIQUE_HINT"
+
+
+@dataclass(frozen=True, slots=True)
+class TargetSelectionResult:
+    """把 authoritative target 与 non-authoritative hint 分开的选择事实。"""
+
+    authoritative_target: str | None
+    target_hint: str | None
+    selected_target: str | None
+    selection_mode: TargetSelectionMode
+    hint_match_count: int = 0
+
+    def __post_init__(self) -> None:
+        mode = TargetSelectionMode(self.selection_mode)
+        object.__setattr__(self, "selection_mode", mode)
+        for field_name in (
+            "authoritative_target",
+            "target_hint",
+            "selected_target",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string or None")
+        if (
+            not isinstance(self.hint_match_count, int)
+            or isinstance(self.hint_match_count, bool)
+            or self.hint_match_count < 0
+        ):
+            raise ValueError("hint_match_count must be a non-negative integer")
+        if mode is TargetSelectionMode.NONE and self.selected_target is not None:
+            raise ValueError("NONE selection cannot have a selected target")
+        if mode is TargetSelectionMode.AUTHORITATIVE:
+            if self.authoritative_target is None:
+                raise ValueError(
+                    "AUTHORITATIVE selection needs an authoritative target"
+                )
+            if self.selected_target != self.authoritative_target:
+                raise ValueError(
+                    "AUTHORITATIVE selection must select the authoritative target"
+                )
+        if mode is TargetSelectionMode.UNIQUE_HINT:
+            if self.authoritative_target is not None:
+                raise ValueError(
+                    "UNIQUE_HINT selection cannot have an authoritative target"
+                )
+            if self.selected_target is None or self.hint_match_count != 1:
+                raise ValueError(
+                    "UNIQUE_HINT selection needs exactly one matched target"
+                )
+
+    @property
+    def selected_materialization_target(self) -> str | None:
+        """兼容 contract 文档中的 selected materialization target 名称。"""
+
+        return self.selected_target
+
+
+def select_materialization_target(
+    *,
+    authoritative_target: str | None,
+    target_hint: str | None,
+    formal_sinks: Iterable[str],
+) -> TargetSelectionResult:
+    """仅按 authority 或 exact unique hint 选择 materialization target。"""
+
+    candidates = tuple(formal_sinks)
+    matches = tuple(
+        sink for sink in candidates if target_hint is not None and sink == target_hint
+    )
+    if authoritative_target is not None:
+        return TargetSelectionResult(
+            authoritative_target=authoritative_target,
+            target_hint=target_hint,
+            selected_target=authoritative_target,
+            selection_mode=TargetSelectionMode.AUTHORITATIVE,
+            hint_match_count=len(matches),
+        )
+    if len(candidates) > 1 and len(matches) == 1:
+        return TargetSelectionResult(
+            authoritative_target=None,
+            target_hint=target_hint,
+            selected_target=matches[0],
+            selection_mode=TargetSelectionMode.UNIQUE_HINT,
+            hint_match_count=1,
+        )
+    return TargetSelectionResult(
+        authoritative_target=None,
+        target_hint=target_hint,
+        selected_target=None,
+        selection_mode=TargetSelectionMode.NONE,
+        hint_match_count=len(matches),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class LineageAuditResult:
-    """一次 Physical DAG audit 的结构化结果与可复用事实摘要。"""
+    """一次 Physical DAG audit 的结构化结果与可复用事实摘要。
+
+    ``target_reachable_nodes`` 只表示 authoritative target 的既有事实；
+    ``selected_target_reachable_nodes`` 仅为 unique hint selection 提供
+    materialization branch，不把 hint 提升为 audit authority。
+    """
 
     dag: ProgramPhysicalDAG
     issues: tuple[LineageIssue, ...]
     expected_target: str | None
     target_reachable_nodes: tuple[str, ...] = ()
     orphan_branch_sinks: tuple[str, ...] = ()
+    target_selection: TargetSelectionResult = field(
+        default_factory=lambda: TargetSelectionResult(
+            authoritative_target=None,
+            target_hint=None,
+            selected_target=None,
+            selection_mode=TargetSelectionMode.NONE,
+        )
+    )
+    selected_target_reachable_nodes: tuple[str, ...] = ()
+
+    @property
+    def authoritative_target(self) -> str | None:
+        """返回 audit 的 authoritative expected target；不包含 hint。"""
+
+        return self.expected_target
+
+    @property
+    def target_hint(self) -> str | None:
+        return self.target_selection.target_hint
+
+    @property
+    def selected_materialization_target(self) -> str | None:
+        return self.target_selection.selected_target
+
+    @property
+    def selection_mode(self) -> TargetSelectionMode:
+        return self.target_selection.selection_mode
+
+    @property
+    def hint_match_count(self) -> int:
+        return self.target_selection.hint_match_count
 
     @property
     def issue_types(self) -> tuple[IssueType, ...]:
@@ -464,7 +601,8 @@ class ProgramLineageAuditor:
         graph_nodes.update(edge.target for edge in edges)
         forward, reverse = _build_adjacency(graph_nodes, edges)
 
-        sinks = _unique_sorted(dag.sinks)
+        raw_sinks = tuple(dag.sinks)
+        sinks = _unique_sorted(raw_sinks)
         written_targets = _unique_sorted(
             [
                 *(step.target for step in dag.steps if step.target is not None),
@@ -472,11 +610,12 @@ class ProgramLineageAuditor:
                 *sinks,
             ]
         )
-        formal_sinks = tuple(
+        formal_sink_candidates = tuple(
             sink
-            for sink in sinks
+            for sink in raw_sinks
             if _node_kind_value(sink, node_map) == PhysicalNodeKind.FORMAL_ASSET.value
         )
+        formal_sinks = _unique_sorted(formal_sink_candidates)
         temporary_sinks = tuple(
             sink
             for sink in sinks
@@ -484,6 +623,11 @@ class ProgramLineageAuditor:
             == PhysicalNodeKind.TEMPORARY_ASSET.value
         )
         sink_kinds = {sink: _node_kind_value(sink, node_map) for sink in sinks}
+        target_selection = select_materialization_target(
+            authoritative_target=dag.expected_target,
+            target_hint=dag.program_source.target_hint,
+            formal_sinks=formal_sink_candidates,
+        )
 
         issues: list[LineageIssue] = []
 
@@ -570,6 +714,13 @@ class ProgramLineageAuditor:
                         "temporary_sinks": list(temporary_sinks),
                         "sink_kinds": sink_kinds,
                         "expected_target": dag.expected_target,
+                        "authoritative_target": target_selection.authoritative_target,
+                        "target_hint": target_selection.target_hint,
+                        "hint_match_count": target_selection.hint_match_count,
+                        "selected_materialization_target": (
+                            target_selection.selected_materialization_target
+                        ),
+                        "selection_mode": target_selection.selection_mode.value,
                     },
                 )
             )
@@ -636,45 +787,51 @@ class ProgramLineageAuditor:
                 )
 
         target_reachable_nodes: tuple[str, ...] = ()
+        selected_target_reachable_nodes: tuple[str, ...] = ()
         orphan_branch_sinks: tuple[str, ...] = ()
-        if expected_target is not None and expected_target in written_targets:
-            target_reachable = _reverse_reachable(expected_target, reverse)
-            target_reachable_nodes = tuple(sorted(target_reachable))
-            orphan_branch_sinks = tuple(
-                sink for sink in sinks if sink not in target_reachable
-            )
-            for branch_sink in orphan_branch_sinks:
-                branch_nodes, branch_edges = _branch_for_sink(branch_sink, reverse)
-                branch_records = [_edge_record(edge) for edge in branch_edges]
-                branch_pairs = [[edge.source, edge.target] for edge in branch_edges]
-                entry_sources = _branch_entry_sources(branch_nodes, branch_edges)
-                branch_node_kinds = {
-                    node: _node_kind_value(node, node_map) for node in branch_nodes
-                }
-                issues.append(
-                    _make_issue(
-                        dag,
-                        IssueType.ORPHAN_BRANCH,
-                        observed_at=observed_at,
-                        batch_id=batch_id,
-                        branch_sink=branch_sink,
-                        message=(
-                            f"Program {dag.program_source.program_name} has an "
-                            f"orphan branch ending at {branch_sink} that cannot "
-                            f"reach expected target {expected_target}."
-                        ),
-                        evidence={
-                            "expected_target": expected_target,
-                            "branch_sink": branch_sink,
-                            "branch_nodes": list(branch_nodes),
-                            "branch_edges": branch_records,
-                            "branch_edge_pairs": branch_pairs,
-                            "entry_sources": list(entry_sources),
-                            "branch_roots": list(entry_sources),
-                            "branch_node_kinds": branch_node_kinds,
-                        },
-                    )
+        selected_target = target_selection.selected_target
+        if selected_target is not None and selected_target in written_targets:
+            target_reachable = _reverse_reachable(selected_target, reverse)
+            if expected_target is not None:
+                target_reachable_nodes = tuple(sorted(target_reachable))
+            else:
+                selected_target_reachable_nodes = tuple(sorted(target_reachable))
+            if expected_target is not None:
+                orphan_branch_sinks = tuple(
+                    sink for sink in sinks if sink not in target_reachable
                 )
+                for branch_sink in orphan_branch_sinks:
+                    branch_nodes, branch_edges = _branch_for_sink(branch_sink, reverse)
+                    branch_records = [_edge_record(edge) for edge in branch_edges]
+                    branch_pairs = [[edge.source, edge.target] for edge in branch_edges]
+                    entry_sources = _branch_entry_sources(branch_nodes, branch_edges)
+                    branch_node_kinds = {
+                        node: _node_kind_value(node, node_map) for node in branch_nodes
+                    }
+                    issues.append(
+                        _make_issue(
+                            dag,
+                            IssueType.ORPHAN_BRANCH,
+                            observed_at=observed_at,
+                            batch_id=batch_id,
+                            branch_sink=branch_sink,
+                            message=(
+                                f"Program {dag.program_source.program_name} has an "
+                                f"orphan branch ending at {branch_sink} that cannot "
+                                f"reach expected target {expected_target}."
+                            ),
+                            evidence={
+                                "expected_target": expected_target,
+                                "branch_sink": branch_sink,
+                                "branch_nodes": list(branch_nodes),
+                                "branch_edges": branch_records,
+                                "branch_edge_pairs": branch_pairs,
+                                "entry_sources": list(entry_sources),
+                                "branch_roots": list(entry_sources),
+                                "branch_node_kinds": branch_node_kinds,
+                            },
+                        )
+                    )
 
         issues.sort(key=_issue_sort_key)
         return LineageAuditResult(
@@ -683,6 +840,8 @@ class ProgramLineageAuditor:
             expected_target=expected_target,
             target_reachable_nodes=target_reachable_nodes,
             orphan_branch_sinks=orphan_branch_sinks,
+            target_selection=target_selection,
+            selected_target_reachable_nodes=selected_target_reachable_nodes,
         )
 
     def __call__(
@@ -713,7 +872,10 @@ __all__ = [
     "ISSUE_SEVERITY_POLICY",
     "LineageAuditResult",
     "ProgramLineageAuditor",
+    "TargetSelectionMode",
+    "TargetSelectionResult",
     "audit_program_physical_dag",
     "compute_lineage_issue_stable_key",
     "issue_severity",
+    "select_materialization_target",
 ]

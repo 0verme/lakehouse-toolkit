@@ -13,6 +13,7 @@ from unittest.mock import patch
 import shared.lineage.materialization as materialization_module
 from shared.lineage.audit import LineageAuditResult, audit_program_physical_dag
 from shared.lineage.domain import (
+    DatasetIdentity,
     IssueType,
     LineageIssue,
     PhysicalEdge,
@@ -854,6 +855,55 @@ class LineageMaterializationTests(unittest.TestCase):
         issue_types = {issue.issue_type for issue in result.issues}
         self.assertNotIn(IssueType.TARGET_MISMATCH, issue_types)
         self.assertNotIn(IssueType.TARGET_NOT_FOUND, issue_types)
+
+    def test_unique_three_part_hint_materializes_only_selected_sink_branch(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DM.RESULT_A:00",
+            script_code=(
+                'execute("INSERT INTO TMP_A SELECT * FROM ODS.SRC_A")\n'
+                'execute("INSERT INTO DM.RESULT_A SELECT * FROM TMP_A")\n'
+                'execute("INSERT INTO TMP_B SELECT * FROM ODS.SRC_B")\n'
+                'execute("INSERT INTO DM.RESULT_B SELECT * FROM TMP_B")'
+            ),
+            source_hash="sha256:target-hint-selection",
+        )
+        original_identity = source.identity
+        dag = build_program_physical_dag(source)
+        audit = audit_dag(dag, batch_id="batch-target-hint")
+        result = materialize_program(
+            dag,
+            audit_result=audit,
+            batch_id="batch-target-hint",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertIsNone(dag.expected_target)
+        self.assertEqual(source.target_hint, "DM.RESULT_A")
+        self.assertEqual(audit.selected_materialization_target, "DM.RESULT_A")
+        self.assertEqual(audit.selection_mode.value, "UNIQUE_HINT")
+        self.assertEqual(
+            edge_pairs(result),
+            {("ODS.SRC_A", "DM.RESULT_A")},
+        )
+        self.assertNotIn(("ODS.SRC_B", "DM.RESULT_B"), edge_pairs(result))
+        self.assertEqual(
+            {issue.issue_type for issue in result.issues},
+            {IssueType.MULTI_SINK_CANDIDATE},
+        )
+        self.assertNotIn(IssueType.TARGET_MISMATCH, audit.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, audit.issue_types)
+        self.assertNotIn(IssueType.ORPHAN_BRANCH, audit.issue_types)
+        self.assertEqual(source.identity, original_identity)
+        self.assertEqual(
+            result.edges[0].source_dataset_identity,
+            DatasetIdentity("DEV", "ODS", "SRC_A"),
+        )
+        self.assertEqual(
+            result.edges[0].target_dataset_identity,
+            DatasetIdentity("DEV", "DM", "RESULT_A"),
+        )
 
     def test_program_name_namespace_normalization_materializes_physical_lineage(self):
         cases = (
