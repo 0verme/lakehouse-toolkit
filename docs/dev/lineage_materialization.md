@@ -13,6 +13,15 @@ DAG，也不替换现有生产入口。
 `Batch != Runtime Run` 的完整边界见
 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
+> **Issue #39 DWS projection clarification:** 本文下面的 `LineageEdge` 和
+> SQLite reference adapter 继续描述当前 Phase 5 runtime 的 formal direct
+> materialization，不能把它直接当成新的 DWS production table contract。Issue #39
+> 的 DWS schema 将完整 Physical Direct Edge（包括 TMP endpoint）放入
+> `dwp.lineage_edge`，再从同一 batch 派生 `dwp.lineage_business_edge`；详见
+> [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
+> 本轮不改变 `imp_lineage_edge` runtime，也不把当前 SQLite 临时/参考表当作
+> `lineage_business_edge` 的正式 schema 来源。
+
 ## Physical DAG 与 Business Lineage
 
 Physical DAG 记录程序内部真实执行关系，TMP 节点必须保留：

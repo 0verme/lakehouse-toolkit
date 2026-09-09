@@ -6,6 +6,13 @@ materialization → Query 主链上增加演进能力。它不改变 `LineageEdg
 restore、Batch 与 runtime boundary 的完整 V1 contract 见
 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
+> **Issue #39 DWS boundary:** 本文的 `LineageEdge`、SQLite history/diff 和 Query
+> 仍是当前 reference runtime contract。新的 DWS production schema 把完整
+> Physical Direct Edge 放入显式的 `dwp.lineage_edge`，并要求从相同 `batch_id`
+> 派生 `dwp.lineage_business_edge`；两者不能跨 batch active。详见
+> [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
+> 本说明不改变现有 `imp_lineage_edge` runtime，也不创建 closure。
+
 ## Program identity 与 source hash
 
 程序 identity 冻结为：
