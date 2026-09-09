@@ -16,6 +16,7 @@ from shared.lineage.lineage_builder import (
     parse_declared_primary_target,
     parse_schedule_time_seconds,
     process_target_name,
+    table_name_aliases,
 )
 
 
@@ -441,6 +442,25 @@ class dataLineageTests(unittest.TestCase):
         self.assertTrue(
             any("根目标表未命中结果表白名单" in item for item in data["warnings"])
         )
+
+    def test_normalize_table_name_preserves_physical_schema_namespace(self):
+        cases = {
+            "DWF.A": "DWF.A",
+            "DWM.B": "DWM.B",
+            "DWD.C": "DWD.C",
+            "DWUPRR.C": "DWUPRR.C",
+            "DWS_DWF.D": "DWS_DWF.D",
+            '  `DWF` . "A"  ': "DWF.A",
+        }
+
+        for raw_name, expected in cases.items():
+            with self.subTest(raw_name=raw_name):
+                self.assertEqual(normalize_table_name(raw_name), expected)
+
+        aliases = table_name_aliases("DWF.A")
+        self.assertIn("DWF.A", aliases)
+        self.assertIn("DWS_DWF.A", aliases)
+        self.assertIn("A", aliases)
 
     def test_normalize_table_name_removes_quotes_and_normalizes_case(self):
         self.assertEqual(

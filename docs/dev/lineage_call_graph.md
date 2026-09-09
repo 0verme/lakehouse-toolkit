@@ -39,8 +39,8 @@ jobs/crontab/*
 
 1. `load_process_infos()` 查询 `demo_meta.processes`，生成旧版
    `ProcessInfo(source_table, process_name, script_code)`；
-2. `normalize_table_name()`、`table_name_aliases()` 处理 `DWS_` schema、短名和
-   `DWE/DWP` 兼容别名；
+2. `normalize_table_name()` 只清理格式并保留 SQL 中的物理 schema；
+   `table_name_aliases()` 处理 `DWS_` schema、短名和 `DWE/DWP` 兼容别名；
 3. `extract_tables_from_code()` 从去注释后的 `FROM/JOIN/USING` 中抽取表名；
 4. `build_target_map()` 按 process name 推导 target；
 5. `PipelineLineageBuilder` 生成 `LineageGraph`，图中的边是

@@ -171,8 +171,9 @@ DEV/PROD diff 默认比较 `DEV` graph 与 `PROD` graph，DEV 的多个
 `source_profile` 合并在同一 environment graph 内；`diff_environments()` 和 store
 adapter 提供可选的 `dev_source_profile` / `prod_source_profile` 显式过滤参数。
 资产 canonicalization 复用
-`shared.lineage.lineage_builder.normalize_table_name()`，例如 `DWA.X` 与
-`DWS_DWA.X` 使用同一正式表示。
+`shared.lineage.lineage_builder.normalize_table_name()`；它只清理格式并保留物理
+schema，因此 `DWA.X` 与 `DWS_DWA.X` 保持不同的正式表示。legacy alias 只在
+lookup/兼容匹配层扩大候选，不改写 Dataset Identity。
 
 普通 `LineageQueryService`、Viewer JSON 和 Blast Radius 仍只读 active edge；
 历史 batch 与 diff 不进入既有 Viewer contract：

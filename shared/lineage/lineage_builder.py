@@ -40,6 +40,8 @@ where target_table is not null
   and source_table is not null
 """.replace("__RELATIONS_TABLE__", metadata_table("relations", "relations"))
 
+# Legacy alias and target matching only; canonical normalization must preserve
+# the physical schema namespace observed in SQL.
 BASE_SCHEMAS = {"DM", "DWA", "DWD", "DWF", "DWM", "DWO", "DWP", "DWE"}
 SCHEMA_PREFIXES = BASE_SCHEMAS | {f"DWS_{schema}" for schema in BASE_SCHEMAS}
 TARGET_SCHEMA_PRIORITY = (
@@ -203,7 +205,15 @@ def normalize_input_name(value: str) -> str:
 
 @lru_cache(maxsize=32768)
 def normalize_table_name(value: str) -> str:
-    text = str(value or "").strip().upper()
+    """Normalize identifier formatting without rewriting its physical namespace.
+
+    Canonicalization is intentionally limited to decoding/stringifying, trimming,
+    upper-casing, quote removal, and whitespace cleanup. Legacy ``DWF`` ↔
+    ``DWS_DWF`` compatibility belongs to :func:`table_name_aliases`, never to
+    the canonical Dataset Identity value returned here.
+    """
+
+    text = decode_code(value).strip().upper()
     text = (
         text.replace("`", "")
         .replace('"', "")
@@ -211,14 +221,7 @@ def normalize_table_name(value: str) -> str:
         .replace("[", "")
         .replace("]", "")
     )
-    text = re.sub(r"\s+", "", text)
-    if text.startswith("DWS_"):
-        return text
-    if "." in text:
-        schema, table = text.split(".", 1)
-        if schema in BASE_SCHEMAS:
-            return f"DWS_{schema}.{table}"
-    return text
+    return re.sub(r"\s+", "", text)
 
 
 @lru_cache(maxsize=32768)
@@ -232,6 +235,8 @@ def table_name_parts(value: str) -> tuple[str, str]:
 
 @lru_cache(maxsize=32768)
 def table_name_aliases(value: str) -> tuple[str, ...]:
+    """Return broad legacy lookup aliases without changing canonical identity."""
+
     full_name, short_name = table_name_parts(value)
     aliases = {name for name in {full_name, short_name} if name}
     if full_name.startswith("DWS_") and "." in full_name:
