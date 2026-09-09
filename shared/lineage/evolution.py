@@ -8,14 +8,22 @@ for an unchanged program.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from .audit import compute_lineage_issue_stable_key, issue_severity
+from .audit import (
+    AUDIT_RULE_VERSION,
+    AuditFact,
+    AuditPolicy,
+    DEFAULT_AUDIT_POLICY,
+    apply_audit_policy,
+    compute_lineage_issue_stable_key,
+)
 from .domain import (
+    IssueDisposition,
     IssueType,
     LineageEdge,
     LineageIssue,
@@ -375,6 +383,29 @@ def program_identity_key(
     raise TypeError("value must be ProgramIdentity, ProgramSource, or ProgramState")
 
 
+def _issue_stable_key(issue: LineageIssue) -> str:
+    """为没有 stable_key 的 legacy row 推导同一 canonical identity。"""
+
+    if issue.stable_key:
+        return issue.stable_key
+    cycle_nodes: Iterable[str] = ()
+    if IssueType(issue.issue_type) is IssueType.CYCLE_DETECTED and isinstance(
+        issue.evidence, Mapping
+    ):
+        raw_nodes = issue.evidence.get("cycle_nodes", ())
+        if isinstance(raw_nodes, (list, tuple, set, frozenset)):
+            cycle_nodes = (str(node) for node in raw_nodes)
+    return compute_lineage_issue_stable_key(
+        issue.environment,
+        issue.source_profile,
+        issue.program_name,
+        issue.issue_type,
+        node_key=issue.node_key,
+        branch_sink=issue.branch_sink,
+        cycle_nodes=cycle_nodes,
+    )
+
+
 def issue_identity_key(issue: LineageIssue) -> tuple[str, str, str, str, str, str, str]:
     """跨 batch reconciliation 使用的稳定 issue identity。"""
 
@@ -385,7 +416,7 @@ def issue_identity_key(issue: LineageIssue) -> tuple[str, str, str, str, str, st
         issue.source_profile,
         issue.program_name,
         IssueType(issue.issue_type).value,
-        issue.stable_key or "",
+        _issue_stable_key(issue),
         issue.node_key or "",
         issue.branch_sink or "",
     )
@@ -525,11 +556,26 @@ def reconcile_issue_lifecycle(
             if issue.last_seen_at is None or issue.last_seen_at == observed_at
             else issue.last_seen_at
         )
+        disposition = issue.disposition
+        disposition_updated_at = issue.disposition_updated_at
+        disposition_updated_by = issue.disposition_updated_by
+        if old is not None and IssueDisposition(old.disposition) in (
+            IssueDisposition.ACCEPTED,
+            IssueDisposition.FALSE_POSITIVE,
+        ):
+            # Manual decisions survive a rule/policy replay while the current
+            # policy may still update severity and policy_version.
+            disposition = old.disposition
+            disposition_updated_at = old.disposition_updated_at
+            disposition_updated_by = old.disposition_updated_by
         resolved_issue = replace(
             issue,
             first_seen_at=first_seen,
             last_seen_at=last_seen,
             is_active=True,
+            disposition=disposition,
+            disposition_updated_at=disposition_updated_at,
+            disposition_updated_by=disposition_updated_by,
         )
         reconciled.append(resolved_issue)
         status = (
@@ -551,7 +597,13 @@ def reconcile_issue_lifecycle(
         if identity in current_map:
             continue
         first_seen = old.first_seen_at or old.last_seen_at or observed_at
-        resolved_issue = replace(old, is_active=False)
+        resolved_issue = replace(
+            old,
+            is_active=False,
+            disposition=IssueDisposition.RESOLVED,
+            disposition_updated_at=observed_at,
+            disposition_updated_by=None,
+        )
         records.append(
             IssueLifecycle(
                 issue=resolved_issue,
@@ -817,23 +869,14 @@ def _issue_expected_target(issue: LineageIssue) -> str | None:
     return normalized or None
 
 
-def detect_broken_lineage_branches(
+def detect_broken_lineage_branch_facts(
     previous_edges: Iterable[LineageEdge],
     current_edges: Iterable[LineageEdge],
     previous_issues: Iterable[LineageIssue],
     current_issues: Iterable[LineageIssue],
-    *,
-    observed_at: datetime,
-    batch_id: str | None = None,
-) -> tuple[LineageIssue, ...]:
-    """只将“旧程序曾到达 target、当前同程序出现 orphan”提升为 broken。
+) -> tuple[AuditFact, ...]:
+    """检测旧 valid branch 到当前 orphan 的 transition fact。"""
 
-    当前 active ``LINEAGE_BRANCH_BROKEN`` issue 也会作为证据继续 carry，避免
-    第二个 batch 因旧 valid edge 已经消失而把 broken 状态错误降级为普通 orphan。
-    """
-
-    if not isinstance(observed_at, datetime):
-        raise TypeError("observed_at must be a datetime")
     old_edges = tuple(previous_edges)
     now_edges = tuple(current_edges)
     old_issues = tuple(previous_issues)
@@ -864,7 +907,7 @@ def detect_broken_lineage_branches(
         for issue in old_issues
         if IssueType(issue.issue_type) is IssueType.LINEAGE_BRANCH_BROKEN
     }
-    generated: dict[tuple[str, str, str, str, str, str, str], LineageIssue] = {}
+    generated: dict[str, AuditFact] = {}
     for orphan in now_issues:
         if IssueType(orphan.issue_type) is not IssueType.ORPHAN_BRANCH:
             continue
@@ -902,26 +945,59 @@ def detect_broken_lineage_branches(
             IssueType.LINEAGE_BRANCH_BROKEN,
             branch_sink=orphan.branch_sink,
         )
-        broken = LineageIssue(
+        broken = AuditFact(
             environment=orphan.environment,
             source_profile=orphan.source_profile,
             program_name=orphan.program_name,
             issue_type=IssueType.LINEAGE_BRANCH_BROKEN,
-            severity=issue_severity(IssueType.LINEAGE_BRANCH_BROKEN),
             message=(
                 f"Program {orphan.program_name} previously reached "
                 f"{expected_target}, but branch {orphan.branch_sink} is now broken."
             ),
             branch_sink=orphan.branch_sink,
             evidence=evidence,
-            batch_id=batch_id,
-            first_seen_at=observed_at,
-            last_seen_at=observed_at,
-            is_active=True,
+            confidence=orphan.confidence,
+            rule_version=AUDIT_RULE_VERSION,
             stable_key=stable_key,
         )
-        generated[issue_identity_key(broken)] = broken
-    return tuple(sorted(generated.values(), key=issue_identity_key))
+        generated[broken.stable_issue_identity] = broken
+    return tuple(
+        sorted(
+            generated.values(),
+            key=lambda fact: (
+                IssueType(fact.issue_type).value,
+                fact.branch_sink or "",
+                fact.stable_issue_identity,
+            ),
+        )
+    )
+
+
+def detect_broken_lineage_branches(
+    previous_edges: Iterable[LineageEdge],
+    current_edges: Iterable[LineageEdge],
+    previous_issues: Iterable[LineageIssue],
+    current_issues: Iterable[LineageIssue],
+    *,
+    observed_at: datetime,
+    batch_id: str | None = None,
+    policy: AuditPolicy | None = None,
+) -> tuple[LineageIssue, ...]:
+    """兼容入口：先检测 transition facts，再应用可替换 policy。"""
+
+    if not isinstance(observed_at, datetime):
+        raise TypeError("observed_at must be a datetime")
+    return apply_audit_policy(
+        detect_broken_lineage_branch_facts(
+            previous_edges,
+            current_edges,
+            previous_issues,
+            current_issues,
+        ),
+        policy=policy or DEFAULT_AUDIT_POLICY,
+        batch_id=batch_id,
+        observed_at=observed_at,
+    )
 
 
 __all__ = [
@@ -936,6 +1012,7 @@ __all__ = [
     "LineageBatchDiff",
     "SnapshotScope",
     "build_program_states",
+    "detect_broken_lineage_branch_facts",
     "detect_broken_lineage_branches",
     "diff_environments",
     "diff_lineage_batches",

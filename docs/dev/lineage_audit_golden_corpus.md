@@ -2,10 +2,11 @@
 
 ## Purpose
 
-Golden Corpus 用于可重复地抽取 Audit issue、做人工事实标注、计算
+Golden Corpus 用于可重复地抽取 Audit fact、做人工事实标注、计算
 `precision` / `false-positive rate`，并把已标注样本作为 detector regression corpus。
-它只消费现有 `LineageIssue` 或已经脱敏的 candidate manifest，不修改
-`ProgramLineageAuditor` 的 detection rule、severity、evidence 或 issue identity。
+它消费 `AuditFact`、兼容的 `LineageIssue` 或已经脱敏的 candidate manifest；不修改
+`ProgramLineageAuditor` 的 detection rule、severity policy、evidence 或 issue identity。
+`candidate_from_fact()` 与 `candidate_from_issue()` 都只读取 fact 部分。
 
 当前代码的 `IssueType` 枚举共有七类：
 
@@ -66,15 +67,17 @@ policy、policy version、持久化 disposition storage，也不改变 Audit 结
 - `sample_id`、`sample_seed`、`sampling_group` 一起存在时，`sample_id` 必须能由
   deterministic sampling contract 重算。
 
-从 `LineageIssue` 导出 candidate 时使用：
+从 fact 或兼容 projection 导出 candidate 时使用：
 
 ```python
-from shared.lineage.audit_golden import candidate_from_issue
+from shared.lineage.audit_golden import candidate_from_fact, candidate_from_issue
 
-candidate = candidate_from_issue(issue, source_kind="lineage_audit")
+candidate = candidate_from_fact(fact, source_kind="lineage_audit")
+# 旧调用方仍可使用 candidate_from_issue(issue, source_kind="lineage_audit")
 ```
 
-此函数只取现有 stable issue identity 的二次 fingerprint 和脱敏 evidence summary。
+这些函数只取 stable issue identity 的二次 fingerprint 和脱敏 evidence summary；
+改变 severity/disposition/policy version 不会改变 candidate fingerprint。
 
 ## Sampling contract
 
@@ -218,6 +221,7 @@ corpus。它只含 fingerprint、计数/布尔 evidence summary 和标签，不�
   变化；应新建版本，不覆盖旧结果。
 - detector 规则变化时保留旧 corpus，使用新版本重新抽样/标注并在报告中记录
   detector/pipeline revision；不要重写旧标签。
-- 本 Issue 不实现 disposition policy、runtime disposition storage、policy
-  version、DWS schema/materialization 或新的 Audit IssueType；这些属于后续 Issue
-  （尤其是 #36 / #39）。
+- #35 corpus 本身不承担 runtime disposition policy；Issue #36 的运行时
+  `IssueDisposition`、policy version 和 reference persistence 已在独立层实现；
+- 本模块仍不实现 DWS schema/materialization 或新的 Audit IssueType，后者属于
+  后续 Issue（尤其是 #39）。

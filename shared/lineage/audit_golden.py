@@ -1,8 +1,8 @@
 """Audit Golden Corpus 的脱敏格式、抽样、标注校验与指标计算。
 
-本模块只消费已经生成的 ``LineageIssue`` 或脱敏 candidate manifest，不修改
-Audit detector，也不引入 runtime disposition policy。公开 manifest 只允许保存
-不可逆 fingerprint、IssueType、结构化 evidence summary 和人工标注。
+本模块只消费已经生成的 ``AuditFact``、兼容 ``LineageIssue`` 或脱敏 candidate
+manifest，不修改 Audit detector，也不引入 runtime disposition policy。公开 manifest
+只允许保存不可逆 fingerprint、IssueType、结构化 evidence summary 和人工标注。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from shared.lineage.audit import AuditFact
 from shared.lineage.domain import IssueType, LineageIssue
 
 CORPUS_FORMAT = "lineage-audit-golden"
@@ -251,22 +252,39 @@ class AuditCandidate:
         )
 
 
+def candidate_from_fact(
+    fact: AuditFact,
+    *,
+    source_kind: str = "lineage_audit",
+    corpus_version: str = CORPUS_VERSION,
+) -> AuditCandidate:
+    """从 policy 无关的 fact 生成脱敏 candidate。"""
+
+    if not isinstance(fact, AuditFact):
+        raise TypeError("fact must be an AuditFact")
+    return AuditCandidate(
+        fingerprint=compute_golden_fingerprint(fact.stable_issue_identity),
+        issue_type=fact.issue_type,
+        evidence_summary=summarize_issue_evidence(fact.evidence),
+        source_kind=source_kind,
+        corpus_version=corpus_version,
+    )
+
+
 def candidate_from_issue(
     issue: LineageIssue,
     *,
     source_kind: str = "lineage_audit",
     corpus_version: str = CORPUS_VERSION,
 ) -> AuditCandidate:
-    """从 ``LineageIssue`` 生成不含原始 identity/evidence value 的 candidate。"""
+    """兼容入口：只读取 ``LineageIssue`` 的 fact 部分，忽略 policy。"""
 
     if not isinstance(issue, LineageIssue):
         raise TypeError("issue must be a LineageIssue")
     if issue.fingerprint is None:
         raise CorpusFormatError("LineageIssue must have a stable fingerprint")
-    return AuditCandidate(
-        fingerprint=compute_golden_fingerprint(issue.fingerprint),
-        issue_type=issue.issue_type,
-        evidence_summary=summarize_issue_evidence(issue.evidence),
+    return candidate_from_fact(
+        AuditFact.from_issue(issue),
         source_kind=source_kind,
         corpus_version=corpus_version,
     )
@@ -842,6 +860,7 @@ __all__ = [
     "UnknownIssueTypeError",
     "UnlabeledCorpusError",
     "calculate_metrics",
+    "candidate_from_fact",
     "candidate_from_issue",
     "compute_golden_fingerprint",
     "compute_sample_id",

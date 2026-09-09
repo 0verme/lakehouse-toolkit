@@ -158,7 +158,9 @@ SQLite transaction rollback，active batch 切换语义不变。
 
 已知 `expected_target` 时，materialization 只使用 Audit 已计算的
 `target_reachable_nodes`。无法到达 expected target 的 terminal branch 不进入
-`lineage_edge`，但原样以 Phase 4 产生的 `LineageIssue` 进入 `lineage_issue`：
+`lineage_edge`，但原样以 Phase 4 产生的 policy projection `LineageIssue` 进入
+`lineage_issue`；history reconciliation 也可将消失的 fact 作为 `RESOLVED`
+projection 保留：
 
 ```text
 正常 target-reaching branch → lineage_edge
@@ -168,7 +170,7 @@ SQLite transaction rollback，active batch 切换语义不变。
 `expected_target=None` 时不猜测 sink，也不重新产生
 `TARGET_NOT_FOUND`、`TARGET_MISMATCH` 或 `ORPHAN_BRANCH`。此时只 materialize
 Physical DAG 中已经明确的 formal-to-formal boundary；cycle/self-reference 仍由
-Phase 4 issue 表达，并且 collapse 有 visited protection。
+Phase 4 issue projection 表达，并且 collapse 有 visited protection。
 
 ## Python API
 
