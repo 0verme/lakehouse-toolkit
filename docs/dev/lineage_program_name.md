@@ -24,6 +24,22 @@
 以及其它非空 suffix 都是可保留的 opaque 值，不会因为不是 `00` 而使 lineage
 失败。
 
+## Legacy program namespace normalization
+
+canonical 四段的 raw target token 只在进入 program-name target authority 时做有限的
+namespace normalization。当前已确认且显式支持的 mapping 只有：
+
+```text
+DWS_DM.<TABLE>  -> DM.<TABLE>
+DLK_DLO.<TABLE> -> DLO.<TABLE>
+```
+
+因此 `logical_target` 表示下游使用的 canonical physical `schema.table`，而完整
+raw `program_name` 仍保留原始 namespace provenance；模型不另增一个 identity 字段。
+未知 namespace（例如 `ABC_DM.<TABLE>`）保持原值，不根据 suffix、sink 或相似度猜测
+physical schema。这个 helper 只服务于 program-name-derived target，DatasetIdentity
+仍直接保留 SQL 中观察到的 physical schema。
+
 ## Conservative recovery
 
 解析入口为 `parse_program_name()`，结果通过 `ProgramSource` 的以下只读属性暴露：

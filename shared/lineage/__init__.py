@@ -75,6 +75,7 @@ from .domain import (
     is_temporary_asset,
     normalize_asset_name,
     normalize_declared_target_from_program_name,
+    normalize_legacy_program_namespace,
     parse_declared_primary_target,
     parse_program_name,
 )
@@ -219,6 +220,7 @@ __all__ = [
     "issue_severity",
     "normalize_asset_name",
     "normalize_declared_target_from_program_name",
+    "normalize_legacy_program_namespace",
     "parse_declared_primary_target",
     "parse_program_name",
     "audit_program_physical_dag",

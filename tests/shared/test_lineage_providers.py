@@ -366,6 +366,40 @@ class LineageProviderTests(unittest.TestCase):
         self.assertEqual(source.expected_target, "DWM.RESULT_A")
         self.assertEqual(source.logical_target, "DWM.RESULT_A")
 
+    def test_program_name_target_fallback_normalizes_confirmed_legacy_names(self):
+        profile = make_profile(
+            expected_target_column=None,
+            primary_target_strategy="program_name",
+        )
+        cases = (
+            (
+                "005:DWS_DM.RESULT_A:1:PRC_RESULT_A",
+                "DM.RESULT_A",
+                "insert into DM.RESULT_A select 1",
+            ),
+            (
+                "005:DLK_DLO.RESULT_A:1:00",
+                "DLO.RESULT_A",
+                "insert into DLO.RESULT_A select 1",
+            ),
+        )
+
+        for program_name, expected_target, script_code in cases:
+            with self.subTest(program_name=program_name):
+                cursor = FakeCursor([(program_name, script_code)])
+                connection = FakeConnection(cursor)
+                with patch.dict(os.environ, environment_for(profile), clear=False):
+                    source = next(
+                        MySQLProcessProvider(
+                            profile,
+                            connection_factory=lambda settings: connection,
+                        ).iter_program_sources()
+                    )
+
+                self.assertEqual(source.expected_target, expected_target)
+                self.assertEqual(source.logical_target, expected_target)
+                self.assertEqual(source.step_seq, 1)
+
     def test_ambiguous_three_part_program_name_does_not_become_expected_target(self):
         profile = make_profile(
             expected_target_column=None,

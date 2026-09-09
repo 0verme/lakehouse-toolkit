@@ -81,6 +81,13 @@ _DECLARED_TARGET_RE = re.compile(
     r"^(?P<schema>[A-Z][A-Z0-9_]*)\.(?P<table>[A-Z][A-Z0-9_$]*)$"
 )
 
+# These are program-name namespace wrappers, not SQL physical schemas. Keep the
+# contract explicit until a versioned namespace registry is established.
+_LEGACY_PROGRAM_NAMESPACE_MAP = {
+    "DWS_DM": "DM",
+    "DLK_DLO": "DLO",
+}
+
 
 class ProgramNameDiagnostic(str, Enum):
     """``program_name`` 解析产生的非审计诊断。"""
@@ -101,7 +108,10 @@ class ProgramNameSemantics:
     """从 legacy ``program_name`` 恢复出的 logical target / step 语义。
 
     ``logical_target`` 是唯一可以参与 target authority 的 program-name
-    字段；``legacy_marker`` 和 ``opaque_suffix`` 都不参与 Dataset Identity，
+    字段；当 raw target 使用已确认的 legacy namespace wrapper 时，
+    ``logical_target`` 保存规范化后的 physical ``schema.table``。raw token
+    不单独进入 identity，仍由原始 ``program_name`` 保留 provenance。
+    ``legacy_marker`` 和 ``opaque_suffix`` 都不参与 Dataset Identity，
     ``step_seq`` 也只表达 expected order evidence，不表达 scheduler fact。
     """
 
@@ -131,15 +141,29 @@ class ProgramNameSemantics:
         return () if self.step_seq is None else (self.step_seq,)
 
 
-def _normalize_program_name_target_token(target_token: object) -> str | None:
-    token = decode_code(target_token).strip().upper()
+def normalize_legacy_program_namespace(target: object) -> str | None:
+    """将 program-name-derived target 的已确认 legacy namespace 规范化。
+
+    只处理显式 contract 中的 namespace mapping；未知 schema 保持原值，
+    不通过 prefix/suffix 相似度猜测 physical schema。该 helper 只属于
+    program-name target authority 边界，DatasetIdentity 不调用它。
+    """
+
+    token = decode_code(target).strip().upper()
     match = _DECLARED_TARGET_RE.fullmatch(token)
     if match is None:
         return None
-    candidate = f"{match.group('schema')}.{match.group('table')}"
+    schema = _LEGACY_PROGRAM_NAMESPACE_MAP.get(
+        match.group("schema"), match.group("schema")
+    )
+    candidate = f"{schema}.{match.group('table')}"
     if is_temporary_asset(candidate):
         return None
     return candidate
+
+
+def _normalize_program_name_target_token(target_token: object) -> str | None:
+    return normalize_legacy_program_namespace(target_token)
 
 
 def _parse_positive_step(token: str) -> int | None:
@@ -154,9 +178,10 @@ def _parse_positive_step(token: str) -> int | None:
 def parse_program_name(program_name: object) -> ProgramNameSemantics:
     """按固定 ``005`` grammar 以 conservative 策略解析程序名。
 
-    只有严格四段形态才足以授予 program-name target authority。三段及其它
-    非 canonical 形态即使第二段看起来像 ``schema.table``，也只保留格式诊断，
-    不猜测 logical target 或 step，避免把未知 legacy grammar 变成错误 target。
+    只有严格四段形态才足以授予 program-name target authority；四段中的 raw
+    target 会先经过显式 legacy namespace normalization。三段及其它非 canonical
+    形态即使第二段看起来像 ``schema.table``，也只保留格式诊断，不猜测 logical
+    target 或 step，避免把未知 legacy grammar 变成错误 target。
     """
 
     normalized_name = decode_code(program_name).strip()
@@ -236,8 +261,9 @@ def normalize_declared_target_from_program_name(
     target_token: object,
     program_name_target_prefix: object = DEFAULT_PROGRAM_NAME_TARGET_PREFIX,
 ) -> str | None:
-    """验证并规范化完整的 ``schema.table`` target token。
+    """验证并规范化 program-name-derived 的完整 ``schema.table`` target。
 
+    仅应用显式 legacy namespace mapping；未知 schema 保持原值。
     ``program_name_target_prefix`` 仅为旧签名保留，不再参与解析；固定
     ``005`` grammar 不支持 multi-prefix abstraction。
     """

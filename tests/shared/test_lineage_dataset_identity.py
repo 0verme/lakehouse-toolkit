@@ -49,7 +49,14 @@ class DatasetIdentityContractTests(unittest.TestCase):
         self.assertEqual(canonical.to_dict()["canonical_table"], "TABLE_A")
 
     def test_identity_preserves_the_physical_schema_namespace(self):
-        for dataset_name in ("DWF.A", "DWM.B", "DWUPRR.C", "DWS_DWF.D"):
+        for dataset_name in (
+            "DWF.A",
+            "DWM.B",
+            "DWUPRR.C",
+            "DWS_DWF.D",
+            "DWS_DM.E",
+            "DLK_DLO.F",
+        ):
             with self.subTest(dataset_name=dataset_name):
                 identity = DatasetIdentity.from_name("DEV200", dataset_name)
                 self.assertIsNotNone(identity)

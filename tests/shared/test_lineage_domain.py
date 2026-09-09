@@ -18,6 +18,7 @@ from shared.lineage.domain import (
     is_formal_asset,
     is_temporary_asset,
     normalize_declared_target_from_program_name,
+    normalize_legacy_program_namespace,
     parse_declared_primary_target,
     parse_program_name,
 )
@@ -115,8 +116,34 @@ class LineageDomainTests(unittest.TestCase):
             "DWM.RESULT_A",
         )
 
+    def test_program_name_parser_normalizes_confirmed_legacy_names(self):
+        cases = (
+            ("005:DM.RESULT_A:1:00", "DM.RESULT_A", 1),
+            ("005:DWS_DM.RESULT_A:1:00", "DM.RESULT_A", 1),
+            ("005:DLK_DLO.RESULT_A:1:00", "DLO.RESULT_A", 1),
+            ("005:DWS_DM.RESULT_A:2:00", "DM.RESULT_A", 2),
+            ("005:DWS_DM.RESULT_A:1:PRC_RESULT_A", "DM.RESULT_A", 1),
+        )
+
+        for value, expected_target, expected_step in cases:
+            with self.subTest(value=value):
+                parsed = parse_program_name(value)
+                self.assertEqual(parsed.logical_target, expected_target)
+                self.assertEqual(parsed.step_seq, expected_step)
+                self.assertIn(
+                    ProgramNameDiagnostic.PROGRAM_NAME_TARGET_RESOLVED,
+                    parsed.diagnostics,
+                )
+
+        self.assertEqual(
+            normalize_legacy_program_namespace("ABC_DM.RESULT_A"),
+            "ABC_DM.RESULT_A",
+        )
+
     def test_program_name_parser_keeps_ambiguous_three_part_shapes_unknown(self):
         for value in (
+            "005:DWS_DM.RESULT_A:00",
+            "005:DLK_DLO.RESULT_A:00",
             "005:DWS_DWM.RESULT_A:00",
             "005:DWM.RESULT_A:00",
             "005:ABC_DWM.RESULT_A:00",

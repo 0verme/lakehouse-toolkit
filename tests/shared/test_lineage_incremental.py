@@ -119,7 +119,26 @@ class IncrementalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.unchanged, ())
         self.assertEqual(plan.changed, (current,))
 
-    def test_audit_target_semantics_version_bump_rebuilds_v4_state(self):
+    def test_namespace_normalization_version_bump_rebuilds_v5_state(self):
+        current = source("PROGRAM_DEMO_NAMESPACE_NORMALIZATION")
+        previous = (
+            replace(
+                ProgramState.from_source(
+                    current,
+                    observed_at=OBSERVED_AT,
+                    batch_id="batch-old",
+                ),
+                pipeline_version="lineage-pipeline-v5-program-namespace-normalization",
+            ),
+        )
+
+        plan = plan_incremental([current], previous)
+
+        self.assertEqual(current.source_hash, previous[0].source_hash)
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
+
+    def test_audit_target_semantics_version_bump_rebuilds_v5_state(self):
         current = source("PROGRAM_DEMO_AUDIT_VERSION_CHANGED")
         previous = (
             replace(
@@ -128,7 +147,7 @@ class IncrementalPlannerTests(unittest.TestCase):
                     observed_at=OBSERVED_AT,
                     batch_id="batch-old",
                 ),
-                pipeline_version="lineage-pipeline-v4-program-name-target-authority",
+                pipeline_version="lineage-pipeline-v5-audit-target-mismatch-semantics",
             ),
         )
 
