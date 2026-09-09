@@ -7,9 +7,11 @@ from typing import cast
 
 from shared.lineage.audit import (  # pyright: ignore[reportMissingImports]
     ProgramLineageAuditor,
+    TargetSelectionMode,
     audit_program_physical_dag,
     compute_lineage_issue_stable_key,
     issue_severity,
+    select_materialization_target,
 )
 from shared.lineage.domain import (
     IssueType,
@@ -215,6 +217,163 @@ class LineageAuditTests(unittest.TestCase):
             IssueType.TARGET_NOT_FOUND,
             {issue.issue_type for issue in result.issues},
         )
+
+    def test_three_part_unique_hint_selects_one_formal_sink_without_authority(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DM.RESULT_A:00",
+            script_code=(
+                'execute("INSERT INTO DM.RESULT_A SELECT * FROM ODS.DEMO_A")\n'
+                'execute("INSERT INTO DM.RESULT_B SELECT * FROM ODS.DEMO_B")'
+            ),
+        )
+        dag = build_program_physical_dag(source)
+        result = audit_program_physical_dag(dag)
+
+        self.assertIsNone(dag.expected_target)
+        self.assertEqual(source.target_hint, "DM.RESULT_A")
+        self.assertIsNone(result.expected_target)
+        self.assertEqual(result.target_hint, "DM.RESULT_A")
+        self.assertEqual(
+            result.selected_materialization_target,
+            "DM.RESULT_A",
+        )
+        self.assertEqual(result.selection_mode, TargetSelectionMode.UNIQUE_HINT)
+        self.assertEqual(result.target_reachable_nodes, ())
+        self.assertEqual(
+            result.selected_target_reachable_nodes,
+            ("DM.RESULT_A", "ODS.DEMO_A"),
+        )
+        self.assertEqual(
+            {issue.issue_type for issue in result.issues},
+            {IssueType.MULTI_SINK_CANDIDATE},
+        )
+        multi_sink = issue_of(result, IssueType.MULTI_SINK_CANDIDATE)
+        evidence = evidence_of(multi_sink)
+        self.assertEqual(evidence["target_hint"], "DM.RESULT_A")
+        self.assertEqual(evidence["hint_match_count"], 1)
+        self.assertEqual(evidence["selected_materialization_target"], "DM.RESULT_A")
+        self.assertEqual(evidence["selection_mode"], "UNIQUE_HINT")
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, result.issue_types)
+        self.assertNotIn(IssueType.ORPHAN_BRANCH, result.issue_types)
+
+    def test_three_part_hint_without_match_remains_unresolved(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DM.RESULT_X:00",
+            script_code=(
+                'execute("INSERT INTO DM.RESULT_A SELECT * FROM ODS.DEMO_A")\n'
+                'execute("INSERT INTO DM.RESULT_B SELECT * FROM ODS.DEMO_B")'
+            ),
+        )
+        result = audit_program_physical_dag(build_program_physical_dag(source))
+
+        self.assertIsNone(result.expected_target)
+        self.assertEqual(result.target_hint, "DM.RESULT_X")
+        self.assertIsNone(result.selected_materialization_target)
+        self.assertEqual(result.selection_mode, TargetSelectionMode.NONE)
+        self.assertEqual(result.hint_match_count, 0)
+        self.assertEqual(result.target_reachable_nodes, ())
+        self.assertEqual(result.issue_types, (IssueType.MULTI_SINK_CANDIDATE,))
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, result.issue_types)
+
+    def test_duplicate_exact_hint_candidates_remain_unresolved(self):
+        dag = build_program_physical_dag(
+            ProgramSource(
+                environment="DEV",
+                source_profile="fixture",
+                program_name="005:DWS_DM.RESULT_A:00",
+                script_code=(
+                    'execute("INSERT INTO DM.RESULT_A SELECT * FROM ODS.DEMO_A")\n'
+                    'execute("INSERT INTO DM.RESULT_B SELECT * FROM ODS.DEMO_B")'
+                ),
+            )
+        )
+        duplicate_sink_dag = replace(
+            dag,
+            sinks=("DM.RESULT_A", "DM.RESULT_A", "DM.RESULT_B"),
+        )
+        result = audit_program_physical_dag(duplicate_sink_dag)
+
+        self.assertIsNone(result.selected_materialization_target)
+        self.assertEqual(result.selection_mode, TargetSelectionMode.NONE)
+        self.assertEqual(result.hint_match_count, 2)
+        self.assertEqual(result.target_reachable_nodes, ())
+
+        direct = select_materialization_target(
+            authoritative_target=None,
+            target_hint="DM.RESULT_A",
+            formal_sinks=("DM.RESULT_A", "DM.RESULT_A", "DM.RESULT_B"),
+        )
+        self.assertEqual(direct.selection_mode, TargetSelectionMode.NONE)
+        self.assertIsNone(direct.selected_target)
+
+    def test_three_part_hint_does_not_gate_single_sink_materialization(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DM.RESULT_A:00",
+            script_code='execute("INSERT INTO DM.RESULT_A SELECT * FROM ODS.DEMO_A")',
+        )
+        result = audit_program_physical_dag(build_program_physical_dag(source))
+
+        self.assertIsNone(result.expected_target)
+        self.assertEqual(result.target_hint, "DM.RESULT_A")
+        self.assertIsNone(result.selected_materialization_target)
+        self.assertEqual(result.selection_mode, TargetSelectionMode.NONE)
+        self.assertEqual(result.issues, ())
+
+    def test_four_part_authority_wins_and_keeps_orphan_audit_semantics(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DM.RESULT_A:1:00",
+            script_code=(
+                'execute("INSERT INTO DM.RESULT_A SELECT * FROM ODS.DEMO_A")\n'
+                'execute("INSERT INTO DM.RESULT_B SELECT * FROM ODS.DEMO_B")'
+            ),
+        )
+        result = audit_program_physical_dag(build_program_physical_dag(source))
+
+        self.assertEqual(result.expected_target, "DM.RESULT_A")
+        self.assertEqual(result.target_hint, "DM.RESULT_A")
+        self.assertEqual(
+            result.selected_materialization_target,
+            "DM.RESULT_A",
+        )
+        self.assertEqual(result.selection_mode, TargetSelectionMode.AUTHORITATIVE)
+        self.assertEqual(result.orphan_branch_sinks, ("DM.RESULT_B",))
+        self.assertIn(IssueType.ORPHAN_BRANCH, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, result.issue_types)
+
+    def test_explicit_target_wins_over_three_part_hint(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DM.RESULT_A:00",
+            script_code=(
+                'execute("INSERT INTO DM.RESULT_A SELECT * FROM ODS.DEMO_A")\n'
+                'execute("INSERT INTO DM.RESULT_B SELECT * FROM ODS.DEMO_B")'
+            ),
+            expected_target="DM.RESULT_B",
+        )
+        result = audit_program_physical_dag(build_program_physical_dag(source))
+
+        self.assertEqual(result.expected_target, "DM.RESULT_B")
+        self.assertEqual(result.target_hint, "DM.RESULT_A")
+        self.assertEqual(
+            result.selected_materialization_target,
+            "DM.RESULT_B",
+        )
+        self.assertEqual(result.selection_mode, TargetSelectionMode.AUTHORITATIVE)
+        self.assertEqual(result.orphan_branch_sinks, ("DM.RESULT_A",))
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, result.issue_types)
 
     def test_target_not_found_does_not_turn_every_branch_into_orphan(self):
         result = audit_program_physical_dag(build_dag(TARGET_NOT_FOUND_PROGRAM))

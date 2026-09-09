@@ -14,6 +14,7 @@ from shared.lineage.domain import (
     ProgramSource,
     expected_processing_order,
     extract_program_declared_target_token,
+    extract_program_target_hint,
     group_program_sources_by_logical_target,
     is_formal_asset,
     is_temporary_asset,
@@ -57,12 +58,13 @@ class LineageDomainTests(unittest.TestCase):
         source = ProgramSource(
             environment="DEV",
             source_profile="fixture",
-            program_name="005:DWS_DWM.RESULT_A:00",
+            program_name="005:DWS_DM.RESULT_A:00",
             script_code="select 1",
             expected_target="DWM.EXPLICIT_TARGET",
         )
 
         self.assertIsNone(source.logical_target)
+        self.assertEqual(source.target_hint, "DM.RESULT_A")
         self.assertEqual(source.resolved_target, "DWM.EXPLICIT_TARGET")
         self.assertIsNone(source.step_seq)
 
@@ -97,6 +99,7 @@ class LineageDomainTests(unittest.TestCase):
 
         self.assertEqual(parsed.legacy_marker, "005")
         self.assertEqual(parsed.logical_target, "DWM.RESULT_A")
+        self.assertEqual(parsed.target_hint, "DWM.RESULT_A")
         self.assertEqual(parsed.step_seq, 1)
         self.assertEqual(parsed.opaque_suffix, "00")
         self.assertEqual(
@@ -172,16 +175,21 @@ class LineageDomainTests(unittest.TestCase):
         )
 
     def test_program_name_parser_keeps_ambiguous_three_part_shapes_unknown(self):
-        for value in (
-            "005:DWS_DM.RESULT_A:00",
-            "005:DLK_DLO.RESULT_A:00",
-            "005:DWS_DWM.RESULT_A:00",
-            "005:DWM.RESULT_A:00",
-            "005:ABC_DWM.RESULT_A:00",
-        ):
+        cases = (
+            ("005:DWS_DM.RESULT_A:00", "DM.RESULT_A"),
+            ("005:DLK_DLO.RESULT_A:00", "DLO.RESULT_A"),
+            ("005:DWS_DWM.RESULT_A:00", "DWM.RESULT_A"),
+            ("005:DWM.RESULT_A:00", "DWM.RESULT_A"),
+            ("005:ABC_DWM.RESULT_A:00", "ABC_DWM.RESULT_A"),
+            ("005:DWS_ABC.RESULT_A:00", "DWS_ABC.RESULT_A"),
+        )
+        for value, expected_hint in cases:
             with self.subTest(value=value):
                 parsed = parse_program_name(value)
                 self.assertIsNone(parsed.logical_target)
+                self.assertEqual(parsed.target_hint, expected_hint)
+                if value.startswith("005:DWS_ABC."):
+                    self.assertNotEqual(parsed.target_hint, "ABC.RESULT_A")
                 self.assertIsNone(parsed.step_seq)
                 self.assertIsNone(parsed.opaque_suffix)
                 self.assertIn(
@@ -202,6 +210,10 @@ class LineageDomainTests(unittest.TestCase):
                 )
 
         self.assertIsNone(parse_declared_primary_target("005:ABC_DWM.RESULT_A:00"))
+        self.assertEqual(
+            extract_program_target_hint("005:DWS_DM.RESULT_A:00"),
+            "DM.RESULT_A",
+        )
 
         custom_suffix = parse_program_name("005:DWM.RESULT_A:1:ABCD")
         self.assertEqual(custom_suffix.logical_target, "DWM.RESULT_A")
@@ -221,6 +233,7 @@ class LineageDomainTests(unittest.TestCase):
             with self.subTest(value=value):
                 parsed = parse_program_name(value)
                 self.assertIsNone(parsed.logical_target)
+                self.assertIsNone(parsed.target_hint)
                 self.assertIn(
                     ProgramNameDiagnostic.PROGRAM_NAME_TARGET_INVALID,
                     parsed.diagnostics,

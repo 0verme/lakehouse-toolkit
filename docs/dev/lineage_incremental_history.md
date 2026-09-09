@@ -28,19 +28,27 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v7-expanded-program-namespace-registry`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v8-program-target-hint-selection`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
-bump 到新的语义版本，并在本文记录原因。本次 v7 扩展固定 `005` canonical 四段
-`program_name` target authority 前的显式 legacy namespace registry：
+bump 到新的语义版本，并在本文记录原因。v7 在 v6 audit target semantics 的基础上
+固定 `005` canonical 四段 target authority 前的显式 legacy namespace registry：
 `DWS_DM -> DM`、`DWS_DWM -> DWM`、`DWS_DWA -> DWA`、`DWS_DWP -> DWP`、
 `DWS_DWD -> DWD`、`DWS_DWF -> DWF`、`DWS_DWUPRR -> DWUPRR` 与
 `DLK_DLO -> DLO`。未知 namespace 仍保持原值，不通过 prefix 猜测。v6 同时包含
 `expected_target_written` 与 `expected_target_is_sink` Audit facts：expected target
 已写入但因 self-reference、downstream 或其它 branch 不是 graph-terminal sink 时，
 不再机械生成 `TARGET_MISMATCH`；expected target 未写入且存在其它 formal sink 的真正
-mismatch 仍然保留。ambiguous 三段仍保持 unknown，step/suffix 语义以及 Python AST
-失败后的保守 legacy SQL literal recovery 不变。相同 source hash 的旧 v4/v5/v6 facts
-都必须 rebuild，避免复用 namespace registry 或 audit target semantics 变更前的旧 facts。
+mismatch 仍然保留。
+
+v8 在上述 namespace registry 与 audit semantics 之后，新增三段 `program_name` 的
+non-authoritative `target_hint`，并把 exact unique multi-sink selection 作为独立
+`TargetSelectionResult` fact。`target_hint` 不写入 `expected_target`，不会产生
+`TARGET_MISMATCH`/`TARGET_NOT_FOUND`，也不会移除 `MULTI_SINK_CANDIDATE`；只有无
+authority、formal sinks 多于一个且 exact match 唯一时才影响 materialization branch。
+四段 authority、explicit/provider priority、DatasetIdentity、step/suffix 语义以及
+Python AST 失败后的保守 legacy SQL literal recovery 不变。相同 source hash 的旧
+v4/v5/v6/v7 facts 都必须 rebuild，避免复用 namespace registry、audit target semantics
+或 target selection 变更前的旧 facts。
 
 ## Incremental planner
 
@@ -113,8 +121,8 @@ AND previous.pipeline_version == LINEAGE_PIPELINE_VERSION
 删除历史 batch、`lineage_edge`、`lineage_issue`。
 
 需要 bump pipeline version 的场景包括：parser 提取规则、primary target 解析、
-Physical DAG 节点/边语义、audit 判定、TMP collapse 或 materialization evidence
-语义发生改变；仅改变日志文案或运行参数不需要 bump。
+Physical DAG 节点/边语义、audit 判定、target selection、TMP collapse 或
+materialization evidence 语义发生改变；仅改变日志文案或运行参数不需要 bump。
 
 ## Issue lifecycle
 

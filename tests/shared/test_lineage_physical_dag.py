@@ -313,7 +313,10 @@ class PhysicalDAGTests(unittest.TestCase):
         )
         dag = build_program_physical_dag(source)
 
+        self.assertIsNone(source.logical_target)
+        self.assertEqual(source.target_hint, "DWM.DEMO_C")
         self.assertIsNone(dag.expected_target)
+        self.assertEqual(dag.program_source.target_hint, "DWM.DEMO_C")
         self.assertEqual(dag.sinks, (normalize_table_name("DWM.DEMO_C"),))
         self.assertGreater(len(dag.edges), 0)
 
