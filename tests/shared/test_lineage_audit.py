@@ -262,6 +262,41 @@ class LineageAuditTests(unittest.TestCase):
             {issue.issue_type for issue in result.issues},
         )
 
+    def test_expected_target_self_reference_is_self_reference_only(self):
+        script = """
+        execute("INSERT INTO DWA.DEMO_RESULT SELECT * FROM ODS.DEMO_A")
+        execute("INSERT OVERWRITE TABLE DWA.DEMO_RESULT SELECT * FROM DWA.DEMO_RESULT")
+        """
+        dag = build_dag(script)
+        result = audit_program_physical_dag(dag)
+
+        self.assertEqual(dag.sinks, ())
+        self.assertIn(EXPECTED_TARGET, {step.target for step in dag.steps})
+        self.assertEqual(
+            [issue.issue_type for issue in result.issues],
+            [IssueType.SELF_REFERENCE],
+        )
+        self_issue = issue_of(result, IssueType.SELF_REFERENCE)
+        self.assertEqual(self_issue.node_key, EXPECTED_TARGET)
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, result.issue_types)
+
+    def test_pure_self_reference_preserves_self_reference_without_target_mismatch(self):
+        target = normalize_table_name("DWM.DEMO_SELF")
+        dag = build_dag(
+            'execute("INSERT OVERWRITE TABLE DWM.DEMO_SELF SELECT * FROM DWM.DEMO_SELF")',
+            expected_target=target,
+        )
+        result = audit_program_physical_dag(dag)
+
+        self.assertEqual(dag.sinks, ())
+        self.assertEqual(
+            [issue.issue_type for issue in result.issues],
+            [IssueType.SELF_REFERENCE],
+        )
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, result.issue_types)
+
     def test_expected_target_none_skips_target_and_orphan_detectors(self):
         result = audit_program_physical_dag(
             build_dag(UNKNOWN_TARGET_PROGRAM, expected_target=None)
@@ -287,29 +322,35 @@ class LineageAuditTests(unittest.TestCase):
             {issue.issue_type for issue in result.issues},
         )
 
-    def test_expected_written_but_not_final_is_target_mismatch(self):
+    def test_expected_written_downstream_is_orphan_not_target_mismatch(self):
         script = """
         execute("INSERT INTO DWA.DEMO_EXPECTED SELECT * FROM ODS.DEMO_A")
         execute("INSERT INTO DWA.DEMO_OTHER SELECT * FROM DWA.DEMO_EXPECTED")
         """
         expected = normalize_table_name("DWA.DEMO_EXPECTED")
-        result = audit_program_physical_dag(
-            build_dag(script, expected_target="DWA.DEMO_EXPECTED")
-        )
+        other = normalize_table_name("DWA.DEMO_OTHER")
+        dag = build_dag(script, expected_target="DWA.DEMO_EXPECTED")
+        result = audit_program_physical_dag(dag)
 
-        mismatch = issue_of(result, IssueType.TARGET_MISMATCH)
-        evidence = evidence_of(mismatch)
-        self.assertEqual(evidence["expected_target"], expected)
-        self.assertTrue(evidence["expected_target_written"])
-        self.assertFalse(evidence["expected_target_is_sink"])
+        self.assertIn(expected, {step.target for step in dag.steps})
+        self.assertNotIn(expected, dag.sinks)
         self.assertEqual(
-            evidence["actual_formal_sinks"],
-            [normalize_table_name("DWA.DEMO_OTHER")],
+            {issue.issue_type for issue in result.issues},
+            {IssueType.ORPHAN_BRANCH},
+        )
+        self.assertNotIn(
+            IssueType.TARGET_MISMATCH,
+            {issue.issue_type for issue in result.issues},
         )
         self.assertNotIn(
             IssueType.TARGET_NOT_FOUND,
             {issue.issue_type for issue in result.issues},
         )
+        orphan = issue_of(result, IssueType.ORPHAN_BRANCH)
+        self.assertEqual(orphan.branch_sink, other)
+        evidence = evidence_of(orphan)
+        self.assertEqual(evidence["expected_target"], expected)
+        self.assertEqual(evidence["branch_sink"], other)
 
     def test_self_reference_is_reported_once_without_single_node_cycle_issue(self):
         result = audit_program_physical_dag(

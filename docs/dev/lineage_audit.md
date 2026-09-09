@@ -46,7 +46,7 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 | `ORPHAN_BRANCH` | 已知且实际写入的 expected target 存在时，某个 terminal branch 无法到达该 target | `MEDIUM` |
 | `MULTI_SINK_CANDIDATE` | `dag.sinks` 中有多个终止写入候选 | `MEDIUM` |
 | `TARGET_NOT_FOUND` | expected target 未被实际写入，且没有其它明确正式 sink | `HIGH` |
-| `TARGET_MISMATCH` | expected target 未成为最终 sink，或存在其它明确正式 sink 替代它 | `HIGH` |
+| `TARGET_MISMATCH` | expected target 未被实际写入，且存在其它明确正式 sink 替代它 | `HIGH` |
 | `CYCLE_DETECTED` | 一个多节点 strongly connected component（SCC） | `HIGH` |
 | `SELF_REFERENCE` | 存在 `A → A` 的 PhysicalEdge | `HIGH` |
 | `LINEAGE_BRANCH_BROKEN` | 既有有效 target 分支在后续 snapshot 中断裂，由 evolution/history 派生 | `HIGH` |
@@ -60,6 +60,16 @@ Severity 由 `ISSUE_SEVERITY_POLICY` 集中定义，并通过 `issue_severity()`
 `formal_sinks` 与 `temporary_sinks`，不会把 `TMP_UNUSED` 误称为正式结果表。
 `MULTI_SINK_CANDIDATE` 仍会保留 TMP sink，因为多个终止写入本身是需要审计的事实。
 
+审计同时保留两个不同的 target fact：
+
+- `expected_target_written`：expected target 是否出现在实际 SQL step target 或
+  PhysicalEdge target 中，表示业务写入事实；
+- `expected_target_is_sink`：expected target 是否出现在 `dag.sinks` 中，表示
+  graph-terminal fact。
+
+后者不是前者的替代品。self-loop、downstream write 或其它 branch 都可能让一个
+已经写入的 target 不是 graph terminal sink；这不应自动等价于 target 写错。
+
 `expected_target` 的规则如下：
 
 `expected_target` 也可以由 profile 显式启用的
@@ -71,15 +81,20 @@ result hint，不是唯一结果声明。所有实际 terminal sink 都保留并
    `TARGET_NOT_FOUND`、`TARGET_MISMATCH` 或 `ORPHAN_BRANCH`；仍可生成 sink、cycle
    和 self-reference issue。
 2. expected target 是 sink：认为 target 已正确成为最终写入，不生成 target issue。
-3. expected target 被写入但不是 sink：生成一个 `TARGET_MISMATCH`，表示 target
-   与终止输出语义不一致。
+3. expected target 已被写入但不是 sink：不生成 `TARGET_MISMATCH`。self-reference
+   由 `SELF_REFERENCE` 表达；存在 downstream 或其它不能到达 expected target 的
+   terminal branch 时由 `ORPHAN_BRANCH` 表达；多个 terminal sink 仍由
+   `MULTI_SINK_CANDIDATE` 表达。
 4. expected target 未被写入：如果存在明确正式 sink，生成一个
    `TARGET_MISMATCH`；否则生成一个 `TARGET_NOT_FOUND`。因此同一事实不会机械地
    同时产生两个 target issue。
 
 例如 `expected_target=DWA.DEMO_RESULT`、实际 sink 为
-`DWA.DEMO_OTHER` 时是 `TARGET_MISMATCH`，不是 `TARGET_NOT_FOUND`。如果实际只
-写入 `TMP_1`，则是 `TARGET_NOT_FOUND`。
+`DWA.DEMO_OTHER` 且 expected target 从未写入时是 `TARGET_MISMATCH`，不是
+`TARGET_NOT_FOUND`。如果实际只写入 `TMP_1`，则是 `TARGET_NOT_FOUND`。
+如果 `DWA.DEMO_RESULT` 已写入后又 downstream 写入 `DWA.DEMO_OTHER`，则
+expected target 的 `written` fact 为真、`sink` fact 为假；该 terminal branch
+由 `ORPHAN_BRANCH` 表达，不再重复生成 `TARGET_MISMATCH`。
 
 ## ORPHAN_BRANCH
 
@@ -102,7 +117,10 @@ ODS.DEMO_X → TMP_X1 → TMP_X2
 的身份仍由 terminal sink 区分。
 
 TMP 不是 orphan 的充分条件。`TMP_X1 → TMP_X2 → DWA.DEMO_RESULT` 能够到达
-expected target，因此不会因为节点类型是 temporary asset 而报警。
+expected target，因此不会因为节点类型是 temporary asset 而报警。相反，若
+`DWA.DEMO_RESULT → DWA.DEMO_OTHER`，`DWA.DEMO_OTHER` 是无法沿业务方向到达
+expected target 的 terminal branch，会生成一个 branch-level `ORPHAN_BRANCH`，
+而不是把已写入的 expected target 再标成 `TARGET_MISMATCH`。
 
 ## Cycle 与 self-reference
 
