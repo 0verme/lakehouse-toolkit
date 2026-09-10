@@ -16,16 +16,22 @@ from shared.lineage.domain import (
 from shared.lineage.materialization import MaterializationBatch, materialize_program
 from shared.lineage.materialization_dws import (
     ACTIVATE_BATCH_SQL,
+    BATCH_SELECT_SQL,
+    BUSINESS_EDGE_SELECT_SQL,
     INSERT_BATCH_SQL,
     INSERT_BUSINESS_EDGE_SQL,
     INSERT_ISSUE_SQL,
     INSERT_PHYSICAL_EDGE_SQL,
     INSERT_PROGRAM_STATE_SQL,
+    ISSUE_SELECT_SQL,
+    PHYSICAL_EDGE_SELECT_SQL,
+    PROGRAM_STATE_SELECT_SQL,
     RETIRE_BATCH_SQL,
     DWSMaterializationStore,
     DWSPublishResult,
     TIMESTAMPTZ_PARAM_SQL,
     _begin_transaction,
+    _parse_datetime,
     _timestamp_param,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG, build_program_physical_dag
@@ -97,6 +103,55 @@ _WRITE_SQL = (
     ACTIVATE_BATCH_SQL,
 )
 _WRITE_SQL_BY_NORMALIZED = {" ".join(sql.split()): sql for sql in _WRITE_SQL}
+_READ_TIMESTAMP_PROJECTIONS = {
+    "lineage_batch": (
+        BATCH_SELECT_SQL,
+        ("observed_at", "published_at", "created_at", "updated_at"),
+    ),
+    "lineage_program_state": (
+        PROGRAM_STATE_SELECT_SQL,
+        (
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "lineage_edge": (
+        PHYSICAL_EDGE_SELECT_SQL,
+        (
+            "observed_at",
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "lineage_business_edge": (
+        BUSINESS_EDGE_SELECT_SQL,
+        (
+            "observed_at",
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "lineage_issue": (
+        ISSUE_SELECT_SQL,
+        (
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "disposition_updated_at",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+}
 
 
 def _split_sql_arguments(expression: str) -> tuple[str, ...]:
@@ -342,6 +397,76 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         self.assertEqual(_timestamp_param(value, "observed_at"), value.isoformat())
         self.assertIsNone(_timestamp_param(None, "disposition_updated_at"))
 
+    def test_parse_datetime_supports_python_310_dws_offsets(self) -> None:
+        expected_utc = datetime(
+            2026, 1, 15, 3, 4, 5, 123456, tzinfo=timezone.utc
+        )
+        expected_shanghai = expected_utc.astimezone(timezone(timedelta(hours=8)))
+        expected_minus_5 = datetime(
+            2026,
+            1,
+            15,
+            11,
+            4,
+            5,
+            123456,
+            tzinfo=timezone(timedelta(hours=-5)),
+        )
+        expected_minus_530 = datetime(
+            2026,
+            1,
+            15,
+            11,
+            4,
+            5,
+            123456,
+            tzinfo=timezone(timedelta(hours=-5, minutes=-30)),
+        )
+        values = {
+            "2026-01-15 11:04:05.123456+08": expected_shanghai,
+            "2026-01-15 03:04:05.123456+00": expected_utc,
+            "2026-01-15 11:04:05.123456+08:00": expected_shanghai,
+            "2026-01-15 11:04:05.123456+0800": expected_shanghai,
+            "2026-01-15 11:04:05.123456-05": expected_minus_5,
+            "2026-01-15 11:04:05.123456-0530": expected_minus_530,
+            "2026-01-15T03:04:05.123456Z": expected_utc,
+        }
+        for text, expected in values.items():
+            with self.subTest(text=text):
+                parsed = _parse_datetime(text, "observed_at")
+                self.assertEqual(parsed, expected)
+                self.assertIsNotNone(parsed.tzinfo)
+                self.assertIsNotNone(parsed.utcoffset())
+
+        aware = datetime(2026, 1, 15, 3, 4, 5, tzinfo=timezone.utc)
+        self.assertIs(_parse_datetime(aware, "observed_at"), aware)
+        with self.assertRaisesRegex(ValueError, "timezone offset"):
+            _parse_datetime(datetime(2026, 1, 15, 3, 4, 5), "observed_at")
+        with self.assertRaisesRegex(ValueError, "timezone offset"):
+            _parse_datetime("2026-01-15 03:04:05", "observed_at")
+
+        same_instant = _parse_datetime(
+            "2026-01-15 03:04:05.123456+00", "observed_at"
+        )
+        same_instant_local = _parse_datetime(
+            "2026-01-15 11:04:05.123456+08", "observed_at"
+        )
+        different_instant = _parse_datetime(
+            "2026-01-15 03:04:06.123456+00", "observed_at"
+        )
+        self.assertEqual(same_instant, same_instant_local)
+        self.assertNotEqual(same_instant, different_instant)
+
+    def test_all_dws_read_timestamps_use_explicit_text_projection(self) -> None:
+        for table_name, (sql, columns) in _READ_TIMESTAMP_PROJECTIONS.items():
+            for column in columns:
+                with self.subTest(table=table_name, column=column):
+                    self.assertRegex(
+                        sql,
+                        rf"CAST\(\s*(?:[a-z]+\.)?{column}\s+AS "
+                        rf"VARCHAR\(128\)\s*\)\s+AS\s+{column}\b",
+                    )
+
     def test_all_dws_projection_and_switch_timestamps_use_cast_boundary(self) -> None:
         source = ProgramSource(
             "DEV",
@@ -402,6 +527,111 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         )
         batch_columns, _ = _insert_contract(batch_call[1])
         self.assertIsNone(batch_call[2][batch_columns.index("published_at")])
+
+    def test_dws_read_round_trip_preserves_aware_instants_for_all_entities(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-read-round-trip",
+            observed_at=OBSERVED_AT,
+        )
+        batch = replace(
+            batch,
+            issues=(
+                LineageIssue(
+                    environment="DEV",
+                    source_profile="fixture",
+                    program_name="DEMO_PROGRAM",
+                    issue_type="ORPHAN_BRANCH",
+                    severity="MEDIUM",
+                    message="round-trip regression issue",
+                    disposition_updated_at=OBSERVED_AT,
+                    disposition_updated_by="DEMO_TESTER",
+                ),
+            ),
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        metadata = self.store.get_batch_metadata(batch.batch_id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata.observed_at, OBSERVED_AT)
+        self.assertEqual(metadata.published_at, OBSERVED_AT)
+
+        states = self.store.read_program_states(batch_id=batch.batch_id)
+        self.assertEqual(len(states), 1)
+        self.assertEqual(states[0].first_seen_at, OBSERVED_AT)
+        self.assertEqual(states[0].last_seen_at, OBSERVED_AT)
+        self.assertEqual(states[0].last_changed_at, OBSERVED_AT)
+
+        physical = self.store.read_physical_edges(batch_id=batch.batch_id)
+        self.assertGreater(len(physical), 0)
+        for row in physical:
+            self.assertEqual(
+                (
+                    row.observed_at,
+                    row.first_seen_at,
+                    row.last_seen_at,
+                    row.last_changed_at,
+                    row.created_at,
+                    row.updated_at,
+                ),
+                (OBSERVED_AT,) * 6,
+            )
+
+        business = self.store._fetch_business_rows(
+            self.connection, batch_id=batch.batch_id
+        )
+        self.assertEqual(len(business), 1)
+        self.assertEqual(
+            (
+                business[0].observed_at,
+                business[0].first_seen_at,
+                business[0].last_seen_at,
+                business[0].last_changed_at,
+                business[0].created_at,
+                business[0].updated_at,
+            ),
+            (OBSERVED_AT,) * 6,
+        )
+
+        issues = self.store._fetch_issue_rows(self.connection, batch_id=batch.batch_id)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(
+            (
+                issues[0].first_seen_at,
+                issues[0].last_seen_at,
+                issues[0].last_changed_at,
+                issues[0].disposition_updated_at,
+                issues[0].created_at,
+                issues[0].updated_at,
+            ),
+            (OBSERVED_AT,) * 6,
+        )
+
+        with self.store._connection_scope() as connection:
+            raw_states = self.store._fetch_program_state_rows(
+                connection, batch_id=batch.batch_id
+            )
+        self.assertTrue(raw_states)
+        for index in (8, 9, 10, 12, 13):
+            self.assertIsInstance(raw_states[0][index], str)
+            self.assertEqual(
+                _parse_datetime(raw_states[0][index], "program_state_timestamp"),
+                OBSERVED_AT,
+            )
 
     def test_writes_physical_tmp_rows_and_collapsed_formal_business_row(self) -> None:
         source = ProgramSource(
