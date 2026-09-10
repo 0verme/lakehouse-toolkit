@@ -68,23 +68,31 @@ def _connect_with_profile(profile: str) -> Any:
 
 
 # Every statement below is source-controlled and schema-qualified.  Values from
-# providers/configuration are always passed through DB-API parameters.
-INSERT_BATCH_SQL = """
+# providers/configuration are always passed through DB-API parameters.  Keep
+# timestamptz parameters as ISO-8601 text and apply the same explicit SQL cast
+# at every DWS write boundary; this avoids relying on old JDBC datetime binding.
+TIMESTAMPTZ_PARAM_SQL = "CAST(? AS TIMESTAMP WITH TIME ZONE)"
+
+INSERT_BATCH_SQL = f"""
     INSERT INTO dwp.lineage_batch(
         batch_id, snapshot_mode, complete_snapshot, snapshot_scope,
         pipeline_version, observed_at, previous_batch_id, publish_status,
         published_at, program_count, edge_count, issue_count, is_active,
         created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, {TIMESTAMPTZ_PARAM_SQL}, ?, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, ?, ?, ?, ?, {TIMESTAMPTZ_PARAM_SQL},
+              {TIMESTAMPTZ_PARAM_SQL})
 """
-INSERT_PROGRAM_STATE_SQL = """
+INSERT_PROGRAM_STATE_SQL = f"""
     INSERT INTO dwp.lineage_program_state(
         row_key, program_key, environment, source_profile, program_name,
         source_hash, pipeline_version, batch_id, first_seen_at, last_seen_at,
         last_changed_at, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, {TIMESTAMPTZ_PARAM_SQL},
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL}, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL})
 """
-INSERT_PHYSICAL_EDGE_SQL = """
+INSERT_PHYSICAL_EDGE_SQL = f"""
     INSERT INTO dwp.lineage_edge(
         row_key, edge_key, environment, source_profile, program_key,
         program_name, source_table, target_table, source_node_kind,
@@ -92,18 +100,24 @@ INSERT_PHYSICAL_EDGE_SQL = """
         evidence_type, evidence_json, source_hash, pipeline_version, batch_id,
         observed_at, first_seen_at, last_seen_at, last_changed_at, is_active,
         created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL},
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL}, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL})
 """
-INSERT_BUSINESS_EDGE_SQL = """
+INSERT_BUSINESS_EDGE_SQL = f"""
     INSERT INTO dwp.lineage_business_edge(
         row_key, business_edge_key, environment, source_profile, program_key,
         program_name, source_dataset_key, source_table, target_dataset_key,
         target_table, collapse_depth, physical_derivation_hash, source_hash,
         pipeline_version, batch_id, observed_at, first_seen_at, last_seen_at,
         last_changed_at, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL},
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL}, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL})
 """
-INSERT_ISSUE_SQL = """
+INSERT_ISSUE_SQL = f"""
     INSERT INTO dwp.lineage_issue(
         row_key, stable_issue_key, environment, source_profile, program_key,
         program_name, issue_type, confidence, rule_version, severity,
@@ -111,7 +125,10 @@ INSERT_ISSUE_SQL = """
         evidence_json, batch_id, first_seen_at, last_seen_at, last_changed_at,
         disposition_updated_at, disposition_updated_by, is_active, created_at,
         updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL},
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL}, ?, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL})
 """
 
 BATCH_SELECT_SQL = """
@@ -186,15 +203,17 @@ DEACTIVATE_ISSUE_SQL = (
 DEACTIVATE_STATE_SQL = (
     "UPDATE dwp.lineage_program_state SET is_active = FALSE WHERE is_active = TRUE"
 )
-RETIRE_BATCH_SQL = """
+RETIRE_BATCH_SQL = f"""
     UPDATE dwp.lineage_batch
-    SET is_active = FALSE, publish_status = 'RETIRED', updated_at = ?
+    SET is_active = FALSE, publish_status = 'RETIRED',
+        updated_at = {TIMESTAMPTZ_PARAM_SQL}
     WHERE is_active = TRUE
 """
-ACTIVATE_BATCH_SQL = """
+ACTIVATE_BATCH_SQL = f"""
     UPDATE dwp.lineage_batch
-    SET is_active = TRUE, publish_status = 'PUBLISHED', published_at = ?,
-        updated_at = ?
+    SET is_active = TRUE, publish_status = 'PUBLISHED',
+        published_at = {TIMESTAMPTZ_PARAM_SQL},
+        updated_at = {TIMESTAMPTZ_PARAM_SQL}
     WHERE batch_id = ? AND is_active = FALSE
 """
 ACTIVATE_PHYSICAL_SQL = """
@@ -436,6 +455,15 @@ def _timestamp_text(
 def _timestamp_param(
     value: datetime | None, field_name: str = "timestamp"
 ) -> str | None:
+    """Return ISO-8601 text for the DWS ``TIMESTAMP WITH TIME ZONE`` cast.
+
+    JayDeBeApi/JDBC may bind a Python string as ``VARCHAR``.  The SQL write
+    statements therefore apply ``TIMESTAMPTZ_PARAM_SQL`` at every timestamp
+    placeholder instead of relying on driver-side datetime inference.  Keeping
+    the original ISO-8601 offset in this value preserves timezone semantics;
+    ``None`` remains SQL ``NULL``.
+    """
+
     return _timestamp_text(value, field_name)
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import unittest
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from shared.lineage.domain import (
     IssueDisposition,
@@ -13,9 +15,18 @@ from shared.lineage.domain import (
 )
 from shared.lineage.materialization import MaterializationBatch, materialize_program
 from shared.lineage.materialization_dws import (
+    ACTIVATE_BATCH_SQL,
+    INSERT_BATCH_SQL,
+    INSERT_BUSINESS_EDGE_SQL,
+    INSERT_ISSUE_SQL,
+    INSERT_PHYSICAL_EDGE_SQL,
+    INSERT_PROGRAM_STATE_SQL,
+    RETIRE_BATCH_SQL,
     DWSMaterializationStore,
     DWSPublishResult,
+    TIMESTAMPTZ_PARAM_SQL,
     _begin_transaction,
+    _timestamp_param,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG, build_program_physical_dag
 from shared.lineage.version import LINEAGE_PIPELINE_VERSION
@@ -66,13 +77,179 @@ CREATE TABLE dwp.lineage_issue (
 );
 """
 
+_TIMESTAMP_COLUMNS = {
+    "observed_at",
+    "published_at",
+    "first_seen_at",
+    "last_seen_at",
+    "last_changed_at",
+    "disposition_updated_at",
+    "created_at",
+    "updated_at",
+}
+_WRITE_SQL = (
+    INSERT_BATCH_SQL,
+    INSERT_PROGRAM_STATE_SQL,
+    INSERT_PHYSICAL_EDGE_SQL,
+    INSERT_BUSINESS_EDGE_SQL,
+    INSERT_ISSUE_SQL,
+    RETIRE_BATCH_SQL,
+    ACTIVATE_BATCH_SQL,
+)
+_WRITE_SQL_BY_NORMALIZED = {" ".join(sql.split()): sql for sql in _WRITE_SQL}
+
+
+def _split_sql_arguments(expression: str) -> tuple[str, ...]:
+    arguments: list[str] = []
+    start = 0
+    depth = 0
+    quoted = False
+    for index, character in enumerate(expression):
+        if character == "'":
+            quoted = not quoted
+        elif not quoted and character == "(":
+            depth += 1
+        elif not quoted and character == ")":
+            depth -= 1
+        elif not quoted and character == "," and depth == 0:
+            arguments.append(expression[start:index].strip())
+            start = index + 1
+    arguments.append(expression[start:].strip())
+    return tuple(arguments)
+
+
+def _insert_contract(sql: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    match = re.search(
+        r"INSERT INTO\s+[^()]+\((.*?)\)\s*VALUES\s*\((.*)\)\s*$",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"cannot parse INSERT SQL: {sql!r}")
+    return (
+        _split_sql_arguments(match.group(1)),
+        _split_sql_arguments(match.group(2)),
+    )
+
+
+class _FakeJDBCCursor:
+    """SQLite-backed cursor that enforces the DWS JDBC parameter boundary."""
+
+    def __init__(self, cursor: Any, calls: list[tuple[str, str, tuple[Any, ...]]]):
+        self._cursor = cursor
+        self._calls = calls
+
+    @staticmethod
+    def _normalized(sql: str) -> str:
+        return " ".join(sql.split())
+
+    def _assert_timestamp_contract(
+        self, sql: str, row: tuple[Any, ...]
+    ) -> None:
+        normalized = self._normalized(sql)
+        if normalized not in _WRITE_SQL_BY_NORMALIZED:
+            return
+
+        if normalized in {
+            self._normalized(INSERT_BATCH_SQL),
+            self._normalized(INSERT_PROGRAM_STATE_SQL),
+            self._normalized(INSERT_PHYSICAL_EDGE_SQL),
+            self._normalized(INSERT_BUSINESS_EDGE_SQL),
+            self._normalized(INSERT_ISSUE_SQL),
+        }:
+            columns, expressions = _insert_contract(sql)
+            if len(columns) != len(expressions) or len(row) != len(columns):
+                raise AssertionError(
+                    "DWS INSERT columns, expressions, and parameters differ"
+                )
+            for index, (column, expression, value) in enumerate(
+                zip(columns, expressions, row)
+            ):
+                if column in _TIMESTAMP_COLUMNS:
+                    if expression != TIMESTAMPTZ_PARAM_SQL:
+                        raise AssertionError(
+                            "VARCHAR directly bound to timestamptz: "
+                            f"{column} uses {expression!r}"
+                        )
+                    if value is not None and not isinstance(value, str):
+                        raise AssertionError(
+                            f"timestamp parameter {column} is not ISO text"
+                        )
+                elif expression != "?":
+                    raise AssertionError(
+                        f"non-timestamp column {column} has unexpected expression"
+                    )
+            return
+
+        if normalized == self._normalized(RETIRE_BATCH_SQL):
+            if not re.search(
+                rf"updated_at\s*=\s*{re.escape(TIMESTAMPTZ_PARAM_SQL)}",
+                sql,
+                flags=re.IGNORECASE,
+            ):
+                raise AssertionError("retire batch timestamp is not explicitly cast")
+            if len(row) != 1 or (row[0] is not None and not isinstance(row[0], str)):
+                raise AssertionError("retire batch timestamp binding is invalid")
+            return
+
+        if normalized == self._normalized(ACTIVATE_BATCH_SQL):
+            for column in ("published_at", "updated_at"):
+                if not re.search(
+                    rf"{column}\s*=\s*{re.escape(TIMESTAMPTZ_PARAM_SQL)}",
+                    sql,
+                    flags=re.IGNORECASE,
+                ):
+                    raise AssertionError(
+                        f"activate batch timestamp {column} is not explicitly cast"
+                    )
+            if len(row) != 3:
+                raise AssertionError("activate batch parameter count is invalid")
+            for value in row[:2]:
+                if value is not None and not isinstance(value, str):
+                    raise AssertionError("activate batch timestamp is not ISO text")
+
+    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any:
+        row = tuple(parameters)
+        self._assert_timestamp_contract(sql, row)
+        self._calls.append(("execute", sql, row))
+        translated = sql.replace(TIMESTAMPTZ_PARAM_SQL, "?")
+        return self._cursor.execute(translated, row)
+
+    def executemany(
+        self, sql: str, rows: tuple[tuple[Any, ...], ...]
+    ) -> Any:
+        materialized_rows = tuple(tuple(row) for row in rows)
+        for row in materialized_rows:
+            self._assert_timestamp_contract(sql, row)
+        self._calls.append(("executemany", sql, materialized_rows))
+        translated = sql.replace(TIMESTAMPTZ_PARAM_SQL, "?")
+        return self._cursor.executemany(translated, materialized_rows)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
+class _FakeJDBCConnection:
+    """Connection proxy for tests without connecting to a real DWS."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.calls: list[tuple[str, str, tuple[Any, ...]]] = []
+
+    def cursor(self) -> _FakeJDBCCursor:
+        return _FakeJDBCCursor(self._connection.cursor(), self.calls)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
 
 class DWSMaterializationStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:")
         self.connection.execute("ATTACH DATABASE ':memory:' AS dwp")
         self.connection.executescript(DWS_SMOKE_SCHEMA_SQL)
-        self.store = DWSMaterializationStore(connection=self.connection)
+        self.jdbc_boundary = _FakeJDBCConnection(self.connection)
+        self.store = DWSMaterializationStore(connection=self.jdbc_boundary)
 
     def tearDown(self) -> None:
         self.connection.close()
@@ -157,6 +334,74 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         restore_begin = _begin_transaction(begin_connection)
         self.assertTrue(begin_connection.begun)
         restore_begin()
+
+    def test_timestamp_param_preserves_offset_and_null(self) -> None:
+        offset = timezone(timedelta(hours=5, minutes=30))
+        value = datetime(2026, 2, 1, 8, 9, 10, 123456, tzinfo=offset)
+
+        self.assertEqual(_timestamp_param(value, "observed_at"), value.isoformat())
+        self.assertIsNone(_timestamp_param(None, "disposition_updated_at"))
+
+    def test_all_dws_projection_and_switch_timestamps_use_cast_boundary(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-timestamptz-contract",
+            observed_at=OBSERVED_AT,
+        )
+        batch = replace(
+            batch,
+            issues=(
+                LineageIssue(
+                    environment="DEV",
+                    source_profile="fixture",
+                    program_name="DEMO_PROGRAM",
+                    issue_type="ORPHAN_BRANCH",
+                    severity="MEDIUM",
+                    message="timestamp binding contract issue",
+                    disposition_updated_at=None,
+                ),
+            ),
+        )
+
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        observed_sql = {
+            " ".join(sql.split()) for _, sql, _ in self.jdbc_boundary.calls
+        }
+        for sql in _WRITE_SQL:
+            with self.subTest(sql=sql.splitlines()[1].strip()):
+                self.assertIn(" ".join(sql.split()), observed_sql)
+
+        issue_call = next(
+            call
+            for call in self.jdbc_boundary.calls
+            if " ".join(call[1].split()) == " ".join(INSERT_ISSUE_SQL.split())
+        )
+        self.assertEqual(issue_call[0], "executemany")
+        issue_columns, _ = _insert_contract(issue_call[1])
+        issue_row = issue_call[2][0]
+        self.assertIsNone(issue_row[issue_columns.index("disposition_updated_at")])
+
+        batch_call = next(
+            call
+            for call in self.jdbc_boundary.calls
+            if " ".join(call[1].split()) == " ".join(INSERT_BATCH_SQL.split())
+        )
+        batch_columns, _ = _insert_contract(batch_call[1])
+        self.assertIsNone(batch_call[2][batch_columns.index("published_at")])
 
     def test_writes_physical_tmp_rows_and_collapsed_formal_business_row(self) -> None:
         source = ProgramSource(
