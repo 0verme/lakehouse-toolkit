@@ -104,6 +104,226 @@ class MySQLConnectionSettings:
     autocommit: bool = True
 
 
+_DEFAULT_SCHEDULE_INCLUDE_PROJECTS = (
+    "DWD:1.0",
+    "DWM:1.0",
+    "DWP:1.0",
+    "DWA:1.0",
+    "DM:1.0",
+)
+_DEFAULT_SCHEDULE_CONDITIONAL_PROJECTS = (("DWUPRR:1.0", "DWS_DWUPRR."),)
+_SCHEDULE_V1_DIRECT_PROJECTS = frozenset(_DEFAULT_SCHEDULE_INCLUDE_PROJECTS)
+_SCHEDULE_V1_CONDITIONAL_PROJECT = "DWUPRR:1.0"
+_SCHEDULE_V1_CONDITIONAL_PREFIX = "DWS_DWUPRR."
+
+
+def _schedule_bool(value: object, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    raise ValueError(f"schedule_lineage {field_name} must be a boolean")
+
+
+def _schedule_column(value: object, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text or "." in text:
+        raise ValueError(f"schedule_lineage {field_name} must be a column identifier")
+    return safe_identifier(text, f"schedule lineage {field_name}")
+
+
+def _schedule_table(value: object) -> str:
+    text = str(value or "").strip()
+    safe = safe_identifier(text, "schedule lineage table")
+    if "." not in safe:
+        raise ValueError("schedule_lineage table must be schema-qualified")
+    return safe
+
+
+def _schedule_prefix(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if not text.endswith("."):
+        text += "."
+    schema = text[:-1]
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", schema):
+        raise ValueError(
+            "schedule_lineage target_schema_prefix must be a schema prefix"
+        )
+    return f"{safe_identifier(schema, 'schedule lineage target schema')}."
+
+
+def _schedule_projects(
+    value: object, field_name: str, default: tuple[str, ...]
+) -> tuple[str, ...]:
+    raw_values = default if value is None else value
+    if isinstance(raw_values, (str, bytes, Mapping)) or not isinstance(
+        raw_values, Iterable
+    ):
+        raise ValueError(f"schedule_lineage {field_name} must be a list")
+    values: list[str] = []
+    for item in raw_values:
+        text = str(item or "").strip().upper()
+        if not text or ":" not in text:
+            raise ValueError(
+                f"schedule_lineage {field_name} contains an invalid project"
+            )
+        if text not in _SCHEDULE_V1_DIRECT_PROJECTS:
+            raise ValueError(
+                f"schedule_lineage {field_name} contains an unsupported V1 project"
+            )
+        if text not in values:
+            values.append(text)
+    return tuple(values)
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleLineageConditionalProject:
+    """一个只按 target schema 放行的 V1 schedule project。"""
+
+    project: str
+    target_schema_prefix: str
+
+    def __post_init__(self) -> None:
+        project = str(self.project or "").strip().upper()
+        if not project or ":" not in project:
+            raise ValueError("schedule conditional project must be non-empty")
+        target_schema_prefix = _schedule_prefix(self.target_schema_prefix)
+        if (
+            project != _SCHEDULE_V1_CONDITIONAL_PROJECT
+            or target_schema_prefix != _SCHEDULE_V1_CONDITIONAL_PREFIX
+        ):
+            raise ValueError(
+                "schedule conditional project must be DWUPRR:1.0 with "
+                "target schema DWS_DWUPRR."
+            )
+        object.__setattr__(self, "project", project)
+        object.__setattr__(self, "target_schema_prefix", target_schema_prefix)
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleLineageConfig:
+    """复用 MySQL process profile connection 的调度 relation 配置。"""
+
+    enabled: bool = False
+    table: str = "demo_meta.schedule_rel"
+    process_name_column: str = "process_name"
+    project_version_column: str = "project_version_key"
+    source_table_column: str = "src_table_key"
+    target_table_column: str = "tar_table_key"
+    include_projects: tuple[str, ...] = _DEFAULT_SCHEDULE_INCLUDE_PROJECTS
+    conditional_projects: tuple[ScheduleLineageConditionalProject, ...] = tuple(
+        ScheduleLineageConditionalProject(project, prefix)
+        for project, prefix in _DEFAULT_SCHEDULE_CONDITIONAL_PROJECTS
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("schedule_lineage enabled must be a boolean")
+        object.__setattr__(self, "table", _schedule_table(self.table))
+        for field_name in (
+            "process_name_column",
+            "project_version_column",
+            "source_table_column",
+            "target_table_column",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _schedule_column(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self,
+            "include_projects",
+            _schedule_projects(
+                self.include_projects,
+                "include_projects",
+                _DEFAULT_SCHEDULE_INCLUDE_PROJECTS,
+            ),
+        )
+        conditional = self.conditional_projects
+        if isinstance(conditional, (str, bytes, Mapping)) or not isinstance(
+            conditional, Iterable
+        ):
+            raise ValueError("schedule_lineage conditional_projects must be a list")
+        normalized: list[ScheduleLineageConditionalProject] = []
+        for item in conditional:
+            if isinstance(item, ScheduleLineageConditionalProject):
+                project = item
+            elif isinstance(item, Mapping):
+                project = ScheduleLineageConditionalProject(
+                    project=str(item.get("project", "") or ""),
+                    target_schema_prefix=str(
+                        item.get("target_schema_prefix", "") or ""
+                    ),
+                )
+            else:
+                raise ValueError(
+                    "schedule_lineage conditional_projects must contain mappings"
+                )
+            if project not in normalized:
+                normalized.append(project)
+        object.__setattr__(self, "conditional_projects", tuple(normalized))
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> "ScheduleLineageConfig":
+        if not isinstance(raw, Mapping):
+            raise ValueError("schedule_lineage must be a mapping")
+        enabled = _schedule_bool(raw.get("enabled", True), "enabled")
+        raw_conditional = raw.get("conditional_projects")
+        if raw_conditional is None:
+            raw_conditional = [
+                {
+                    "project": project,
+                    "target_schema_prefix": prefix,
+                }
+                for project, prefix in _DEFAULT_SCHEDULE_CONDITIONAL_PROJECTS
+            ]
+        if isinstance(raw_conditional, (str, bytes, Mapping)) or not isinstance(
+            raw_conditional, Iterable
+        ):
+            raise ValueError("schedule_lineage conditional_projects must be a list")
+        conditional_projects: list[ScheduleLineageConditionalProject] = []
+        for item in raw_conditional:
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "schedule_lineage conditional_projects must contain mappings"
+                )
+            conditional_projects.append(
+                ScheduleLineageConditionalProject(
+                    project=str(item.get("project", "") or ""),
+                    target_schema_prefix=str(
+                        item.get("target_schema_prefix", "") or ""
+                    ),
+                )
+            )
+        return cls(
+            enabled=enabled,
+            table=str(raw.get("table", "demo_meta.schedule_rel") or ""),
+            process_name_column=str(
+                raw.get("process_name_column", "process_name") or ""
+            ),
+            project_version_column=str(
+                raw.get("project_version_column", "project_version_key") or ""
+            ),
+            source_table_column=str(
+                raw.get("source_table_column", "src_table_key") or ""
+            ),
+            target_table_column=str(
+                raw.get("target_table_column", "tar_table_key") or ""
+            ),
+            include_projects=_schedule_projects(
+                raw.get("include_projects"),
+                "include_projects",
+                _DEFAULT_SCHEDULE_INCLUDE_PROJECTS,
+            ),
+            conditional_projects=tuple(conditional_projects),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class MySQLProcessProfile:
     """一个 DEV MySQL 来源 profile 的连接和 metadata 配置描述。
@@ -139,6 +359,9 @@ class MySQLProcessProfile:
     )
     primary_target_strategy: str = "explicit"
     program_name_target_prefix: str | None = None
+    schedule_lineage: ScheduleLineageConfig | None = field(
+        default=None, repr=False, hash=False
+    )
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -166,6 +389,17 @@ class MySQLProcessProfile:
         )
         object.__setattr__(self, "primary_target_strategy", strategy)
         object.__setattr__(self, "program_name_target_prefix", target_prefix)
+
+        if self.schedule_lineage is not None and not isinstance(
+            self.schedule_lineage, ScheduleLineageConfig
+        ):
+            if not isinstance(self.schedule_lineage, Mapping):
+                raise ValueError("schedule_lineage must be a mapping or None")
+            object.__setattr__(
+                self,
+                "schedule_lineage",
+                ScheduleLineageConfig.from_mapping(self.schedule_lineage),
+            )
 
         if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
             raise ValueError("batch_size must be a positive integer")
@@ -281,6 +515,16 @@ class MySQLProcessProfile:
         program_name_target_prefix = raw.get("program_name_target_prefix")
         if program_name_target_prefix is not None:
             program_name_target_prefix = str(program_name_target_prefix).strip() or None
+        raw_schedule_lineage = raw.get("schedule_lineage")
+        if raw_schedule_lineage is not None and not isinstance(
+            raw_schedule_lineage, Mapping
+        ):
+            raise ValueError("schedule_lineage must be a mapping")
+        schedule_lineage = (
+            None
+            if raw_schedule_lineage is None
+            else ScheduleLineageConfig.from_mapping(raw_schedule_lineage)
+        )
 
         return cls(
             name=text("name"),
@@ -305,6 +549,7 @@ class MySQLProcessProfile:
             connection_env=source_mapping("connection_env"),
             primary_target_strategy=str(primary_target_strategy),
             program_name_target_prefix=program_name_target_prefix,
+            schedule_lineage=schedule_lineage,
         )
 
     def resolve_connection_settings(self) -> MySQLConnectionSettings:
@@ -945,6 +1190,8 @@ __all__ = [
     "LineageDependencyError",
     "MySQLConnectionSettings",
     "MySQLProcessProfile",
+    "ScheduleLineageConditionalProject",
+    "ScheduleLineageConfig",
     "MySQLProcessProvider",
     "ProductionProvider",
     "ProductionSVNProvider",

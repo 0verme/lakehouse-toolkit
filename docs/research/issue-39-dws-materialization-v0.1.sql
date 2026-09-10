@@ -59,6 +59,48 @@ DISTRIBUTE BY HASH(batch_id);
 
 
 -- ============================================================================
+-- Issue #85 extension: configured schedule lineage
+-- ============================================================================
+--
+-- This table intentionally does not use lineage_batch as its active control:
+-- lineage_batch has one global SQL-lineage active boundary, while schedule
+-- ingestion is an independently publishable source. The schedule writer still
+-- reuses the #84 DWS connection/transaction boundary and keeps its own
+-- batch_id/is_active history in this single fact table.
+
+CREATE TABLE dwp.lineage_schedule_edge (
+    row_key              VARCHAR(128) NOT NULL,
+    schedule_edge_key    VARCHAR(128) NOT NULL,
+
+    environment          VARCHAR(128) NOT NULL,
+    source_profile       VARCHAR(256) NOT NULL,
+
+    process_name         VARCHAR(512) NOT NULL,
+    project_version_key  VARCHAR(256) NOT NULL,
+
+    raw_source_table     VARCHAR(512) NOT NULL,
+    raw_target_table     VARCHAR(512) NOT NULL,
+
+    source_table         VARCHAR(512) NOT NULL,
+    target_table         VARCHAR(512) NOT NULL,
+
+    batch_id             VARCHAR(128) NOT NULL,
+    observed_at          TIMESTAMP(6) WITH TIME ZONE,
+
+    first_seen_at        TIMESTAMP(6) WITH TIME ZONE,
+    last_seen_at         TIMESTAMP(6) WITH TIME ZONE,
+    last_changed_at      TIMESTAMP(6) WITH TIME ZONE,
+
+    is_active            BOOLEAN DEFAULT FALSE,
+
+    created_at           TIMESTAMP(6) WITH TIME ZONE,
+    updated_at           TIMESTAMP(6) WITH TIME ZONE
+)
+WITH (ORIENTATION = COLUMN)
+DISTRIBUTE BY HASH(schedule_edge_key);
+
+
+-- ============================================================================
 -- 1. Program state
 -- ============================================================================
 
