@@ -43,11 +43,17 @@ def get_db_profile(profile: str) -> dict:
 
 
 def _get_profile_password(config: dict) -> str:
-    password_env = str(config.get("password_env", "") or "").strip()
-    if not password_env:
-        raise KeyError("database profile missing required field: password_env")
-    return required_env(password_env)
+    password = str(config.get("password", "") or "")
+    if password:
+        return password
 
+    password_env = str(config.get("password_env", "") or "").strip()
+    if password_env:
+        return required_env(password_env)
+
+    raise KeyError(
+        "database profile missing required field: password or password_env"
+    )
 
 def connect_with_profile(profile: str):
     config = get_db_profile(profile)
