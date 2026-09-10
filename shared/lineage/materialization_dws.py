@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -131,18 +132,29 @@ INSERT_ISSUE_SQL = f"""
               {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL})
 """
 
+# Raw JDBC timestamp objects lose the DWS offset during JayDeBeApi conversion.
+# Every timestamptz projection below is therefore text at the READ boundary;
+# row converters then enforce the timezone-aware Python datetime contract.
 BATCH_SELECT_SQL = """
     SELECT batch_id, snapshot_mode, complete_snapshot, snapshot_scope,
-           pipeline_version, observed_at, previous_batch_id, publish_status,
-           published_at, program_count, edge_count, issue_count, is_active,
-           created_at, updated_at
+           pipeline_version,
+           CAST(observed_at AS VARCHAR(128)) AS observed_at,
+           previous_batch_id, publish_status,
+           CAST(published_at AS VARCHAR(128)) AS published_at,
+           program_count, edge_count, issue_count, is_active,
+           CAST(created_at AS VARCHAR(128)) AS created_at,
+           CAST(updated_at AS VARCHAR(128)) AS updated_at
     FROM dwp.lineage_batch
 """
 PROGRAM_STATE_SELECT_SQL = """
     SELECT s.row_key, s.program_key, s.environment, s.source_profile,
            s.program_name, s.source_hash, s.pipeline_version, s.batch_id,
-           s.first_seen_at, s.last_seen_at, s.last_changed_at, s.is_active,
-           s.created_at, s.updated_at
+           CAST(s.first_seen_at AS VARCHAR(128)) AS first_seen_at,
+           CAST(s.last_seen_at AS VARCHAR(128)) AS last_seen_at,
+           CAST(s.last_changed_at AS VARCHAR(128)) AS last_changed_at,
+           s.is_active,
+           CAST(s.created_at AS VARCHAR(128)) AS created_at,
+           CAST(s.updated_at AS VARCHAR(128)) AS updated_at
     FROM dwp.lineage_program_state AS s
 """
 PHYSICAL_EDGE_SELECT_SQL = """
@@ -150,9 +162,14 @@ PHYSICAL_EDGE_SELECT_SQL = """
            e.program_key, e.program_name, e.source_table, e.target_table,
            e.source_node_kind, e.target_node_kind, e.source_dataset_key,
            e.target_dataset_key, e.evidence_type, e.evidence_json,
-           e.source_hash, e.pipeline_version, e.batch_id, e.observed_at,
-           e.first_seen_at, e.last_seen_at, e.last_changed_at, e.is_active,
-           e.created_at, e.updated_at
+           e.source_hash, e.pipeline_version, e.batch_id,
+           CAST(e.observed_at AS VARCHAR(128)) AS observed_at,
+           CAST(e.first_seen_at AS VARCHAR(128)) AS first_seen_at,
+           CAST(e.last_seen_at AS VARCHAR(128)) AS last_seen_at,
+           CAST(e.last_changed_at AS VARCHAR(128)) AS last_changed_at,
+           e.is_active,
+           CAST(e.created_at AS VARCHAR(128)) AS created_at,
+           CAST(e.updated_at AS VARCHAR(128)) AS updated_at
     FROM dwp.lineage_edge AS e
 """
 BUSINESS_EDGE_SELECT_SQL = """
@@ -160,8 +177,14 @@ BUSINESS_EDGE_SELECT_SQL = """
            e.program_key, e.program_name, e.source_dataset_key, e.source_table,
            e.target_dataset_key, e.target_table, e.collapse_depth,
            e.physical_derivation_hash, e.source_hash, e.pipeline_version,
-           e.batch_id, e.observed_at, e.first_seen_at, e.last_seen_at,
-           e.last_changed_at, e.is_active, e.created_at, e.updated_at
+           e.batch_id,
+           CAST(e.observed_at AS VARCHAR(128)) AS observed_at,
+           CAST(e.first_seen_at AS VARCHAR(128)) AS first_seen_at,
+           CAST(e.last_seen_at AS VARCHAR(128)) AS last_seen_at,
+           CAST(e.last_changed_at AS VARCHAR(128)) AS last_changed_at,
+           e.is_active,
+           CAST(e.created_at AS VARCHAR(128)) AS created_at,
+           CAST(e.updated_at AS VARCHAR(128)) AS updated_at
     FROM dwp.lineage_business_edge AS e
 """
 ISSUE_SELECT_SQL = """
@@ -169,9 +192,13 @@ ISSUE_SELECT_SQL = """
            i.program_key, i.program_name, i.issue_type, i.confidence,
            i.rule_version, i.severity, i.disposition, i.policy_version,
            i.node_key, i.branch_sink, i.message, i.evidence_json, i.batch_id,
-           i.first_seen_at, i.last_seen_at, i.last_changed_at,
-           i.disposition_updated_at, i.disposition_updated_by, i.is_active,
-           i.created_at, i.updated_at
+           CAST(i.first_seen_at AS VARCHAR(128)) AS first_seen_at,
+           CAST(i.last_seen_at AS VARCHAR(128)) AS last_seen_at,
+           CAST(i.last_changed_at AS VARCHAR(128)) AS last_changed_at,
+           CAST(i.disposition_updated_at AS VARCHAR(128)) AS disposition_updated_at,
+           i.disposition_updated_by, i.is_active,
+           CAST(i.created_at AS VARCHAR(128)) AS created_at,
+           CAST(i.updated_at AS VARCHAR(128)) AS updated_at
     FROM dwp.lineage_issue AS i
 """
 
@@ -467,18 +494,57 @@ def _timestamp_param(
     return _timestamp_text(value, field_name)
 
 
-def _parse_datetime(value: object, field_name: str) -> datetime:
-    if isinstance(value, datetime):
+_TIMESTAMP_OFFSET_SUFFIX_RE = re.compile(
+    r"(?P<sign>[+-])(?P<hours>\d{2})"
+    r"(?:(?::(?P<colon_minutes>\d{2}))|(?P<compact_minutes>\d{2}))?$"
+)
+_TIMESTAMP_TIME_PREFIX_RE = re.compile(
+    r"(?:T| )\d{2}:\d{2}(?::\d{2}(?:[.,]\d{1,6})?)?$"
+)
+
+
+def _normalize_timestamp_text(value: str) -> str:
+    if value.endswith("Z"):
+        return value[:-1] + "+00:00"
+
+    match = _TIMESTAMP_OFFSET_SUFFIX_RE.search(value)
+    if (
+        match is None
+        or _TIMESTAMP_TIME_PREFIX_RE.search(value[: match.start()]) is None
+    ):
         return value
-    if value is None:
-        raise ValueError(f"{field_name} must not be NULL")
-    text = str(value).strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise ValueError(f"{field_name} is not a valid timestamp") from exc
+
+    minutes = (
+        match.group("colon_minutes")
+        or match.group("compact_minutes")
+        or "00"
+    )
+    return (
+        f"{value[: match.start()]}{match.group('sign')}"
+        f"{match.group('hours')}:{minutes}"
+    )
+
+
+def _parse_datetime(value: object, field_name: str) -> datetime:
+    """Parse one DWS timestamp without guessing a timezone for naive values."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        if value is None:
+            raise ValueError(f"{field_name} must not be NULL")
+        text = str(value).strip()
+        if not text:
+            raise ValueError(f"{field_name} is not a valid timestamp")
+        text = _normalize_timestamp_text(text)
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} is not a valid timestamp") from exc
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field_name} must include a timezone offset")
+    return parsed
 
 
 def _decode_json(value: object) -> Mapping[str, object] | str | None:
