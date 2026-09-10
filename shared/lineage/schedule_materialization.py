@@ -17,6 +17,12 @@ from datetime import datetime
 from time import perf_counter
 from typing import Any
 
+from shared.lineage.dws_timestamp import (
+    TIMESTAMPTZ_PARAM_SQL,
+    dws_timestamp_param,
+    dws_timestamp_projection,
+    parse_dws_timestamp,
+)
 from shared.lineage.evolution import SnapshotScope
 from shared.lineage.materialization_dws import (
     DWSMaterializationStore,
@@ -32,19 +38,28 @@ from shared.lineage.schedule import (
     schedule_row_key,
 )
 
-INSERT_SCHEDULE_EDGE_SQL = """
+INSERT_SCHEDULE_EDGE_SQL = f"""
     INSERT INTO dwp.lineage_schedule_edge(
         row_key, schedule_edge_key, environment, source_profile, process_name,
         project_version_key, raw_source_table, raw_target_table, source_table,
         target_table, batch_id, observed_at, first_seen_at, last_seen_at,
         last_changed_at, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL},
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL}, ?,
+              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL})
 """
-SELECT_SCHEDULE_EDGE_SQL = """
+SELECT_SCHEDULE_EDGE_SQL = f"""
     SELECT row_key, schedule_edge_key, environment, source_profile, process_name,
            project_version_key, raw_source_table, raw_target_table, source_table,
-           target_table, batch_id, observed_at, first_seen_at, last_seen_at,
-           last_changed_at, is_active, created_at, updated_at
+           target_table, batch_id,
+           {dws_timestamp_projection("observed_at")},
+           {dws_timestamp_projection("first_seen_at")},
+           {dws_timestamp_projection("last_seen_at")},
+           {dws_timestamp_projection("last_changed_at")},
+           is_active,
+           {dws_timestamp_projection("created_at")},
+           {dws_timestamp_projection("updated_at")}
     FROM dwp.lineage_schedule_edge
 """
 DEACTIVATE_SCHEDULE_EDGE_SQL = (
@@ -79,26 +94,8 @@ def _key_text(value: object, field_name: str) -> str:
     return text
 
 
-def _timestamp_param(value: datetime | None, field_name: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, datetime):
-        raise TypeError(f"{field_name} must be a datetime or None")
-    return value.isoformat()
-
-
-def _parse_timestamp(value: object, field_name: str) -> datetime:
-    if isinstance(value, datetime):
-        return value
-    if value is None:
-        raise ValueError(f"{field_name} must not be NULL")
-    text = str(value).strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise ValueError(f"{field_name} is not a valid timestamp") from exc
+_timestamp_param = dws_timestamp_param
+_parse_timestamp = parse_dws_timestamp
 
 
 def _stored_bool(value: object, field_name: str) -> bool:
@@ -422,7 +419,10 @@ class DWSScheduleLineageStore:
             cursor.close()
         if row is None:
             raise ValueError("schedule candidate count returned no row")
-        return int(row[0])
+        try:
+            return int(row[0])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ValueError("schedule candidate count is not an integer") from exc
 
     def _prepare_candidate(
         self,
