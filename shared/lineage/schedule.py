@@ -8,6 +8,7 @@ process DAG，也不改写 SQL parser 使用的 DatasetIdentity normalization。
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +29,21 @@ from shared.lineage.providers import (
 
 SCHEDULE_KEY_SEPARATOR = "\x1f"
 SCHEDULE_DWS_TABLE = "lineage_schedule_edge"
+_DEV_ENVIRONMENT_RE = re.compile(r"^DEV(?:\d+)?$")
+
+
+def _is_dev_environment(value: object) -> bool:
+    """Recognize the configured DEV environment naming contract.
+
+    Environment remains an opaque, case-preserving graph boundary elsewhere in
+    lineage.  The schedule source contract accepts the historical ``DEV`` name
+    and its numeric instances such as ``DEV214``; arbitrary ``DEV`` prefixes are
+    not treated as development environments.
+    """
+
+    if not isinstance(value, str):
+        return False
+    return _DEV_ENVIRONMENT_RE.fullmatch(value.strip().upper()) is not None
 
 
 def _required_text(value: object, field_name: str) -> str:
@@ -242,7 +258,7 @@ class MySQLScheduleLineageProvider:
         config = profile.schedule_lineage
         if config is None or not config.enabled:
             raise ValueError("schedule_lineage is not enabled for this profile")
-        if profile.environment.strip().upper() != "DEV":
+        if not _is_dev_environment(profile.environment):
             raise ValueError("schedule lineage only supports DEV profiles")
         self.profile = profile
         self.schedule_config = config

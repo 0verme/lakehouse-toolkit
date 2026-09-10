@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from shared.lineage.providers import (
     MySQLProcessProfile,
@@ -17,9 +17,11 @@ from shared.lineage.schedule import (
     deduplicate_schedule_edges,
     normalize_schedule_table_key,
 )
+from shared.lineage.dws_timestamp import TIMESTAMPTZ_PARAM_SQL
 from shared.lineage.schedule_materialization import (
     DWSScheduleLineageStore,
     INSERT_SCHEDULE_EDGE_SQL,
+    SELECT_SCHEDULE_EDGE_SQL,
 )
 
 OBSERVED_AT = datetime(2026, 9, 10, 8, 9, 10, tzinfo=timezone.utc)
@@ -45,6 +47,37 @@ CREATE TABLE dwp.lineage_schedule_edge (
     updated_at TEXT
 )
 """
+
+
+class FakeScheduleDwsCursor:
+    """SQLite cursor that emulates the DWS timestamp binding boundary."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, parameters=()):
+        translated = sql.replace(TIMESTAMPTZ_PARAM_SQL, "?")
+        return self._cursor.execute(translated, tuple(parameters))
+
+    def executemany(self, sql, rows):
+        translated = sql.replace(TIMESTAMPTZ_PARAM_SQL, "?")
+        return self._cursor.executemany(translated, tuple(tuple(row) for row in rows))
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class FakeScheduleDwsConnection:
+    """Connection proxy for schedule tests without a real DWS."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def cursor(self):
+        return FakeScheduleDwsCursor(self._connection.cursor())
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 class FakeScheduleCursor:
@@ -209,6 +242,23 @@ class ScheduleLineageProviderTests(unittest.TestCase):
                 }
             )
 
+    def test_provider_accepts_existing_dev_environment_names(self):
+        for environment in ("DEV", "DEV200", "DEV214", "DEV203", "DEV224"):
+            with self.subTest(environment=environment):
+                provider = MySQLScheduleLineageProvider(
+                    make_profile(environment=environment),
+                    connection_factory=lambda settings: None,
+                )
+                self.assertEqual(provider.environment, environment)
+
+    def test_provider_rejects_prod_and_unrelated_dev_prefixes(self):
+        for environment in ("PROD", "PROD214", "DEVICE", "DEV_PROD"):
+            with self.subTest(environment=environment):
+                with self.assertRaisesRegex(
+                    ValueError, "schedule lineage only supports DEV profiles"
+                ):
+                    MySQLScheduleLineageProvider(make_profile(environment=environment))
+
     def test_provider_filters_projects_normalizes_and_deduplicates(self):
         profile = make_profile()
         rows = [
@@ -288,9 +338,10 @@ class ScheduleLineageProviderTests(unittest.TestCase):
 
 class ScheduleLineageMaterializationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.connection = sqlite3.connect(":memory:")
-        self.connection.execute("ATTACH DATABASE ':memory:' AS dwp")
-        self.connection.executescript(SCHEDULE_SCHEMA_SQL)
+        database = sqlite3.connect(":memory:")
+        database.execute("ATTACH DATABASE ':memory:' AS dwp")
+        database.executescript(SCHEDULE_SCHEMA_SQL)
+        self.connection = FakeScheduleDwsConnection(database)
         self.store = DWSScheduleLineageStore(connection=self.connection)
 
     def tearDown(self) -> None:
@@ -301,6 +352,7 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         edges,
         batch_id: str,
         *,
+        observed_at: datetime = OBSERVED_AT,
         complete_snapshot: bool = True,
         scopes=(("DEV", "mysql_dev_a"),),
         stage_hook=None,
@@ -308,7 +360,7 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         return self.store.publish(
             edges,
             batch_id=batch_id,
-            observed_at=OBSERVED_AT,
+            observed_at=observed_at,
             complete_snapshot=complete_snapshot,
             snapshot_scopes=scopes,
             stage_hook=stage_hook,
@@ -329,20 +381,32 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
 
     def test_repeat_publish_keeps_stable_key_and_updates_history(self):
         edge = make_edge()
-        self.publish((edge,), "batch-schedule-1")
+        first_observed_at = OBSERVED_AT
+        second_observed_at = OBSERVED_AT + timedelta(days=1)
+        self.publish(
+            (edge,),
+            "batch-schedule-1",
+            observed_at=first_observed_at,
+        )
         first = self.store.read_rows(batch_id="batch-schedule-1")[0]
 
         self.publish(
             (edge,),
             "batch-schedule-2",
+            observed_at=second_observed_at,
         )
         second = self.store.read_rows(batch_id="batch-schedule-2")[0]
 
         self.assertEqual(first.schedule_edge_key, second.schedule_edge_key)
         self.assertNotEqual(first.row_key, second.row_key)
         self.assertEqual(first.first_seen_at, second.first_seen_at)
-        self.assertEqual(second.last_seen_at, OBSERVED_AT)
+        self.assertEqual(second.first_seen_at, first_observed_at)
+        self.assertEqual(second.last_seen_at, second_observed_at)
+        self.assertEqual(first.updated_at, first_observed_at)
+        self.assertEqual(second.updated_at, second_observed_at)
+        self.assertEqual(len(self.store.read_rows()), 2)
         self.assertEqual(len(self.store.read_rows(active_only=True)), 1)
+        self.assertEqual(self.store.get_active_batch_id(), "batch-schedule-2")
 
     def test_duplicate_configuration_is_one_fact_but_process_provenance_survives(self):
         first = make_edge("DEMO_PROCESS_A")
@@ -470,6 +534,55 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         self.assertEqual(self.store.read_rows(active_only=True), ())
         self.assertIsNone(self.store.get_active_batch_id())
 
+    def test_schedule_write_and_read_use_shared_timestamp_contract(self):
+        self.assertEqual(INSERT_SCHEDULE_EDGE_SQL.count(TIMESTAMPTZ_PARAM_SQL), 6)
+        self.assertIn(
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            f"{TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL}, "
+            f"{TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL}, ?, "
+            f"{TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL})",
+            " ".join(INSERT_SCHEDULE_EDGE_SQL.split()),
+        )
+        for column in (
+            "observed_at",
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "created_at",
+            "updated_at",
+        ):
+            with self.subTest(column=column):
+                self.assertRegex(
+                    SELECT_SCHEDULE_EDGE_SQL,
+                    rf"CAST\(\s*{column}\s+AS VARCHAR\(128\)\s*\)\s+AS\s+{column}\b",
+                )
+
+    def test_schedule_candidate_round_trip_handles_truncated_fractional_seconds(self):
+        self.publish((make_edge(),), "batch-schedule-round-trip")
+        dws_text = "2026-09-10 18:56:48.5814+08:00"
+        self.connection.execute(
+            "UPDATE dwp.lineage_schedule_edge SET "
+            "observed_at = ?, first_seen_at = ?, last_seen_at = ?, "
+            "last_changed_at = ?, created_at = ?, updated_at = ? "
+            "WHERE batch_id = ?",
+            (dws_text,) * 6 + ("batch-schedule-round-trip",),
+        )
+        self.connection.commit()
+
+        row = self.store.read_rows(batch_id="batch-schedule-round-trip")[0]
+        timestamps = (
+            row.observed_at,
+            row.first_seen_at,
+            row.last_seen_at,
+            row.last_changed_at,
+            row.created_at,
+            row.updated_at,
+        )
+        for timestamp in timestamps:
+            self.assertEqual(timestamp.microsecond, 581400)
+            self.assertEqual(timestamp.utcoffset(), timedelta(hours=8))
+            self.assertIsNotNone(timestamp.tzinfo)
+
     def test_writer_uses_parameter_binding_for_schedule_values(self):
         self.assertIn("?", INSERT_SCHEDULE_EDGE_SQL)
         self.assertNotIn("DWS_DWF.A", INSERT_SCHEDULE_EDGE_SQL)
@@ -514,9 +627,10 @@ class ScheduleSourceFailureTests(unittest.TestCase):
                     ),
                 )
 
-        connection = sqlite3.connect(":memory:")
-        connection.execute("ATTACH DATABASE ':memory:' AS dwp")
-        connection.executescript(SCHEDULE_SCHEMA_SQL)
+        database = sqlite3.connect(":memory:")
+        database.execute("ATTACH DATABASE ':memory:' AS dwp")
+        database.executescript(SCHEDULE_SCHEMA_SQL)
+        connection = FakeScheduleDwsConnection(database)
         store = DWSScheduleLineageStore(connection=connection)
 
         result = run(
@@ -544,9 +658,10 @@ class ScheduleSourceFailureTests(unittest.TestCase):
             def load(self, limit=None):
                 raise ProviderError("source read failed")
 
-        connection = sqlite3.connect(":memory:")
-        connection.execute("ATTACH DATABASE ':memory:' AS dwp")
-        connection.executescript(SCHEDULE_SCHEMA_SQL)
+        database = sqlite3.connect(":memory:")
+        database.execute("ATTACH DATABASE ':memory:' AS dwp")
+        database.executescript(SCHEDULE_SCHEMA_SQL)
+        connection = FakeScheduleDwsConnection(database)
         store = DWSScheduleLineageStore(connection=connection)
         store.publish(
             (make_edge(),),

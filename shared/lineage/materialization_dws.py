@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -38,6 +37,13 @@ from shared.lineage.domain import (
     ProgramSource,
     ProgramState,
     is_temporary_asset,
+)
+from shared.lineage.dws_timestamp import (
+    TIMESTAMPTZ_PARAM_SQL,
+    dws_timestamp_param,
+    dws_timestamp_projection,
+    normalize_dws_timestamp_text,
+    parse_dws_timestamp,
 )
 from shared.lineage.evolution import (
     BatchMetadata,
@@ -72,8 +78,6 @@ def _connect_with_profile(profile: str) -> Any:
 # providers/configuration are always passed through DB-API parameters.  Keep
 # timestamptz parameters as ISO-8601 text and apply the same explicit SQL cast
 # at every DWS write boundary; this avoids relying on old JDBC datetime binding.
-TIMESTAMPTZ_PARAM_SQL = "CAST(? AS TIMESTAMP WITH TIME ZONE)"
-
 INSERT_BATCH_SQL = f"""
     INSERT INTO dwp.lineage_batch(
         batch_id, snapshot_mode, complete_snapshot, snapshot_scope,
@@ -135,70 +139,70 @@ INSERT_ISSUE_SQL = f"""
 # Raw JDBC timestamp objects lose the DWS offset during JayDeBeApi conversion.
 # Every timestamptz projection below is therefore text at the READ boundary;
 # row converters then enforce the timezone-aware Python datetime contract.
-BATCH_SELECT_SQL = """
+BATCH_SELECT_SQL = f"""
     SELECT batch_id, snapshot_mode, complete_snapshot, snapshot_scope,
            pipeline_version,
-           CAST(observed_at AS VARCHAR(128)) AS observed_at,
+           {dws_timestamp_projection("observed_at")},
            previous_batch_id, publish_status,
-           CAST(published_at AS VARCHAR(128)) AS published_at,
+           {dws_timestamp_projection("published_at")},
            program_count, edge_count, issue_count, is_active,
-           CAST(created_at AS VARCHAR(128)) AS created_at,
-           CAST(updated_at AS VARCHAR(128)) AS updated_at
+           {dws_timestamp_projection("created_at")},
+           {dws_timestamp_projection("updated_at")}
     FROM dwp.lineage_batch
 """
-PROGRAM_STATE_SELECT_SQL = """
+PROGRAM_STATE_SELECT_SQL = f"""
     SELECT s.row_key, s.program_key, s.environment, s.source_profile,
            s.program_name, s.source_hash, s.pipeline_version, s.batch_id,
-           CAST(s.first_seen_at AS VARCHAR(128)) AS first_seen_at,
-           CAST(s.last_seen_at AS VARCHAR(128)) AS last_seen_at,
-           CAST(s.last_changed_at AS VARCHAR(128)) AS last_changed_at,
+           {dws_timestamp_projection("s.first_seen_at")},
+           {dws_timestamp_projection("s.last_seen_at")},
+           {dws_timestamp_projection("s.last_changed_at")},
            s.is_active,
-           CAST(s.created_at AS VARCHAR(128)) AS created_at,
-           CAST(s.updated_at AS VARCHAR(128)) AS updated_at
+           {dws_timestamp_projection("s.created_at")},
+           {dws_timestamp_projection("s.updated_at")}
     FROM dwp.lineage_program_state AS s
 """
-PHYSICAL_EDGE_SELECT_SQL = """
+PHYSICAL_EDGE_SELECT_SQL = f"""
     SELECT e.row_key, e.edge_key, e.environment, e.source_profile,
            e.program_key, e.program_name, e.source_table, e.target_table,
            e.source_node_kind, e.target_node_kind, e.source_dataset_key,
            e.target_dataset_key, e.evidence_type, e.evidence_json,
            e.source_hash, e.pipeline_version, e.batch_id,
-           CAST(e.observed_at AS VARCHAR(128)) AS observed_at,
-           CAST(e.first_seen_at AS VARCHAR(128)) AS first_seen_at,
-           CAST(e.last_seen_at AS VARCHAR(128)) AS last_seen_at,
-           CAST(e.last_changed_at AS VARCHAR(128)) AS last_changed_at,
+           {dws_timestamp_projection("e.observed_at")},
+           {dws_timestamp_projection("e.first_seen_at")},
+           {dws_timestamp_projection("e.last_seen_at")},
+           {dws_timestamp_projection("e.last_changed_at")},
            e.is_active,
-           CAST(e.created_at AS VARCHAR(128)) AS created_at,
-           CAST(e.updated_at AS VARCHAR(128)) AS updated_at
+           {dws_timestamp_projection("e.created_at")},
+           {dws_timestamp_projection("e.updated_at")}
     FROM dwp.lineage_edge AS e
 """
-BUSINESS_EDGE_SELECT_SQL = """
+BUSINESS_EDGE_SELECT_SQL = f"""
     SELECT e.row_key, e.business_edge_key, e.environment, e.source_profile,
            e.program_key, e.program_name, e.source_dataset_key, e.source_table,
            e.target_dataset_key, e.target_table, e.collapse_depth,
            e.physical_derivation_hash, e.source_hash, e.pipeline_version,
            e.batch_id,
-           CAST(e.observed_at AS VARCHAR(128)) AS observed_at,
-           CAST(e.first_seen_at AS VARCHAR(128)) AS first_seen_at,
-           CAST(e.last_seen_at AS VARCHAR(128)) AS last_seen_at,
-           CAST(e.last_changed_at AS VARCHAR(128)) AS last_changed_at,
+           {dws_timestamp_projection("e.observed_at")},
+           {dws_timestamp_projection("e.first_seen_at")},
+           {dws_timestamp_projection("e.last_seen_at")},
+           {dws_timestamp_projection("e.last_changed_at")},
            e.is_active,
-           CAST(e.created_at AS VARCHAR(128)) AS created_at,
-           CAST(e.updated_at AS VARCHAR(128)) AS updated_at
+           {dws_timestamp_projection("e.created_at")},
+           {dws_timestamp_projection("e.updated_at")}
     FROM dwp.lineage_business_edge AS e
 """
-ISSUE_SELECT_SQL = """
+ISSUE_SELECT_SQL = f"""
     SELECT i.row_key, i.stable_issue_key, i.environment, i.source_profile,
            i.program_key, i.program_name, i.issue_type, i.confidence,
            i.rule_version, i.severity, i.disposition, i.policy_version,
            i.node_key, i.branch_sink, i.message, i.evidence_json, i.batch_id,
-           CAST(i.first_seen_at AS VARCHAR(128)) AS first_seen_at,
-           CAST(i.last_seen_at AS VARCHAR(128)) AS last_seen_at,
-           CAST(i.last_changed_at AS VARCHAR(128)) AS last_changed_at,
-           CAST(i.disposition_updated_at AS VARCHAR(128)) AS disposition_updated_at,
+           {dws_timestamp_projection("i.first_seen_at")},
+           {dws_timestamp_projection("i.last_seen_at")},
+           {dws_timestamp_projection("i.last_changed_at")},
+           {dws_timestamp_projection("i.disposition_updated_at")},
            i.disposition_updated_by, i.is_active,
-           CAST(i.created_at AS VARCHAR(128)) AS created_at,
-           CAST(i.updated_at AS VARCHAR(128)) AS updated_at
+           {dws_timestamp_projection("i.created_at")},
+           {dws_timestamp_projection("i.updated_at")}
     FROM dwp.lineage_issue AS i
 """
 
@@ -469,82 +473,12 @@ def _stored_int(value: object, field_name: str) -> int:
     return parsed
 
 
-def _timestamp_text(
-    value: datetime | None, field_name: str = "timestamp"
-) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, datetime):
-        raise TypeError(f"{field_name} must be a datetime or None")
-    return value.isoformat()
-
-
-def _timestamp_param(
-    value: datetime | None, field_name: str = "timestamp"
-) -> str | None:
-    """Return ISO-8601 text for the DWS ``TIMESTAMP WITH TIME ZONE`` cast.
-
-    JayDeBeApi/JDBC may bind a Python string as ``VARCHAR``.  The SQL write
-    statements therefore apply ``TIMESTAMPTZ_PARAM_SQL`` at every timestamp
-    placeholder instead of relying on driver-side datetime inference.  Keeping
-    the original ISO-8601 offset in this value preserves timezone semantics;
-    ``None`` remains SQL ``NULL``.
-    """
-
-    return _timestamp_text(value, field_name)
-
-
-_TIMESTAMP_OFFSET_SUFFIX_RE = re.compile(
-    r"(?P<sign>[+-])(?P<hours>\d{2})"
-    r"(?:(?::(?P<colon_minutes>\d{2}))|(?P<compact_minutes>\d{2}))?$"
-)
-_TIMESTAMP_TIME_PREFIX_RE = re.compile(
-    r"(?:T| )\d{2}:\d{2}(?::\d{2}(?:[.,]\d{1,6})?)?$"
-)
-
-
-def _normalize_timestamp_text(value: str) -> str:
-    if value.endswith("Z"):
-        return value[:-1] + "+00:00"
-
-    match = _TIMESTAMP_OFFSET_SUFFIX_RE.search(value)
-    if (
-        match is None
-        or _TIMESTAMP_TIME_PREFIX_RE.search(value[: match.start()]) is None
-    ):
-        return value
-
-    minutes = (
-        match.group("colon_minutes")
-        or match.group("compact_minutes")
-        or "00"
-    )
-    return (
-        f"{value[: match.start()]}{match.group('sign')}"
-        f"{match.group('hours')}:{minutes}"
-    )
-
-
-def _parse_datetime(value: object, field_name: str) -> datetime:
-    """Parse one DWS timestamp without guessing a timezone for naive values."""
-
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        if value is None:
-            raise ValueError(f"{field_name} must not be NULL")
-        text = str(value).strip()
-        if not text:
-            raise ValueError(f"{field_name} is not a valid timestamp")
-        text = _normalize_timestamp_text(text)
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError as exc:
-            raise ValueError(f"{field_name} is not a valid timestamp") from exc
-
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{field_name} must include a timezone offset")
-    return parsed
+# Backward-compatible private aliases keep the SQL lineage adapter's existing
+# internal call sites on the single shared timestamp implementation.
+_timestamp_text = dws_timestamp_param
+_timestamp_param = dws_timestamp_param
+_normalize_timestamp_text = normalize_dws_timestamp_text
+_parse_datetime = parse_dws_timestamp
 
 
 def _decode_json(value: object) -> Mapping[str, object] | str | None:
