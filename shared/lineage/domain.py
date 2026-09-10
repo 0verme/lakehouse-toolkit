@@ -114,8 +114,17 @@ _LEGACY_PROGRAM_NAMESPACE_MAP = {
     "DWS_DWD": "DWD",
     "DWS_DWF": "DWF",
     "DWS_DWUPRR": "DWUPRR",
+    "DWS_DWO": "DWO",
+    "DWS_DLO": "DLO",
     "DLK_DLO": "DLO",
 }
+
+# Business Asset Boundary V1: DLO/DWO are physical-only pre-business layers;
+# DWF is the lowest internal business warehouse layer.  The explicit registry
+# is intentionally small so a new/unknown schema is never reclassified by a
+# fuzzy prefix or a sink name.
+BUSINESS_ASSET_MINIMUM_SCHEMA = "DWF"
+PRE_BUSINESS_ASSET_SCHEMAS = frozenset({"DLO", "DWO"})
 
 
 class ProgramNameDiagnostic(str, Enum):
@@ -526,6 +535,84 @@ class DatasetIdentity:
         }
 
 
+def normalize_lineage_schema(value: object) -> str | None:
+    """Return the explicit lineage layer name for a schema token.
+
+    Physical DatasetIdentity keeps the observed schema unchanged.  This helper
+    only applies the existing explicit legacy/DWS namespace registry when a
+    caller needs to classify a business boundary; unknown wrappers remain
+    unknown instead of being guessed from a prefix.
+    """
+
+    try:
+        schema = canonicalize_schema(value)
+    except (TypeError, ValueError):
+        return None
+    return _LEGACY_PROGRAM_NAMESPACE_MAP.get(schema, schema)
+
+
+def _asset_schema_for_boundary(
+    asset_name: object,
+    *,
+    environment: str | None,
+) -> str | None:
+    if isinstance(asset_name, DatasetIdentity):
+        return normalize_lineage_schema(asset_name.canonical_schema)
+    if environment is not None:
+        identity = DatasetIdentity.from_name(environment, asset_name)
+        if identity is None:
+            return None
+        return normalize_lineage_schema(identity.canonical_schema)
+    parts = _dataset_name_parts(asset_name)
+    if parts is None:
+        return None
+    return normalize_lineage_schema(parts[0])
+
+
+def is_technical_asset(
+    asset_name: object,
+    *,
+    environment: str | None = None,
+) -> bool:
+    """Return whether a qualified asset is DLO/DWO technical-only lineage.
+
+    ``environment`` is optional for callers that already have a canonical
+    ``schema.table`` value.  Passing it makes the check go through
+    ``DatasetIdentity`` and therefore uses the same identity validation as
+    ``LineageEdge``.
+    """
+
+    if isinstance(asset_name, DatasetIdentity):
+        if is_temporary_asset(asset_name.canonical_name):
+            return False
+    elif is_temporary_asset(asset_name if isinstance(asset_name, str) else None):
+        return False
+    schema = _asset_schema_for_boundary(asset_name, environment=environment)
+    return schema in PRE_BUSINESS_ASSET_SCHEMAS
+
+
+def is_business_asset(
+    asset_name: object,
+    *,
+    environment: str | None = None,
+) -> bool:
+    """Return whether a qualified asset may be a Business Lineage endpoint.
+
+    DLO and DWO (including their registered DWS/legacy wrappers) remain valid
+    ``DatasetIdentity``/Physical DAG values but are deliberately excluded from
+    Business Lineage endpoints.  Other existing qualified formal sources keep
+    the compatibility behavior of the current table-level contract.
+    """
+
+    if isinstance(asset_name, DatasetIdentity):
+        if is_temporary_asset(asset_name.canonical_name):
+            return False
+    elif is_temporary_asset(asset_name if isinstance(asset_name, str) else None):
+        return False
+    schema = _asset_schema_for_boundary(asset_name, environment=environment)
+    return schema is not None and schema not in PRE_BUSINESS_ASSET_SCHEMAS
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramIdentity:
     """一个程序实例的稳定 identity。
@@ -865,9 +952,9 @@ class PhysicalEdge:
 class LineageEdge:
     """正式资产之间的直接业务血缘事实。
 
-    一条 ``LineageEdge`` 表示某环境下，一个正式上游资产到一个正式下游
-    资产的直接业务血缘事实。它不是全量递归祖先关系；TMP 只在 Physical
-    DAG 阶段保留，默认不能作为正式业务资产进入此对象。source/target 必须是
+    一条 ``LineageEdge`` 表示某环境下，一个 Business Asset 上游到一个 Business Asset
+    下游的直接业务血缘事实。它不是全量递归祖先关系；TMP、DLO、DWO 只在 Physical
+    DAG/collapse evidence 阶段保留，不能作为 Business endpoint 进入此对象。source/target 必须是
     可解析的 ``schema.table`` DatasetIdentity；``evidence`` 可携带不含完整源码
     的结构化 provenance，供 materialization adapter 序列化。
     """
@@ -905,6 +992,10 @@ class LineageEdge:
         if source_identity is None or target_identity is None:
             raise ValueError(
                 "LineageEdge endpoints must be qualified schema.table dataset references"
+            )
+        if not is_business_asset(source_identity) or not is_business_asset(target_identity):
+            raise ValueError(
+                "LineageEdge endpoints must be Business Assets; keep DLO/DWO in Physical DAG"
             )
         object.__setattr__(self, "environment", source_identity.environment)
         object.__setattr__(self, "source_table", source_identity.canonical_name)
@@ -1025,8 +1116,10 @@ class LineageIssue:
 
 
 __all__ = [
+    "BUSINESS_ASSET_MINIMUM_SCHEMA",
     "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
     "DEFAULT_TEMPORARY_ASSET_RULES",
+    "PRE_BUSINESS_ASSET_SCHEMAS",
     "PROGRAM_NAME_DEFAULT_SUFFIX",
     "PROGRAM_NAME_LEGACY_MARKER",
     "ProgramNameDiagnostic",
@@ -1051,9 +1144,12 @@ __all__ = [
     "ProgramSource",
     "ProgramState",
     "TemporaryAssetRule",
+    "is_business_asset",
     "is_formal_asset",
+    "is_technical_asset",
     "is_temporary_asset",
     "normalize_asset_name",
+    "normalize_lineage_schema",
     "normalize_declared_target_from_program_name",
     "normalize_expected_target",
     "normalize_program_name",

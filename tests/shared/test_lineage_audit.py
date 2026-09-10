@@ -130,6 +130,36 @@ class LineageAuditTests(unittest.TestCase):
         self.assertEqual(evidence["entry_sources"], ["ODS.DEMO_X"])
         self.assertEqual(result.orphan_branch_sinks, ("TMP_X2",))
 
+    def test_pre_business_sinks_do_not_create_business_multi_sink_issue(self):
+        dag = build_dag(
+            """
+            execute("INSERT INTO DLO.DEMO_RESULT_A SELECT * FROM DLO.DEMO_SOURCE_A")
+            execute("INSERT INTO DWO.DEMO_RESULT_B SELECT * FROM DWO.DEMO_SOURCE_B")
+            """,
+            expected_target=None,
+        )
+        result = audit_program_physical_dag(dag)
+
+        self.assertEqual(dag.sinks, ("DLO.DEMO_RESULT_A", "DWO.DEMO_RESULT_B"))
+        self.assertEqual(result.issues, ())
+        self.assertNotIn(IssueType.MULTI_SINK_CANDIDATE, result.issue_types)
+
+    def test_technical_sink_does_not_become_target_mismatch(self):
+        result = audit_program_physical_dag(
+            build_dag(
+                'execute("INSERT INTO DLO.DEMO_STAGE SELECT * FROM ODS.DEMO_SOURCE")',
+                expected_target="DWF.DEMO_RESULT",
+            )
+        )
+
+        self.assertIn(IssueType.TARGET_NOT_FOUND, result.issue_types)
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.issue_types)
+        target_issue = issue_of(result, IssueType.TARGET_NOT_FOUND)
+        self.assertEqual(
+            evidence_of(target_issue)["business_sinks"],
+            [],
+        )
+
     def test_multiple_sinks_reports_candidate_and_orphan_branch(self):
         result = audit_program_physical_dag(build_dag(MULTI_SINK_PROGRAM))
 

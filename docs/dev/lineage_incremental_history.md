@@ -52,7 +52,7 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v8-program-target-hint-selection`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v9-business-asset-boundary`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
 bump 到新的语义版本，并在本文记录原因。v7 在 v6 audit target semantics 的基础上
 固定 `005` canonical 四段 target authority 前的显式 legacy namespace registry：
@@ -73,6 +73,12 @@ authority、formal sinks 多于一个且 exact match 唯一时才影响 material
 Python AST 失败后的保守 legacy SQL literal recovery 不变。相同 source hash 的旧
 v4/v5/v6/v7 facts 都必须 rebuild，避免复用 namespace registry、audit target semantics
 或 target selection 变更前的旧 facts。
+
+v9 在上述语义之上冻结 Business Asset Boundary：DLO/DWO 仅保留在 Physical Lineage，
+作为 collapse 中间节点时穿透到下一个 Business Asset；DLO/DWO-only sink 不触发
+Business `MULTI_SINK_CANDIDATE`，并将 clean boundary-only 程序从
+`NO_LINEAGE_EDGE` coverage failure 中排除。相同 source hash 的旧 v8 facts 必须
+rebuild，避免复用 boundary 规则变更前的 Business projection。
 
 ## Incremental planner
 

@@ -18,6 +18,9 @@ from shared.lineage.domain import ProgramSource
 from shared.lineage.evolution import SnapshotScope
 from shared.lineage.materialization import materialize_program
 from shared.lineage.physical_dag import build_program_physical_dag
+from tests.fixtures.lineage.phase5_materialization_programs import (
+    TECHNICAL_TO_DWF_PROGRAM,
+)
 from tests.fixtures.lineage.phase8_coverage_profiles import COVERAGE_PROFILE_SOURCES
 
 OBSERVED_AT = datetime(2026, 1, 5, 10, 11, 12, tzinfo=timezone.utc)
@@ -96,6 +99,61 @@ class LineageCoverageTests(unittest.TestCase):
         self.assertEqual(read_only.sql_step_count, 1)
         self.assertEqual(
             read_only.failure_reasons[CoverageReason.READ_ONLY_SQL.value],
+            1,
+        )
+
+    def test_business_boundary_only_program_is_not_a_lineage_failure(self):
+        source = ProgramSource(
+            environment="ENV_SYNTHETIC",
+            source_profile="profile_boundary",
+            program_name="DEMO_TECHNICAL_TO_DWF",
+            script_code=TECHNICAL_TO_DWF_PROGRAM,
+            expected_target="DWF.DEMO_RESULT",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            audit_program_physical_dag(dag, observed_at=OBSERVED_AT),
+            batch_id="coverage-boundary",
+            observed_at=OBSERVED_AT,
+        )
+        coverage = LineageCoverageAccumulator()
+        coverage.observe_sources([source])
+        coverage.observe_dag(dag, count_program=False)
+        coverage.observe_materialization(result)
+
+        profile = coverage.report(generated_at="2026-01-05T10:11:12+00:00").profiles[0]
+        self.assertEqual(profile.physical_edge_count, 2)
+        self.assertEqual(profile.lineage_edge_count, 0)
+        self.assertEqual(profile.programs_with_lineage_edges, 0)
+        self.assertEqual(profile.programs_with_business_boundary_only, 1)
+        self.assertEqual(profile.lineage_failure_reasons[CoverageReason.NO_LINEAGE_EDGE.value], 0)
+        self.assertEqual(profile.ratios()["physical_edge_program_ratio"], 1.0)
+
+    def test_tmp_only_program_remains_a_lineage_failure(self):
+        source = ProgramSource(
+            environment="ENV_SYNTHETIC",
+            source_profile="profile_tmp",
+            program_name="DEMO_TMP_ONLY",
+            script_code="INSERT INTO TMP_RESULT SELECT * FROM TMP_SOURCE",
+            expected_target=None,
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            audit_program_physical_dag(dag, observed_at=OBSERVED_AT),
+            batch_id="coverage-tmp-only",
+            observed_at=OBSERVED_AT,
+        )
+        coverage = LineageCoverageAccumulator()
+        coverage.observe_sources([source])
+        coverage.observe_dag(dag, count_program=False)
+        coverage.observe_materialization(result)
+
+        profile = coverage.report(generated_at="2026-01-05T10:11:12+00:00").profiles[0]
+        self.assertEqual(profile.programs_with_business_boundary_only, 0)
+        self.assertEqual(
+            profile.lineage_failure_reasons[CoverageReason.NO_LINEAGE_EDGE.value],
             1,
         )
 

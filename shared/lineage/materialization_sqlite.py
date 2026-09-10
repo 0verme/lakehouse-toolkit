@@ -28,6 +28,7 @@ from shared.lineage.domain import (
     LineageIssue,
     ProgramState,
     canonicalize_dataset_name,
+    is_technical_asset,
 )
 
 from .evolution import (  # pyright: ignore[reportMissingImports]
@@ -365,6 +366,27 @@ def _decode_evidence(value: str) -> Mapping[str, object] | str | None:
     if decoded is None or isinstance(decoded, (str, Mapping)):
         return decoded
     raise ValueError("stored evidence must be a JSON object, string, or null")
+
+
+def _is_legacy_technical_edge_row(row: Any) -> bool:
+    """Exclude pre-boundary DLO/DWO rows from the Business read projection."""
+
+    try:
+        environment, source_table, target_table = row[0], row[2], row[3]
+    except (IndexError, KeyError, TypeError):
+        return False
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (environment, source_table, target_table)
+    ):
+        return False
+    return is_technical_asset(
+        source_table,
+        environment=environment,
+    ) or is_technical_asset(
+        target_table,
+        environment=environment,
+    )
 
 
 def _edge_from_row(row: Any) -> LineageEdge:
@@ -1083,7 +1105,11 @@ class SQLiteMaterializationStore:
             # table, environment and profile values remain parameters.
             # pi-lens-ignore: python-sql-injection
             rows = connection.execute(query_sql, tuple(params)).fetchall()
-        return tuple(_edge_from_row(row) for row in rows)
+        return tuple(
+            _edge_from_row(row)
+            for row in rows
+            if not _is_legacy_technical_edge_row(row)
+        )
 
     def read_outgoing_edges(
         self,
@@ -1129,7 +1155,11 @@ class SQLiteMaterializationStore:
             batch_id=batch_id,
             active_only=active_only,
         )
-        return tuple(_edge_from_row(row) for row in rows)
+        return tuple(
+            _edge_from_row(row)
+            for row in rows
+            if not _is_legacy_technical_edge_row(row)
+        )
 
     def read_program_states(
         self,

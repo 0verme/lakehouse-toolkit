@@ -1,7 +1,7 @@
 """Phase 5: 从 audited Physical DAG 派生正式业务血缘。
 
-本模块只负责纯转换，不访问数据库。Physical DAG 保留完整的 TMP、cycle 和
-orphan 事实；materialization 只沿 TMP 穿透到下一个正式资产，并把每条
+本模块只负责纯转换，不访问数据库。Physical DAG 保留完整的 TMP、DLO、DWO、cycle
+和 orphan 事实；materialization 只沿可折叠节点穿透到下一个 Business Asset，并把每条
 ``LineageEdge`` 的 provenance 压缩为可序列化的结构化 evidence。
 """
 
@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from heapq import heapify, heappop, heappush
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from shared.lineage.audit import (
@@ -34,7 +34,6 @@ from shared.lineage.audit import (
     _value_sort_key as _audit_value_sort_key,
 )
 from shared.lineage.domain import (
-    DatasetIdentity,
     IssueType,
     LineageEdge,
     LineageIssue,
@@ -42,6 +41,8 @@ from shared.lineage.domain import (
     PhysicalNode,
     PhysicalNodeKind,
     ProgramState,
+    is_business_asset,
+    is_technical_asset,
     is_temporary_asset,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
@@ -50,6 +51,7 @@ from shared.lineage.physical_dag import ProgramPhysicalDAG
 MAX_PHYSICAL_PATHS = 100
 MAX_PHYSICAL_EDGE_PAIRS = 200
 MAX_COLLAPSED_TMP_NODES = 200
+MAX_COLLAPSED_TECHNICAL_NODES = 200
 MAX_STATEMENT_INDICES = 200
 MAX_EVIDENCE_DEPTH = 64
 MAX_EVIDENCE_COLLECTION_SIZE = 10_000
@@ -245,13 +247,16 @@ def _simple_canonical_json(value: object) -> str | None:
         return str(value)
     if type(value) is str:
         return json.encoder.encode_basestring(value)
-    if type(value) in (list, tuple) and all(
+    if type(value) not in (list, tuple):
+        return None
+    sequence = cast(list[object] | tuple[object, ...], value)
+    if all(
         item is None or type(item) is bool or type(item) is int or type(item) is str
-        for item in value
+        for item in sequence
     ):
         return (
             "["
-            + ",".join(_simple_canonical_json(item) or "null" for item in value)
+            + ",".join(_simple_canonical_json(item) or "null" for item in sequence)
             + "]"
         )
     return None
@@ -355,12 +360,16 @@ class _EdgeEvidenceAccumulator:
     collapsed_tmp_nodes: _BoundedValues = field(
         default_factory=lambda: _BoundedValues(MAX_COLLAPSED_TMP_NODES)
     )
+    collapsed_technical_nodes: _BoundedValues = field(
+        default_factory=lambda: _BoundedValues(MAX_COLLAPSED_TECHNICAL_NODES)
+    )
     statement_indices: _BoundedValues = field(
         default_factory=lambda: _BoundedValues(MAX_STATEMENT_INDICES)
     )
     paths_truncated: bool = False
     physical_edge_pairs_truncated: bool = False
     collapsed_tmp_nodes_truncated: bool = False
+    collapsed_technical_nodes_truncated: bool = False
     statement_indices_truncated: bool = False
     physical_edge_summaries: dict[int, dict[str, object]] = field(
         default_factory=dict,
@@ -385,6 +394,15 @@ class _EdgeEvidenceAccumulator:
             )
         )
 
+    def _add_collapsed_node(self, node: object) -> None:
+        node_text = str(node)
+        if is_technical_asset(node_text):
+            self.collapsed_technical_nodes.add_safe(node_text)
+        else:
+            # Preserve explicit/custom temporary nodes that do not match the
+            # default TMP naming rule.
+            self.collapsed_tmp_nodes.add_safe(node_text)
+
     def add_graph_summary(
         self,
         physical_edges: Iterable[PhysicalEdge],
@@ -402,7 +420,7 @@ class _EdgeEvidenceAccumulator:
                 if isinstance(index, (int, str)) and not isinstance(index, bool):
                     self.statement_indices.add_safe(index)
         for node in collapsed_tmp_nodes:
-            self.collapsed_tmp_nodes.add_safe(node)
+            self._add_collapsed_node(node)
 
     def add_evidence(self, evidence: Mapping[str, object] | str | None) -> None:
         _record_metric("accumulator_add_evidence_calls")
@@ -453,7 +471,12 @@ class _EdgeEvidenceAccumulator:
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
                 self.physical_edge_pairs.add_safe((str(pair[0]), str(pair[1])))
         for node in _as_items(safe_value.get("collapsed_tmp_nodes")):
-            self.collapsed_tmp_nodes.add_safe(str(node))
+            self._add_collapsed_node(node)
+        for node in _as_items(safe_value.get("collapsed_technical_nodes")):
+            self.collapsed_technical_nodes.add_safe(str(node))
+        self.collapsed_technical_nodes_truncated |= bool(
+            safe_value.get("collapsed_technical_nodes_truncated")
+        )
         for index in _as_items(safe_value.get("statement_indices")):
             if isinstance(index, (int, str)) and not isinstance(index, bool):
                 self.statement_indices.add_safe(index)
@@ -485,7 +508,9 @@ class _EdgeEvidenceAccumulator:
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
                 self.physical_edge_pairs.add_safe((str(pair[0]), str(pair[1])))
         for node in _as_items(value.get("collapsed_tmp_nodes")):
-            self.collapsed_tmp_nodes.add_safe(str(node))
+            self._add_collapsed_node(node)
+        for node in _as_items(value.get("collapsed_technical_nodes")):
+            self.collapsed_technical_nodes.add_safe(str(node))
         for edge in _as_items(value.get("physical_edges")):
             if not isinstance(edge, Mapping):
                 continue
@@ -500,10 +525,15 @@ class _EdgeEvidenceAccumulator:
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
                 physical_edge_pairs.append(list(pair))
         return {
-            "collapse": "tmp_until_formal_boundary",
+            "collapse": "technical_and_tmp_until_business_boundary",
             "collapsed_tmp_nodes": self.collapsed_tmp_nodes.sorted_values(),
             "collapsed_tmp_nodes_truncated": (
                 self.collapsed_tmp_nodes_truncated or self.collapsed_tmp_nodes.truncated
+            ),
+            "collapsed_technical_nodes": self.collapsed_technical_nodes.sorted_values(),
+            "collapsed_technical_nodes_truncated": (
+                self.collapsed_technical_nodes_truncated
+                or self.collapsed_technical_nodes.truncated
             ),
             "physical_edge_pairs": physical_edge_pairs,
             "physical_edge_pairs_truncated": (
@@ -595,6 +625,14 @@ def _node_map(dag: ProgramPhysicalDAG) -> dict[str, PhysicalNode]:
     return {node.node_key: node for node in dag.nodes}
 
 
+def _node_asset_name(
+    node_key: str,
+    node_map: Mapping[str, PhysicalNode],
+) -> str:
+    node = node_map.get(node_key)
+    return node.asset_name if node is not None else node_key
+
+
 def _is_temporary(node_key: str, node_map: Mapping[str, PhysicalNode]) -> bool:
     node = node_map.get(node_key)
     if node is not None:
@@ -602,8 +640,32 @@ def _is_temporary(node_key: str, node_map: Mapping[str, PhysicalNode]) -> bool:
     return is_temporary_asset(node_key)
 
 
-def _has_dataset_identity(environment: str, node_key: str) -> bool:
-    return DatasetIdentity.from_name(environment, node_key) is not None
+def _is_business_boundary(
+    node_key: str,
+    node_map: Mapping[str, PhysicalNode],
+    *,
+    environment: str | None,
+) -> bool:
+    if _is_temporary(node_key, node_map):
+        return False
+    return is_business_asset(
+        _node_asset_name(node_key, node_map),
+        environment=environment,
+    )
+
+
+def _is_collapsible_intermediate(
+    node_key: str,
+    node_map: Mapping[str, PhysicalNode],
+    *,
+    environment: str | None,
+) -> bool:
+    if _is_temporary(node_key, node_map):
+        return True
+    return is_technical_asset(
+        _node_asset_name(node_key, node_map),
+        environment=environment,
+    )
 
 
 def _build_adjacency(
@@ -624,9 +686,13 @@ def _build_adjacency(
             if edge.target not in selected_by_target:
                 selected_by_target[edge.target] = edge
                 continue
-            if _is_temporary(edge.target, node_map):
-                # TMP states are pushed onto a LIFO stack, so the last sorted
-                # duplicate was the first one to reach a later boundary.
+            if _is_collapsible_intermediate(
+                edge.target,
+                node_map,
+                environment=None,
+            ):
+                # Collapsible states are pushed onto a LIFO stack, so the last
+                # sorted duplicate was the first one to reach a later boundary.
                 selected_by_target[edge.target] = edge
         normalized[source] = tuple(
             sorted(selected_by_target.values(), key=_physical_edge_sort_key)
@@ -650,20 +716,20 @@ def _collapsed_paths(
     dag: ProgramPhysicalDAG,
     included_nodes: set[str],
 ) -> Iterator[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]]]:
-    """显式遍历 TMP 路径；acyclic materialization 优先使用 DAG DP。"""
+    """显式遍历 TMP/DLO/DWO 路径直到下一个 Business Asset。"""
 
     node_map = _node_map(dag)
     adjacency = _build_adjacency(dag.edges, node_map)
-    formal_starts = sorted(
+    environment = dag.program_source.environment
+    business_starts = sorted(
         node
         for node in included_nodes
-        if not _is_temporary(node, node_map)
-        and _has_dataset_identity(dag.program_source.environment, node)
+        if _is_business_boundary(node, node_map, environment=environment)
     )
     traversed_states = 0
     collapsed_path_count = 0
 
-    for start in formal_starts:
+    for start in business_starts:
         pending: list[tuple[str, tuple[str, ...], tuple[PhysicalEdge, ...]]] = [
             (start, (start,), ())
         ]
@@ -679,20 +745,30 @@ def _collapsed_paths(
                 next_node = edge.target
                 if next_node not in included_nodes:
                     continue
-                if _is_temporary(next_node, node_map):
+                if _is_collapsible_intermediate(
+                    next_node,
+                    node_map,
+                    environment=environment,
+                ):
                     if next_node in path:
-                        # TMP cycle 没有新的 formal boundary；停止该路径。
+                        # A cycle without a new Business Asset boundary stops
+                        # this path; audit retains the physical cycle fact.
                         continue
                     pending.append(
                         (next_node, path + (next_node,), path_edges + (edge,))
                     )
                     continue
-                if not _has_dataset_identity(dag.program_source.environment, next_node):
-                    # 缺少 schema 的引用保持 unresolved，不猜测 namespace。
+                if not _is_business_boundary(
+                    next_node,
+                    node_map,
+                    environment=environment,
+                ):
+                    # Unknown/non-boundary physical references stay out of the
+                    # Business projection rather than being guessed as assets.
                     continue
 
-                # Formal endpoint 是一条新的业务资产边界。即使它等于 start，
-                # 也只输出一次 self edge，不再沿它继续展开。
+                # A Business Asset endpoint is a boundary.  Even when it equals
+                # start, emit one self edge and do not expand through it.
                 if collapsed_path_count >= MAX_COLLAPSED_PATHS:
                     raise LineagePathEnumerationError(
                         "collapsed physical path count exceeds maximum "
@@ -706,14 +782,24 @@ def _temporary_topological_order(
     included_nodes: set[str],
     node_map: Mapping[str, PhysicalNode],
     adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+    *,
+    environment: str | None = None,
 ) -> tuple[str, ...] | None:
-    """Return a deterministic TMP topological order, or ``None`` for a cycle."""
+    """Return a deterministic TMP/technical topological order, or ``None`` for a cycle."""
 
-    temporary_nodes = {node for node in included_nodes if _is_temporary(node, node_map)}
-    indegree = {node: 0 for node in temporary_nodes}
-    for source in sorted(temporary_nodes):
+    collapsible_nodes = {
+        node
+        for node in included_nodes
+        if _is_collapsible_intermediate(
+            node,
+            node_map,
+            environment=environment,
+        )
+    }
+    indegree = {node: 0 for node in collapsible_nodes}
+    for source in sorted(collapsible_nodes):
         for edge in adjacency.get(source, ()):
-            if edge.target in temporary_nodes:
+            if edge.target in collapsible_nodes:
                 indegree[edge.target] += 1
 
     ready = [node for node, count in indegree.items() if count == 0]
@@ -728,7 +814,7 @@ def _temporary_topological_order(
             indegree[edge.target] -= 1
             if indegree[edge.target] == 0:
                 heappush(ready, edge.target)
-    if len(ordered) != len(temporary_nodes):
+    if len(ordered) != len(collapsible_nodes):
         return None
     return tuple(ordered)
 
@@ -738,12 +824,21 @@ def _reachable_temporary_nodes(
     included_nodes: set[str],
     node_map: Mapping[str, PhysicalNode],
     adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+    *,
+    environment: str | None = None,
 ) -> set[str]:
+    """Return traversable TMP/DLO/DWO nodes reachable from a business source."""
+
     reachable: set[str] = set()
     pending = [
         edge.target
         for edge in adjacency.get(start, ())
-        if edge.target in included_nodes and _is_temporary(edge.target, node_map)
+        if edge.target in included_nodes
+        and _is_collapsible_intermediate(
+            edge.target,
+            node_map,
+            environment=environment,
+        )
     ]
     while pending:
         current = pending.pop()
@@ -754,7 +849,11 @@ def _reachable_temporary_nodes(
             edge.target
             for edge in adjacency.get(current, ())
             if edge.target in included_nodes
-            and _is_temporary(edge.target, node_map)
+            and _is_collapsible_intermediate(
+                edge.target,
+                node_map,
+                environment=environment,
+            )
             and edge.target not in reachable
         )
     return reachable
@@ -765,12 +864,21 @@ def _reverse_reachable_temporary_nodes(
     included_nodes: set[str],
     node_map: Mapping[str, PhysicalNode],
     reverse_adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
+    *,
+    environment: str | None = None,
 ) -> set[str]:
+    """Return traversable TMP/DLO/DWO nodes that can reach a business target."""
+
     reachable: set[str] = set()
     pending = [
         edge.source
         for edge in reverse_adjacency.get(target, ())
-        if edge.source in included_nodes and _is_temporary(edge.source, node_map)
+        if edge.source in included_nodes
+        and _is_collapsible_intermediate(
+            edge.source,
+            node_map,
+            environment=environment,
+        )
     ]
     while pending:
         current = pending.pop()
@@ -781,7 +889,11 @@ def _reverse_reachable_temporary_nodes(
             edge.source
             for edge in reverse_adjacency.get(current, ())
             if edge.source in included_nodes
-            and _is_temporary(edge.source, node_map)
+            and _is_collapsible_intermediate(
+                edge.source,
+                node_map,
+                environment=environment,
+            )
             and edge.source not in reachable
         )
     return reachable
@@ -793,6 +905,8 @@ def _acyclic_path_counts(
     node_map: Mapping[str, PhysicalNode],
     adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
     topological_order: tuple[str, ...],
+    *,
+    environment: str | None = None,
 ) -> dict[tuple[str, str], int]:
     counts: dict[tuple[str, str], int] = {}
     for start in formal_starts:
@@ -800,9 +914,18 @@ def _acyclic_path_counts(
         for edge in adjacency.get(start, ()):
             if edge.target not in included_nodes:
                 continue
-            if _is_temporary(edge.target, node_map):
+            if _is_collapsible_intermediate(
+                edge.target,
+                node_map,
+                environment=environment,
+            ):
                 temporary_counts[edge.target] = temporary_counts.get(edge.target, 0) + 1
-            else:
+                continue
+            if _is_business_boundary(
+                edge.target,
+                node_map,
+                environment=environment,
+            ):
                 identity = (start, edge.target)
                 counts[identity] = counts.get(identity, 0) + 1
 
@@ -813,13 +936,22 @@ def _acyclic_path_counts(
             for edge in adjacency.get(current, ()):
                 if edge.target not in included_nodes:
                     continue
-                if _is_temporary(edge.target, node_map):
+                if _is_collapsible_intermediate(
+                    edge.target,
+                    node_map,
+                    environment=environment,
+                ):
                     temporary_counts[edge.target] = (
                         temporary_counts.get(edge.target, 0) + current_count
                     )
                     continue
-                identity = (start, edge.target)
-                counts[identity] = counts.get(identity, 0) + current_count
+                if _is_business_boundary(
+                    edge.target,
+                    node_map,
+                    environment=environment,
+                ):
+                    identity = (start, edge.target)
+                    counts[identity] = counts.get(identity, 0) + current_count
     return counts
 
 
@@ -831,6 +963,8 @@ def _sample_acyclic_paths(
     node_map: Mapping[str, PhysicalNode],
     adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
     max_paths: int,
+    *,
+    environment: str | None = None,
 ) -> Iterator[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]]]:
     """Yield a deterministic bounded sample without traversing every path."""
 
@@ -844,12 +978,20 @@ def _sample_acyclic_paths(
             next_node = edge.target
             if next_node not in included_nodes:
                 continue
-            if _is_temporary(next_node, node_map):
+            if _is_collapsible_intermediate(
+                next_node,
+                node_map,
+                environment=environment,
+            ):
                 if next_node not in relevant_temporary_nodes or next_node in path:
                     continue
                 pending.append((next_node, path + (next_node,), path_edges + (edge,)))
                 continue
-            if next_node != target:
+            if not _is_business_boundary(
+                next_node,
+                node_map,
+                environment=environment,
+            ) or next_node != target:
                 continue
             emitted += 1
             yield path + (next_node,), path_edges + (edge,)
@@ -878,19 +1020,21 @@ def _collapse_acyclic_dag_to_edges(
     observed_at: datetime,
     job_key: str | None,
 ) -> tuple[LineageEdge, ...] | None:
-    """Collapse an acyclic TMP graph with exact DP counts and bounded samples.
+    """Collapse an acyclic TMP/technical graph with exact DP counts and bounded samples.
 
-    ``None`` means the TMP subgraph contains a cycle; callers must use the
+    ``None`` means the collapsible subgraph contains a cycle; callers must use the
     simple-path fallback because exact cyclic path counts need different
     semantics.
     """
 
     node_map = _node_map(dag)
     adjacency = _build_adjacency(dag.edges, node_map)
+    environment = dag.program_source.environment
     topological_order = _temporary_topological_order(
         included_nodes,
         node_map,
         adjacency,
+        environment=environment,
     )
     if topological_order is None:
         return None
@@ -898,8 +1042,7 @@ def _collapse_acyclic_dag_to_edges(
     formal_starts = sorted(
         node
         for node in included_nodes
-        if not _is_temporary(node, node_map)
-        and _has_dataset_identity(dag.program_source.environment, node)
+        if _is_business_boundary(node, node_map, environment=environment)
     )
     path_counts = _acyclic_path_counts(
         formal_starts,
@@ -907,6 +1050,7 @@ def _collapse_acyclic_dag_to_edges(
         node_map,
         adjacency,
         topological_order,
+        environment=environment,
     )
     if not path_counts:
         return ()
@@ -922,7 +1066,11 @@ def _collapse_acyclic_dag_to_edges(
     ] = {}
 
     for (source_table, target_table), path_count in sorted(path_counts.items()):
-        if not _has_dataset_identity(source.environment, target_table):
+        if not _is_business_boundary(
+            target_table,
+            node_map,
+            environment=environment,
+        ):
             continue
         identity = (
             source.environment,
@@ -943,6 +1091,7 @@ def _collapse_acyclic_dag_to_edges(
                 included_nodes,
                 node_map,
                 adjacency,
+                environment=environment,
             )
             forward_cache[source_table] = forward_nodes
         backward_nodes = backward_cache.get(target_table)
@@ -952,6 +1101,7 @@ def _collapse_acyclic_dag_to_edges(
                 included_nodes,
                 node_map,
                 reverse_adjacency,
+                environment=environment,
             )
             backward_cache[target_table] = backward_nodes
         relevant_temporary_nodes = forward_nodes & backward_nodes
@@ -977,6 +1127,7 @@ def _collapse_acyclic_dag_to_edges(
             node_map,
             adjacency,
             MAX_PHYSICAL_PATHS,
+            environment=environment,
         ):
             accumulator.add_path(path, physical_edges, count=False)
         grouped[identity] = accumulator
@@ -1038,14 +1189,24 @@ def _path_evidence(
             edge_records.append(_physical_edge_summary(edge))
             continue
         edge_records.append(_cached_physical_edge_summary(edge, edge_summary_cache))
-    # path[1:-1] 只包含 traversal 中实际穿透的 temporary 节点，
-    # 也涵盖通过 CREATE TEMP 标记但名称不是 TMP 的节点。
-    tmp_nodes = sorted(set(path[1:-1]))
+    # Keep TMP and registered DLO/DWO intermediates separate in evidence.  A
+    # path produced by this module only contains collapsible intermediates, so
+    # an intermediate that is not registered DLO/DWO is an explicitly temporary
+    # PhysicalNode (including CREATE TEMP names outside the default TMP rule).
+    intermediate_nodes = set(path[1:-1])
+    technical_nodes = sorted(
+        node for node in intermediate_nodes if is_technical_asset(node)
+    )
+    technical_node_set = set(technical_nodes)
+    tmp_nodes = sorted(
+        node for node in intermediate_nodes if node not in technical_node_set
+    )
     return {
         "nodes": list(path),
         "physical_edge_pairs": [[edge.source, edge.target] for edge in physical_edges],
         "physical_edges": edge_records,
         "collapsed_tmp_nodes": tmp_nodes,
+        "collapsed_technical_nodes": technical_nodes,
     }
 
 
@@ -1111,14 +1272,16 @@ def _collapse_paths_to_edges(
     job_key: str | None,
 ) -> tuple[LineageEdge, ...]:
     source = dag.program_source
+    node_map = _node_map(dag)
+    environment = source.environment
     grouped: dict[
         tuple[str, str, str, str, str, str],
         _EdgeEvidenceAccumulator,
     ] = {}
     for path, physical_edges in paths:
         if not (
-            _has_dataset_identity(source.environment, path[0])
-            and _has_dataset_identity(source.environment, path[-1])
+            _is_business_boundary(path[0], node_map, environment=environment)
+            and _is_business_boundary(path[-1], node_map, environment=environment)
         ):
             continue
         identity = (
@@ -1240,13 +1403,13 @@ def materialize_program(
     observed_at: datetime | None = None,
     job_key: str | None = None,
 ) -> ProgramMaterialization:
-    """把一个 audited DAG 转换为 direct formal ``LineageEdge``。
+    """把一个 audited DAG 转换为 direct Business ``LineageEdge``。
 
     ``audit_result`` 未提供时只调用既有 Phase 4 auditor，不在这里复制 detector
     或解析 ``program_name``。Target Selection 已选择 authoritative target 或 unique
     hint 时只使用 ``target_reachable_nodes``；没有选择时不猜 sink，仅 materialize
-    图中已有的 formal-to-formal boundary。TMP 子图无环时使用
-    exact DAG path-count DP 加 bounded representative sample；TMP 有环时保留
+    图中已有的 Business-to-Business boundary。TMP/DLO/DWO 子图无环时使用
+    exact DAG path-count DP 加 bounded representative sample；可折叠节点有环时保留
     explicit simple-path fallback 及其 controlled limits。
     """
 
@@ -1323,7 +1486,7 @@ def collapse_tmp_edges(
     observed_at: datetime | None = None,
     job_key: str | None = None,
 ) -> tuple[LineageEdge, ...]:
-    """纯 TMP collapse 入口；返回已带批次 metadata 的 direct edges。"""
+    """兼容的 TMP collapse 入口；同时穿透 DLO/DWO 到 Business boundary。"""
 
     return materialize_program(
         dag,

@@ -16,8 +16,11 @@ from shared.lineage.domain import (
     extract_program_declared_target_token,
     extract_program_target_hint,
     group_program_sources_by_logical_target,
+    is_business_asset,
     is_formal_asset,
+    is_technical_asset,
     is_temporary_asset,
+    normalize_lineage_schema,
     normalize_declared_target_from_program_name,
     normalize_legacy_program_namespace,
     parse_declared_primary_target,
@@ -360,6 +363,45 @@ class LineageDomainTests(unittest.TestCase):
                 source_profile="mysql_dev_a",
                 source_table="TMP_1",
                 target_table="DWA.DEMO_C",
+            )
+
+    def test_business_asset_boundary_reuses_registered_schema_wrappers(self):
+        cases = {
+            "DWF.DEMO_A": True,
+            "DWS_DWF.DEMO_A": True,
+            "DWM.DEMO_A": True,
+            "DLO.DEMO_A": False,
+            "DWO.DEMO_A": False,
+            "DWS_DLO.DEMO_A": False,
+            "DWS_DWO.DEMO_A": False,
+            "DLK_DLO.DEMO_A": False,
+        }
+        for asset_name, expected_business in cases.items():
+            with self.subTest(asset_name=asset_name):
+                self.assertEqual(is_business_asset(asset_name), expected_business)
+                self.assertEqual(
+                    is_technical_asset(asset_name), not expected_business
+                    if "DLO" in asset_name or "DWO" in asset_name
+                    else False,
+                )
+        self.assertEqual(normalize_lineage_schema("DWS_DWO"), "DWO")
+        self.assertEqual(normalize_lineage_schema("DLK_DLO"), "DLO")
+        self.assertTrue(is_business_asset("DLO.DEMO_A", environment="DEV") is False)
+
+    def test_lineage_edge_rejects_pre_business_endpoint(self):
+        with self.assertRaisesRegex(ValueError, "Business Assets"):
+            LineageEdge(
+                environment="DEV",
+                source_profile="mysql_dev_a",
+                source_table="DLO.DEMO_A",
+                target_table="DWF.DEMO_C",
+            )
+        with self.assertRaisesRegex(ValueError, "Business Assets"):
+            LineageEdge(
+                environment="DEV",
+                source_profile="mysql_dev_a",
+                source_table="DWF.DEMO_A",
+                target_table="DWS_DWO.DEMO_C",
             )
 
     def test_issue_type_contains_all_frozen_values(self):

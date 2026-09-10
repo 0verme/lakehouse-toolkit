@@ -5,7 +5,9 @@ Phase 4 只消费 Phase 3 的 `ProgramPhysicalDAG`，把已经确认的程序事
 不重新解析 `ProgramSource.script_code`，也不修复或重写 Physical 图。
 
 完整的 Fact / Policy / lifecycle contract 见
-[`lineage_audit_policy.md`](lineage_audit_policy.md)。核心边界是：
+[`lineage_audit_policy.md`](lineage_audit_policy.md)。Business Asset Boundary（DLO/DWO
+仅保留 Physical、Business sink 分类和 coverage 解释）见
+[`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。核心边界是：
 
 ```text
 Physical DAG → AuditFact → AuditPolicy → LineageIssue projection → persistence/history
@@ -57,7 +59,7 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 | IssueType | 触发语义 | 默认 policy severity |
 | --- | --- | --- |
 | `ORPHAN_BRANCH` | 已知且实际写入的 expected target 存在时，某个 terminal branch 无法到达该 target | `MEDIUM` |
-| `MULTI_SINK_CANDIDATE` | `dag.sinks` 中有多个终止写入候选 | `MEDIUM` |
+| `MULTI_SINK_CANDIDATE` | 有多个 Business Asset 终止写入候选；全部为 DLO/DWO technical sink 时不触发 | `MEDIUM` |
 | `TARGET_NOT_FOUND` | expected target 未被实际写入，且没有其它明确正式 sink | `HIGH` |
 | `TARGET_MISMATCH` | expected target 未被实际写入，且存在其它明确正式 sink 替代它 | `HIGH` |
 | `CYCLE_DETECTED` | 一个多节点 strongly connected component（SCC） | `HIGH` |
@@ -71,8 +73,10 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 ## Sink 与 target 规则
 
 审计直接使用 Phase 3 的 `dag.sinks`。节点的 `PhysicalNodeKind` 区分
-`formal_sinks` 与 `temporary_sinks`，不会把 `TMP_UNUSED` 误称为正式结果表。
-`MULTI_SINK_CANDIDATE` 仍会保留 TMP sink，因为多个终止写入本身是需要审计的事实。
+`formal_sinks` 与 `temporary_sinks`，不会把 `TMP_UNUSED` 误称为正式结果表；在
+formal sinks 中再按 [`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)
+的 registry 派生 Business sink。`MULTI_SINK_CANDIDATE` 仍会保留 TMP sink，因为多个终止
+写入本身是需要审计的事实；只有候选 sink 全部是 DLO/DWO 时才抑制该 Business issue。
 
 审计同时保留两个不同的 target fact：
 
@@ -88,8 +92,9 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 
 `expected_target` 也可以由 profile 显式启用的
 `program_name -> declared primary target` 策略产生；此时它仍只是 primary
-result hint，不是唯一结果声明。所有实际 terminal sink 都保留并参与
-`MULTI_SINK_CANDIDATE` 审计。
+result hint，不是唯一结果声明。所有实际 terminal sink 都保留在 Physical evidence；Business sink 候选参与
+`MULTI_SINK_CANDIDATE` 审计。DLO/DWO target hint 不会授予 Business sink selection
+authority。
 
 1. `expected_target is None`：没有权威 target，不生成
    `TARGET_NOT_FOUND`、`TARGET_MISMATCH` 或 `ORPHAN_BRANCH`；仍可生成 sink、cycle
@@ -99,9 +104,9 @@ result hint，不是唯一结果声明。所有实际 terminal sink 都保留并
    由 `SELF_REFERENCE` 表达；存在 downstream 或其它不能到达 expected target 的
    terminal branch 时由 `ORPHAN_BRANCH` 表达；多个 terminal sink 仍由
    `MULTI_SINK_CANDIDATE` 表达。
-4. expected target 未被写入：如果存在明确正式 sink，生成一个
-   `TARGET_MISMATCH`；否则生成一个 `TARGET_NOT_FOUND`。因此同一事实不会机械地
-   同时产生两个 target issue。
+4. expected target 未被写入：如果存在明确 Business sink，生成一个
+   `TARGET_MISMATCH`；DLO/DWO technical sink 不作为 Business 替代结果，否则生成一个
+   `TARGET_NOT_FOUND`。因此同一事实不会机械地同时产生两个 target issue。
 
 例如 `expected_target=DWA.DEMO_RESULT`、实际 sink 为
 `DWA.DEMO_OTHER` 且 expected target 从未写入时是 `TARGET_MISMATCH`，不是

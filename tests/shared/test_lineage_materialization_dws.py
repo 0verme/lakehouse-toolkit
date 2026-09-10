@@ -684,6 +684,110 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             2,
         )
 
+    def test_business_boundary_keeps_technical_physical_rows_out_of_business_rows(
+        self,
+    ) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_BUSINESS_BOUNDARY",
+            "INSERT INTO DLO.TECH_STAGE SELECT * FROM DWF.SOURCE;"
+            " INSERT INTO DWO.TECH_STAGE_2 SELECT * FROM DLO.TECH_STAGE;"
+            " INSERT INTO DWM.RESULT SELECT * FROM DWO.TECH_STAGE_2;",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:business-boundary",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-business-boundary",
+            observed_at=OBSERVED_AT,
+        )
+
+        result = self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertEqual(result.edge_count, 3)
+        self.assertEqual(result.business_edge_count, 1)
+        physical = self.store.read_physical_edges(active_only=True)
+        self.assertEqual(len(physical), 3)
+        self.assertTrue(
+            any(
+                row.source_table.startswith(("DLO.", "DWO."))
+                or row.target_table.startswith(("DLO.", "DWO."))
+                for row in physical
+            )
+        )
+        business = self.store.read_edges(active_only=True)
+        self.assertEqual(
+            [(edge.source_table, edge.target_table) for edge in business],
+            [("DWF.SOURCE", "DWM.RESULT")],
+        )
+        self.assertEqual(business[0].source_table, "DWF.SOURCE")
+        self.assertEqual(business[0].target_table, "DWM.RESULT")
+
+    def test_legacy_technical_business_rows_are_hidden_from_dws_reads(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_LEGACY_TECHNICAL",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE;",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:legacy-technical",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-legacy-technical",
+            observed_at=OBSERVED_AT,
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+        self.connection.execute(
+            "UPDATE dwp.lineage_business_edge SET source_table = ?, target_table = ?",
+            ("DLO.LEGACY_SOURCE", "DWF.LEGACY_TARGET"),
+        )
+        self.connection.commit()
+
+        self.assertEqual(self.store.read_edges(active_only=True), ())
+        self.assertEqual(
+            self.store.read_outgoing_edges(
+                environment="DEV",
+                source_table="DLO.LEGACY_SOURCE",
+            ),
+            (),
+        )
+
+        second_batch, second_dag = self.make_batch(
+            source,
+            batch_id="batch-dws-legacy-technical-cleanup",
+            observed_at=OBSERVED_AT.replace(day=2),
+        )
+        self.store.publish(
+            second_batch,
+            physical_dags=(second_dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+        active_edges = self.store.read_edges(active_only=True)
+        self.assertEqual(
+            [(edge.source_table, edge.target_table) for edge in active_edges],
+            [("DWF.SOURCE", "DWM.RESULT")],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM dwp.lineage_business_edge "
+                "WHERE is_active = TRUE"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_complete_snapshot_requires_explicit_nonempty_scope(self) -> None:
         batch = MaterializationBatch(
             batch_id="batch-dws-scope-required",
