@@ -564,6 +564,10 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             snapshot_scopes=(("DEV", "fixture"),),
         )
 
+        self.assertEqual(
+            self.store.get_active_snapshot_scope(),
+            (("DEV", "fixture"),),
+        )
         metadata = self.store.get_batch_metadata(batch.batch_id)
         self.assertIsNotNone(metadata)
         assert metadata is not None
