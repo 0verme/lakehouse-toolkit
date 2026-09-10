@@ -11,6 +11,7 @@ DOC_PATH = ROOT / "docs" / "research" / "issue-39-dws-materialization-schema.md"
 MATRIX_PATH = ROOT / "docs" / "research" / "issue-39-dws-lifecycle-matrix.json"
 TABLE_NAMES = (
     "lineage_batch",
+    "lineage_schedule_edge",
     "lineage_program_state",
     "lineage_edge",
     "lineage_business_edge",
@@ -18,6 +19,7 @@ TABLE_NAMES = (
 )
 ORIENTATIONS = {
     "lineage_batch": "ROW",
+    "lineage_schedule_edge": "COLUMN",
     "lineage_program_state": "ROW",
     "lineage_edge": "COLUMN",
     "lineage_business_edge": "COLUMN",
@@ -39,7 +41,7 @@ class DwsSchemaContractTests(unittest.TestCase):
         cls.doc = DOC_PATH.read_text(encoding="utf-8")
         cls.matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
 
-    def test_ddl_declares_exactly_the_five_writer_tables(self):
+    def test_ddl_declares_five_writer_tables_and_schedule_extension(self):
         tables = tuple(
             re.findall(r"^CREATE TABLE ([^\s(]+) \(", self.ddl, re.MULTILINE)
         )
@@ -63,12 +65,13 @@ class DwsSchemaContractTests(unittest.TestCase):
             )
             self.assertRegex(
                 block,
-                r"\b(row_key|batch_id|program_key|edge_key|business_edge_key|stable_issue_key)\b",
+                r"\b(row_key|batch_id|schedule_edge_key|program_key|edge_key|business_edge_key|stable_issue_key)\b",
             )
 
     def test_each_fact_separates_row_and_stable_identity_keys(self):
         required_keys = {
             "lineage_batch": ("batch_id",),
+            "lineage_schedule_edge": ("row_key", "schedule_edge_key"),
             "lineage_program_state": ("row_key", "program_key"),
             "lineage_edge": ("row_key", "edge_key"),
             "lineage_business_edge": ("row_key", "business_edge_key"),
@@ -79,6 +82,30 @@ class DwsSchemaContractTests(unittest.TestCase):
             for key in keys:
                 with self.subTest(table=table_name, key=key):
                     self.assertRegex(block, rf"\b{re.escape(key)}\b")
+
+    def test_schedule_edge_preserves_raw_comparison_and_history_contract(self):
+        schedule = table_block(self.ddl, "lineage_schedule_edge")
+        for field in (
+            "environment",
+            "source_profile",
+            "process_name",
+            "project_version_key",
+            "raw_source_table",
+            "raw_target_table",
+            "source_table",
+            "target_table",
+            "batch_id",
+            "observed_at",
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ):
+            with self.subTest(field=field):
+                self.assertRegex(schedule, rf"\b{field}\b")
+        self.assertIn("DISTRIBUTE BY HASH(schedule_edge_key)", self.ddl)
 
     def test_physical_and_business_edges_have_distinct_endpoint_contracts(self):
         physical = table_block(self.ddl, "lineage_edge")

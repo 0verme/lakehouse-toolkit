@@ -145,6 +145,23 @@ from .materialization_dws import (  # pyright: ignore[reportMissingImports]
     physical_edge_key,
     program_key,
 )
+from .schedule import (
+    MySQLScheduleLineageProvider,
+    ScheduleLineageEdge,
+    ScheduleLineageLoadResult,
+    ScheduleLineageLoadStats,
+    deduplicate_schedule_edges,
+    normalize_schedule_table_key,
+    schedule_edge_key,
+    schedule_row_key,
+)
+from .schedule_materialization import (
+    DWSScheduleLineageRow,
+    DWSScheduleLineageStore,
+    DWSScheduleLineageWriter,
+    DWSSchedulePublishMetrics,
+    DWSSchedulePublishResult,
+)
 from .materialization_sqlite import (  # pyright: ignore[reportMissingImports]
     CURRENT_SCHEMA_VERSION,
     DEFAULT_MATERIALIZATION_DB_PATH,
@@ -317,6 +334,19 @@ __all__ = [
     "issue_stable_key",
     "physical_edge_key",
     "program_key",
+    "MySQLScheduleLineageProvider",
+    "ScheduleLineageEdge",
+    "ScheduleLineageLoadResult",
+    "ScheduleLineageLoadStats",
+    "deduplicate_schedule_edges",
+    "normalize_schedule_table_key",
+    "schedule_edge_key",
+    "schedule_row_key",
+    "DWSScheduleLineageRow",
+    "DWSScheduleLineageStore",
+    "DWSScheduleLineageWriter",
+    "DWSSchedulePublishMetrics",
+    "DWSSchedulePublishResult",
     "DEFAULT_QUERY_DEPTH",
     "DEFAULT_QUERY_MAX_NODES",
     "BlastRadiusResult",

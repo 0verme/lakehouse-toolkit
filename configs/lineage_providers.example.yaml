@@ -23,6 +23,25 @@ mysql_process_profiles:
     primary_target_strategy: program_name
     batch_size: 200
 
+    # 调度 relation 复用本 profile 的 connection；真实 table/column 只写入
+    # 被 gitignore 的 configs/lineage_providers.local.yaml。
+    schedule_lineage:
+      enabled: true
+      table: demo_meta.schedule_rel
+      process_name_column: process_name
+      project_version_column: project_version_key
+      source_table_column: src_table_key
+      target_table_column: tar_table_key
+      include_projects:
+        - DWD:1.0
+        - DWM:1.0
+        - DWP:1.0
+        - DWA:1.0
+        - DM:1.0
+      conditional_projects:
+        - project: DWUPRR:1.0
+          target_schema_prefix: DWS_DWUPRR.
+
   # CI / Docker 可只提交环境变量名，连接值仍由运行环境注入。
   - name: mysql_dev_b
     environment: DEV
