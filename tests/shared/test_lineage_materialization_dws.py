@@ -1,0 +1,531 @@
+from __future__ import annotations
+
+import sqlite3
+import unittest
+from dataclasses import replace
+from datetime import datetime, timezone
+
+from shared.lineage.domain import (
+    IssueDisposition,
+    LineageIssue,
+    ProgramState,
+    ProgramSource,
+)
+from shared.lineage.materialization import MaterializationBatch, materialize_program
+from shared.lineage.materialization_dws import (
+    DWSMaterializationStore,
+    DWSPublishResult,
+    _begin_transaction,
+)
+from shared.lineage.physical_dag import ProgramPhysicalDAG, build_program_physical_dag
+from shared.lineage.version import LINEAGE_PIPELINE_VERSION
+
+OBSERVED_AT = datetime(2026, 2, 1, 8, 9, 10, tzinfo=timezone.utc)
+
+DWS_SMOKE_SCHEMA_SQL = """
+CREATE TABLE dwp.lineage_batch (
+    batch_id TEXT NOT NULL, snapshot_mode TEXT NOT NULL,
+    complete_snapshot INTEGER NOT NULL, snapshot_scope TEXT,
+    pipeline_version TEXT, observed_at TEXT, previous_batch_id TEXT,
+    publish_status TEXT, published_at TEXT, program_count INTEGER,
+    edge_count INTEGER, issue_count INTEGER, is_active INTEGER,
+    created_at TEXT, updated_at TEXT
+);
+CREATE TABLE dwp.lineage_program_state (
+    row_key TEXT, program_key TEXT, environment TEXT, source_profile TEXT,
+    program_name TEXT, source_hash TEXT, pipeline_version TEXT, batch_id TEXT,
+    first_seen_at TEXT, last_seen_at TEXT, last_changed_at TEXT,
+    is_active INTEGER, created_at TEXT, updated_at TEXT
+);
+CREATE TABLE dwp.lineage_edge (
+    row_key TEXT, edge_key TEXT, environment TEXT, source_profile TEXT,
+    program_key TEXT, program_name TEXT, source_table TEXT, target_table TEXT,
+    source_node_kind TEXT, target_node_kind TEXT, source_dataset_key TEXT,
+    target_dataset_key TEXT, evidence_type TEXT, evidence_json TEXT,
+    source_hash TEXT, pipeline_version TEXT, batch_id TEXT, observed_at TEXT,
+    first_seen_at TEXT, last_seen_at TEXT, last_changed_at TEXT,
+    is_active INTEGER, created_at TEXT, updated_at TEXT
+);
+CREATE TABLE dwp.lineage_business_edge (
+    row_key TEXT, business_edge_key TEXT, environment TEXT,
+    source_profile TEXT, program_key TEXT, program_name TEXT,
+    source_dataset_key TEXT, source_table TEXT, target_dataset_key TEXT,
+    target_table TEXT, collapse_depth INTEGER, physical_derivation_hash TEXT,
+    source_hash TEXT, pipeline_version TEXT, batch_id TEXT, observed_at TEXT,
+    first_seen_at TEXT, last_seen_at TEXT, last_changed_at TEXT,
+    is_active INTEGER, created_at TEXT, updated_at TEXT
+);
+CREATE TABLE dwp.lineage_issue (
+    row_key TEXT, stable_issue_key TEXT, environment TEXT, source_profile TEXT,
+    program_key TEXT, program_name TEXT, issue_type TEXT, confidence TEXT,
+    rule_version TEXT, severity TEXT, disposition TEXT, policy_version TEXT,
+    node_key TEXT, branch_sink TEXT, message TEXT, evidence_json TEXT,
+    batch_id TEXT, first_seen_at TEXT, last_seen_at TEXT, last_changed_at TEXT,
+    disposition_updated_at TEXT, disposition_updated_by TEXT, is_active INTEGER,
+    created_at TEXT, updated_at TEXT
+);
+"""
+
+
+class DWSMaterializationStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.execute("ATTACH DATABASE ':memory:' AS dwp")
+        self.connection.executescript(DWS_SMOKE_SCHEMA_SQL)
+        self.store = DWSMaterializationStore(connection=self.connection)
+
+    def tearDown(self) -> None:
+        self.connection.close()
+
+    @staticmethod
+    def make_batch(
+        source: ProgramSource,
+        *,
+        batch_id: str,
+        observed_at: datetime,
+        dag: ProgramPhysicalDAG | None = None,
+    ) -> tuple[MaterializationBatch, ProgramPhysicalDAG]:
+        dag = dag or build_program_physical_dag(source)
+        materialization = materialize_program(
+            dag,
+            batch_id=batch_id,
+            observed_at=observed_at,
+        )
+        state = ProgramState(
+            environment=source.environment,
+            source_profile=source.source_profile,
+            program_name=source.program_name,
+            source_hash=source.source_hash,
+            first_seen_at=observed_at,
+            last_seen_at=observed_at,
+            last_changed_at=observed_at,
+            batch_id=batch_id,
+            pipeline_version=LINEAGE_PIPELINE_VERSION,
+        )
+        return (
+            MaterializationBatch(
+                batch_id=batch_id,
+                observed_at=observed_at,
+                edges=materialization.edges,
+                issues=materialization.issues,
+                program_states=(state,),
+            ),
+            dag,
+        )
+
+    def test_transaction_helpers_restore_dbapi_and_jdbc_autocommit(self) -> None:
+        class DbApiConnection:
+            autocommit = True
+
+        dbapi_connection = DbApiConnection()
+        restore_dbapi = _begin_transaction(dbapi_connection)
+        self.assertFalse(dbapi_connection.autocommit)
+        restore_dbapi()
+        self.assertTrue(dbapi_connection.autocommit)
+
+        class JdbcConnection:
+            def __init__(self) -> None:
+                self.autocommit = True
+                self.calls: list[bool] = []
+
+            def getAutoCommit(self) -> bool:
+                return self.autocommit
+
+            def setAutoCommit(self, value: bool) -> None:
+                self.calls.append(value)
+                self.autocommit = value
+
+        class JdbcWrapper:
+            def __init__(self, jconn: JdbcConnection) -> None:
+                self.jconn = jconn
+
+        jdbc_connection = JdbcConnection()
+        restore_jdbc = _begin_transaction(JdbcWrapper(jdbc_connection))
+        self.assertFalse(jdbc_connection.autocommit)
+        restore_jdbc()
+        self.assertTrue(jdbc_connection.autocommit)
+        self.assertEqual(jdbc_connection.calls, [False, True])
+
+        class BeginConnection:
+            def __init__(self) -> None:
+                self.begun = False
+
+            def begin(self) -> None:
+                self.begun = True
+
+        begin_connection = BeginConnection()
+        restore_begin = _begin_transaction(begin_connection)
+        self.assertTrue(begin_connection.begun)
+        restore_begin()
+
+    def test_writes_physical_tmp_rows_and_collapsed_formal_business_row(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "CREATE TEMPORARY TABLE TMP_STAGE AS SELECT * FROM DWF.SOURCE;"
+            " INSERT INTO DWM.RESULT SELECT * FROM TMP_STAGE;",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-1",
+            observed_at=OBSERVED_AT,
+        )
+
+        result = self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertEqual(result.edge_count, 2)
+        self.assertEqual(result.business_edge_count, 1)
+        physical = self.store.read_physical_edges(active_only=True)
+        self.assertEqual(len(physical), 2)
+        self.assertTrue(
+            any(
+                row.source_node_kind == "temporary_asset"
+                or row.target_node_kind == "temporary_asset"
+                for row in physical
+            )
+        )
+        business = self.store.read_edges(active_only=True)
+        self.assertEqual(len(business), 1)
+        self.assertEqual(
+            (business[0].source_table, business[0].target_table),
+            ("DWF.SOURCE", "DWM.RESULT"),
+        )
+        self.assertIsInstance(business[0].evidence, dict)
+        assert isinstance(business[0].evidence, dict)
+        self.assertEqual(business[0].evidence["collapse_depth"], 2)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT edge_count FROM dwp.lineage_batch WHERE batch_id = ?",
+                ("batch-dws-1",),
+            ).fetchone()[0],
+            2,
+        )
+
+    def test_complete_snapshot_requires_explicit_nonempty_scope(self) -> None:
+        batch = MaterializationBatch(
+            batch_id="batch-dws-scope-required",
+            observed_at=OBSERVED_AT,
+        )
+
+        with self.assertRaisesRegex(ValueError, "explicit snapshot_scopes"):
+            self.store.publish(batch, complete_snapshot=True)
+        with self.assertRaisesRegex(ValueError, "non-empty snapshot scope"):
+            self.store.publish(
+                batch,
+                complete_snapshot=True,
+                snapshot_scopes=(),
+            )
+
+    def test_empty_snapshot_is_a_published_active_batch(self) -> None:
+        batch = MaterializationBatch(
+            batch_id="batch-dws-empty",
+            observed_at=OBSERVED_AT,
+        )
+
+        result = self.store.publish(
+            batch,
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertEqual(result.edge_count, 0)
+        self.assertEqual(result.business_edge_count, 0)
+        self.assertEqual(result.issue_count, 0)
+        self.assertEqual(self.store.get_active_batch_id(), "batch-dws-empty")
+        self.assertEqual(self.store.read_physical_edges(active_only=True), ())
+        self.assertEqual(self.store.read_edges(active_only=True), ())
+        self.assertEqual(self.store.read_issues(active_only=True), ())
+        metadata = self.store.get_batch_metadata("batch-dws-empty")
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(metadata.is_active)
+        self.assertEqual(metadata.edge_count, 0)
+
+    def test_history_isolation_and_rebase_preserve_stable_keys(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        first, first_dag = self.make_batch(
+            source,
+            batch_id="batch-dws-history-1",
+            observed_at=OBSERVED_AT,
+        )
+        self.store.publish(
+            first,
+            physical_dags=(first_dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+        second, second_dag = self.make_batch(
+            source,
+            batch_id="batch-dws-history-2",
+            observed_at=OBSERVED_AT.replace(day=2),
+        )
+        self.store.publish(
+            second,
+            physical_dags=(second_dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertEqual(self.store.get_active_batch_id(), "batch-dws-history-2")
+        first_physical = self.store.read_physical_edges(batch_id=first.batch_id)
+        second_physical = self.store.read_physical_edges(batch_id=second.batch_id)
+        self.assertEqual(
+            tuple(row.edge_key for row in first_physical),
+            tuple(row.edge_key for row in second_physical),
+        )
+        self.assertNotEqual(
+            tuple(row.row_key for row in first_physical),
+            tuple(row.row_key for row in second_physical),
+        )
+        self.assertEqual(
+            len(self.store.read_edges(batch_id=first.batch_id)),
+            1,
+        )
+        self.assertEqual(len(self.store.read_edges(active_only=True)), 1)
+        first_metadata = self.store.get_batch_metadata(first.batch_id)
+        self.assertIsNotNone(first_metadata)
+        assert first_metadata is not None
+        self.assertFalse(first_metadata.is_active)
+
+    def test_resolved_issue_can_survive_scoped_program_disappearance(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        first, first_dag = self.make_batch(
+            source,
+            batch_id="batch-dws-issue-1",
+            observed_at=OBSERVED_AT,
+        )
+        first = replace(
+            first,
+            issues=(
+                LineageIssue(
+                    environment="DEV",
+                    source_profile="fixture",
+                    program_name="DEMO_PROGRAM",
+                    issue_type="ORPHAN_BRANCH",
+                    severity="MEDIUM",
+                    message="demo issue",
+                ),
+            ),
+        )
+        self.store.publish(
+            first,
+            physical_dags=(first_dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        second = MaterializationBatch(
+            batch_id="batch-dws-issue-2",
+            observed_at=OBSERVED_AT.replace(day=2),
+        )
+        self.store.publish(
+            second,
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertEqual(self.store.read_issues(active_only=True), ())
+        resolved = self.store.read_issues(batch_id=second.batch_id)
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0].disposition, IssueDisposition.RESOLVED)
+        self.assertFalse(resolved[0].is_active)
+        self.assertEqual(self.store.read_program_states(active_only=True), ())
+
+    def test_failed_active_switch_rolls_back_candidate_and_preserves_previous(
+        self,
+    ) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        first, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-1",
+            observed_at=OBSERVED_AT,
+        )
+        self.store.publish(
+            first,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+        second, second_dag = self.make_batch(
+            source,
+            batch_id="batch-dws-2",
+            observed_at=OBSERVED_AT.replace(day=2),
+        )
+
+        def fail_after_validation(stage: str) -> None:
+            if stage == "after_validate":
+                raise RuntimeError("controlled publish failure")
+
+        with self.assertRaisesRegex(RuntimeError, "controlled publish failure"):
+            self.store.publish(
+                second,
+                physical_dags=(second_dag,),
+                complete_snapshot=True,
+                snapshot_scopes=(("DEV", "fixture"),),
+                stage_hook=fail_after_validation,
+            )
+
+        self.assertEqual(self.store.get_active_batch_id(), "batch-dws-1")
+        self.assertIsNone(self.store.get_batch_metadata("batch-dws-2"))
+        for table in (
+            "lineage_program_state",
+            "lineage_edge",
+            "lineage_business_edge",
+            "lineage_issue",
+        ):
+            self.assertEqual(
+                self.connection.execute(
+                    f"SELECT COUNT(*) FROM dwp.{table} WHERE batch_id = ?",
+                    ("batch-dws-2",),
+                ).fetchone()[0],
+                0,
+            )
+        self.assertEqual(len(self.store.read_edges(active_only=True)), 1)
+
+    def test_job_publishes_through_injected_dws_backend(self) -> None:
+        from jobs.crontab.imp_lineage_edge import materialize_sources
+
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "CREATE TEMPORARY TABLE TMP_STAGE AS SELECT * FROM DWF.SOURCE;"
+            " INSERT INTO DWM.RESULT SELECT * FROM TMP_STAGE;",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+
+        result = materialize_sources(
+            [source],
+            store=self.store,
+            batch_id="batch-dws-job",
+            observed_at=OBSERVED_AT,
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertIsInstance(result, DWSPublishResult)
+        self.assertEqual(result.edge_count, 2)
+        self.assertEqual(len(self.store.read_physical_edges(active_only=True)), 2)
+        self.assertEqual(len(self.store.read_edges(active_only=True)), 1)
+        first_hash = self.connection.execute(
+            "SELECT physical_derivation_hash FROM dwp.lineage_business_edge "
+            "WHERE batch_id = ?",
+            ("batch-dws-job",),
+        ).fetchone()[0]
+
+        second = materialize_sources(
+            [source],
+            store=self.store,
+            batch_id="batch-dws-job-rebase",
+            observed_at=OBSERVED_AT.replace(day=2),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertIsInstance(second, DWSPublishResult)
+        self.assertEqual(second.edge_count, 2)
+        self.assertEqual(len(self.store.read_physical_edges(active_only=True)), 2)
+        self.assertEqual(len(self.store.read_edges(active_only=True)), 1)
+        second_hash = self.connection.execute(
+            "SELECT physical_derivation_hash FROM dwp.lineage_business_edge "
+            "WHERE batch_id = ?",
+            ("batch-dws-job-rebase",),
+        ).fetchone()[0]
+        self.assertEqual(first_hash, second_hash)
+
+    def test_public_candidate_validation_rechecks_inserted_projection(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-validation",
+            observed_at=OBSERVED_AT,
+        )
+
+        def validate_after_insert(stage: str) -> None:
+            if stage == "after_candidate_insert":
+                self.store.validate_candidate(batch.batch_id)
+
+        result = self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+            stage_hook=validate_after_insert,
+        )
+
+        self.assertEqual(result.batch_id, batch.batch_id)
+        self.assertEqual(self.store.get_active_batch_id(), batch.batch_id)
+
+    def test_duplicate_physical_identity_fails_closed(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-duplicate",
+            observed_at=OBSERVED_AT,
+        )
+        duplicate_dag = replace(dag, edges=dag.edges + dag.edges[:1])
+
+        with self.assertRaisesRegex(ValueError, r"duplicate (row_key|stable identity)"):
+            self.store.publish(
+                batch,
+                physical_dags=(duplicate_dag,),
+                complete_snapshot=True,
+                snapshot_scopes=(("DEV", "fixture"),),
+            )
+
+        self.assertIsNone(self.store.get_active_batch_id())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM dwp.lineage_edge WHERE batch_id = ?",
+                ("batch-dws-duplicate",),
+            ).fetchone()[0],
+            0,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

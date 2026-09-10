@@ -13,15 +13,14 @@ DAG，也不替换现有生产入口。
 `Batch != Runtime Run` 的完整边界见
 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
-> **Issue #39 DWS boundary correction:** 本文下面的 `LineageEdge` 和
-> SQLite reference adapter 描述的是当前 Phase 5 runtime contract：程序级 TMP
-> collapse 后的 formal direct materialization。DWS v0.1 的 `dwp.lineage_edge`
-> 与该语义一致，两个 endpoint 都必须是 `DatasetIdentity`；TMP 只保留在
-> `ProgramPhysicalDAG` 和 bounded evidence 中，不能作为 DWS endpoint。DWS v0.1
-> 不创建 raw PhysicalEdge writer，也不创建独立的 `dwp.lineage_business_edge`；
-> 跨 program/global N-hop closure 属于 Issue #40。详见
+> **Issue #39 DWS Materialization Writer:** 本文的 Phase 5 formal direct
+> `LineageEdge` 仍由既有 materialization 产生；DWS writer 将同一 pipeline 的
+> `ProgramPhysicalDAG` direct `PhysicalEdge` 写入 `dwp.lineage_edge`（TMP endpoint
+> 允许），并将 formal `LineageEdge` 写入 `dwp.lineage_business_edge`（TMP endpoint
+> 禁止）。writer 不重新解析 SQL 或复制 TMP collapse。五张表共用 batch/lifecycle，
+> `edge_count` 统计 physical `lineage_edge` rows；跨 program/global N-hop closure
+> 属于 Issue #40。详见
 > [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
-> 本轮不改变 `imp_lineage_edge` runtime。
 
 ## Physical DAG 与 Business Lineage
 
@@ -43,7 +42,8 @@ DWM.C → DWA.F
 DWA.D → DWA.F
 ```
 
-TMP 只存在于 Physical DAG 和 edge evidence 中，不作为正式资产 endpoint 落库。
+TMP 只作为正式业务 endpoint 被禁止；它可作为 physical `lineage_edge` endpoint
+落库，并在 business `lineage_business_edge` 中由既有 collapse 结果隐藏。
 
 ## TMP Collapse 与正式资产边界
 
@@ -79,13 +79,14 @@ DWM.B → DWA.C
 一个 batch/program 内相同的
 `environment + source_profile + source_table + target_table + program_name + job_key`
 只保留一个 `LineageEdge` formal direct fact；重复 physical path 会合并到同一条
-edge 的 deterministic `evidence.physical_paths`。
+business edge 的 deterministic `evidence.physical_paths`。每一条 raw
+`PhysicalEdge` 仍独立写入 physical projection。
 
 ### Bounded Evidence Contract
 
 `evidence.path_count` 是当前 SQLite/reference runtime 中该 formal edge 发现的完整
 collapsed physical path 数量，不是 sample 的长度。它是现有 `LineageEdge` evidence
-contract 的 runtime 字段；DWS v0.1 不增加专用 `path_count` 列，也不能把 bounded
+contract 的 runtime 字段；DWS writer 不增加专用 `path_count` 列，也不能把 bounded
 sample 映射成生产计数。为避免一个 edge 携带无限 JSON，`physical_paths` 只保留最多 `100`
 条按稳定 traversal 顺序取得的 deterministic representative sample，并用
 `physical_paths_truncated` 标识是否还有未保存的 path；explicit fallback 仍会按 bounded
@@ -97,8 +98,9 @@ statement evidence summary 不因 sample 截断而丢失。
 `physical_edge_pairs_truncated`、`collapsed_tmp_nodes_truncated` 和
 `statement_indices_truncated` 表示截断。SQLite 仍将 evidence 作为 JSON 文本保存，
 因此没有额外的表迁移；SQLite consumer 必须使用 runtime `path_count` 判断完整规模，
-不能用 `len(physical_paths)` 代替；DWS consumer 不得假设存在同名列。DWS
-`lineage_edge` 只接收 formal direct `LineageEdge`，不接收 raw PhysicalEdge。
+不能用 `len(physical_paths)` 代替。DWS `lineage_edge` 接收 raw direct `PhysicalEdge`；DWS
+`lineage_business_edge` 才接收 formal direct `LineageEdge`。两个 projection 使用同
+一批次和同一 program pipeline。
 
 Materialization 对无环 TMP 子图使用 deterministic DAG dynamic programming：formal
 boundary 的 exact `path_count`、能参与该 boundary 的 physical edge/node summary 都由
@@ -127,22 +129,11 @@ fan-out、high fan-in、约 `150` 节点/`350` 边/约 `20k` paths 的 mixed gra
 `branch_nodes=35`、`merge_nodes=36` 的 dense graph；它不读取数据库，也不是依赖机器速度的
 CI timing gate。
 
-上一轮真实 blocker 的 baseline 仍是：`program_id=602c19ac3a23` 的
-`collapsed_paths=24566`、path enumeration 约 `47945ms`、materialization 约 `307692ms`。
-新增匿名 dense samples 为 A/B 两个开发环境 profile（匿名样本标识
-`program_id=bd531e7bb184`）：`PROGRAM_NAME_SAME=True`、`SCRIPT_IDENTICAL=False`；
-A 为 `1847` lines / `101801` chars，B 为 `1829` lines / `101103` chars，源码
-SHA256 不同。两者仍生成完全一致的 `43` nodes、`407` edges、
-`max_out_degree=36`、`max_in_degree=39`、`branch_nodes=35`、`merge_nodes=36`、
-`edge_pairs=407`、`duplicate_edge_count=0` topology，并都触发旧实现的
-`LineagePathEnumerationError: collapsed physical path count exceeds maximum (100000)`。
-这表明同一逻辑程序在两套开发环境的不同源码版本中稳定重现该 failure mode，具有
-cross-profile 和 cross-version reproducibility，而非单脚本偶发问题。本轮 benchmark
-用同等 small dense / high fan-in / high fan-out fixture 覆盖该结构，重点验证 full path
-count 不再驱动 path object/evidence/LineageEdge 数量；无环 dense graph 即使 exact
-count 超过 `MAX_COLLAPSED_PATHS` 也不再依赖显式枚举。该差异支持 hot spot 是
-per-path materialization 与全量 path enumeration，而不是把 `_json_safe` 单独认定为
-Windows native crash 根因；`0xC0000005` 仍需结合生产 dump/driver 证据进一步定位。
+公开 benchmark 只使用 fictional `DEMO` nodes、edges 和 profiles，不记录真实
+program id、源码尺寸、内部地址、driver error 或连接信息。它覆盖 small dense、high
+fan-in、high fan-out、TMP cycle、bounded evidence 和 deterministic JSON，重点验证
+full path count 不驱动无限 path object/evidence/LineageEdge 数量；耗时只用于观察，
+不作为机器相关的 CI threshold。
 
 运行：
 
@@ -276,12 +267,26 @@ batch 的 edge、issue 和 program state 都保留为 historical snapshot。`pip
 来自代码中明确维护的 `LINEAGE_PIPELINE_VERSION`，不是 Git commit SHA；只有 hash
 和 pipeline version 都相同才会跳过 parser/DAG/audit。
 
+## DWS Materialization Writer
+
+`shared/lineage/materialization_dws.py` 复用同一 `MaterializationBatch`，并由
+`imp_lineage_edge.py` 把本轮 rebuilt 的 `ProgramPhysicalDAG` 一并传入。它集中管理
+显式 `dwp.<table>` SQL：physical direct rows 写入 `lineage_edge`，formal direct rows
+写入 `lineage_business_edge`，program state 与 Issue #36 projection 写入另外两张
+事实表。DWS 不在 adapter 内重新执行 parser 或 TMP collapse；所有 DWS connection
+都来自 `gaussdb.connect_with_profile()`，profile/password 不写入日志。
+
+CLI 默认保持 SQLite；只有 `--store dws --dws-profile <DATABASE_PROFILE>` 才启用
+DWS writer。DWS publish 使用 DB-API/JDBC transaction、candidate validation、active
+batch join 和 rollback；测试通过 SQLite/mock DB-API connection 覆盖，不连接真实 DWS。
+完整字段和五表 contract 见 [`../research/issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
+
 ## Atomic Batch Publish
 
-`SQLiteMaterializationStore.publish()` 在同一个 transaction 中完成：
+`SQLiteMaterializationStore.publish()` 或 `DWSMaterializationStore.publish()` 在同一个 transaction 中完成：
 
 ```text
-BEGIN IMMEDIATE
+BEGIN / DB-API-JDBC transaction
   insert inactive candidate batch/edges/issues/program states
   validate row counts、identity 和 JSON evidence
   deactivate previous batch
@@ -306,7 +311,7 @@ ProgramSource provider
     → existing Physical DAG Builder
     → existing Phase 4 Auditor
     → Phase 5 candidate batch
-    → SQLite atomic publish
+    → selected backend atomic publish（默认 SQLite，可显式选择 DWS）
 ```
 
 它支持注入公开 fixture/mock provider，直接执行时从 local/example provider 配置读取，
@@ -327,16 +332,22 @@ SQL、表名或 connection settings。
 其中 `build_program_physical_dag_ms`、`audit_program_physical_dag_ms` 和
 `single_program_total_ms` 作为旧 log consumer 的兼容别名保留。使用
 `--diagnostic` 才会额外为每个程序输出 `STARTED` 和 `SUCCESS`，用于受控 replay 定位，
-不会让正常 2 万程序默认产生 4 万行日志。coverage funnel 的聚合行以
+不会让正常大规模运行默认产生与程序数成倍的日志。coverage funnel 的聚合行以
 `stage=coverage` 单独输出，详见 [`lineage_coverage.md`](lineage_coverage.md)。
 
-直接运行：
+直接运行（默认 SQLite）：
 
 ```bash
-python jobs/crontab/imp_lineage_edge.py
+python jobs/crontab/imp_lineage_edge.py --store sqlite
 ```
 
-本轮只 rebuild 100 个程序时，`build total` 也只会是 100；日志不会为每个
+DWS 必须显式选择 profile；示例 profile 只使用 placeholder 和环境变量密码：
+
+```bash
+python jobs/crontab/imp_lineage_edge.py --store dws --dws-profile <DATABASE_PROFILE>
+```
+
+本轮只 rebuild 小规模 sample 时，`build total` 只会是本轮 rebuild 数；日志不会为每个
 `ProgramSource` 输出一条记录。默认运行与 controlled replay 的区别如下：
 
 - 不传 `--profile`、`--limit`：保持正常全 provider、complete snapshot 运行；
@@ -352,33 +363,31 @@ python jobs/crontab/imp_lineage_edge.py
 
 ```bash
 python jobs/crontab/imp_lineage_edge.py \
-  --profile mysql_dev_a_data --limit 100 \
+  --store sqlite --profile DEMO_PROFILE --limit 100 \
   --force-rebuild --progress-every 10 --slow-threshold-ms 5000
 ```
 
-推荐内网验证顺序为：`100 programs → 500 programs → one profile → all profiles`。
-其中 sample 阶段必须带 `--limit` 并保持 partial snapshot；单 profile full 阶段不带
-`--limit`，由 provider 的完整扫描状态决定是否开放 scoped disappearance。当前已观测
-38 个 rebuild 约耗时 17 分钟；因此不建议直接对约 2 万程序 force rebuild，也不要
-为了掩盖瓶颈而盲目并发。每一级先检查 active edge diff、issue、耗时和
-`partial_snapshot`，再进入下一阶段。
+推荐验证顺序为：小规模 `--limit` sample → 单 profile → 多 profile。sample 阶段必须
+保持 partial snapshot；单 profile full 阶段不带 `--limit`，由 provider 完整扫描状态
+决定是否开放 scoped disappearance。每一级先检查 active edge diff、issue、耗时和
+`partial_snapshot`，再扩大范围；不要为了掩盖瓶颈而盲目并发。
 
 日志示例：
 
 ```text
 stage=job status=STARTED providers=4 replay_mode=normal selected_profiles=- force_rebuild=False partial_snapshot=False
-stage=source_load status=SUCCESS sources=20493 elapsed_ms=...
-stage=replay status=SELECTED replay_mode=normal selected_profiles=- source_total=20493 replay_total=20493 limit=- force_rebuild=False partial_snapshot=False
-stage=incremental_plan status=SUCCESS total=20493 new=23 changed=15 unchanged=20455 deleted=0 rebuild=38 elapsed_ms=...
-stage=build status=STARTED total=38 slow_threshold_ms=5000
-stage=build status=RUNNING processed=10 total=38 percent=26 elapsed_ms=...
+stage=source_load status=SUCCESS sources=<N> elapsed_ms=...
+stage=replay status=SELECTED replay_mode=normal selected_profiles=- source_total=<N> replay_total=<N> limit=- force_rebuild=False partial_snapshot=False
+stage=incremental_plan status=SUCCESS total=<N> new=<N> changed=<N> unchanged=<N> deleted=0 rebuild=<N> elapsed_ms=...
+stage=build status=STARTED total=<N> slow_threshold_ms=5000
+stage=build status=RUNNING processed=<N> total=<N> percent=<P> elapsed_ms=...
 stage=build_program status=SLOW program_id=<stable-short-hash> build_program_physical_dag_ms=... audit_program_physical_dag_ms=... single_program_total_ms=...
-stage=build status=SUCCESS processed=38 slow_programs=... max_program_elapsed_ms=... avg_program_elapsed_ms=... edges=... issues=... elapsed_ms=...
-stage=publish status=SUCCESS batch_id=batch-... edges=... issues=... previous=- elapsed_ms=...
+stage=build status=SUCCESS processed=<N> slow_programs=... max_program_elapsed_ms=... avg_program_elapsed_ms=... edges=... issues=... elapsed_ms=...
+stage=publish status=SUCCESS batch_id=batch-... edges=... business_edges=... issues=... previous=- elapsed_ms=...
 stage=job status=SUCCESS elapsed_ms=...
 ```
 
-`stage=job status=SUCCESS` 只会在 SQLite atomic publish 完成后出现。中途的 STARTED/RUNNING
+`stage=job status=SUCCESS` 只会在选定 backend 的 atomic publish 完成后出现。中途的 STARTED/RUNNING
 日志只表示计算进度，不表示 snapshot 已经发布；失败时会输出
 `status=FAILED exception=<ExceptionClass>` 并保留原有异常传播/non-zero 行为。`build`
 成功摘要还包括 `program_computation_ms`、`program_materialization_ms`、

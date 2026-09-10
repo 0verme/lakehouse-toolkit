@@ -9,7 +9,7 @@ HTML schedule graph 和正式业务 `lineage_edge` 是不同 contract。
 
 | Path | Entry | Current caller / registration | Current capability | Replacement | Decision | Migration risk |
 | --- | --- | --- | --- | --- | --- | --- |
-| `jobs/crontab/imp_lineage_edge.py` | `main()` / `materialize_sources()` | `configs/tools.yaml` 外的 crontab/manual entry；测试直接注入 Provider | Provider → Physical DAG → Audit → TMP collapse → formal edge publish | `plan_incremental()` + complete candidate + existing `SQLiteMaterializationStore.publish()` | **MIGRATE（完成）** | 低；保留 `build_candidate_batch()` 兼容入口，publish 仍 atomic |
+| `jobs/crontab/imp_lineage_edge.py` | `main()` / `materialize_sources()` | `configs/tools.yaml` 外的 crontab/manual entry；测试直接注入 Provider | Provider → Physical DAG → Audit → TMP collapse → dual DWS/SQLite projection | `plan_incremental()` + complete candidate + selected `SQLiteMaterializationStore`/`DWSMaterializationStore.publish()` | **MIGRATE（完成）** | 低；保留 `build_candidate_batch()` 兼容入口，SQLite 默认且 publish 仍 atomic |
 | `shared/lineage/lineage_builder.py` | `load_process_infos()`, `normalize_table_name()`, `build_lineage_graph*()` | `ProductionProvider`、`physical_dag.py`、`tools/integrations/lineage_roamer.py`、测试 | legacy metadata loader、normalization、旧 process/table graph 和 schedule enrichment | Provider adapter、Phase 3 Physical DAG、Phase 6 Query 分别覆盖不同部分 | **KEEP / compatibility** | 高；仍是 Provider 与 normalization 的真实依赖，不能删除 |
 | `tools/integrations/lineage_roamer.py` | `main()`, `analyze_one()` | 手动 PyWebIO tool；import `shared.lineage.lineage_builder` | 旧 process graph + targeted schedule time + HTML 漫游 | `LineageQueryService` 可替代 formal table graph，但不提供 schedule time/process nodes | **KEEP** | 中；用户依赖 schedule/HTML 语义，不能无损替换 |
 | `tools/integrations/sql_upstream_to_layer.py` | `main()`, `trace_to_dwf_by_sql()`, `trace_to_dwf_by_schedule()` | 当前仓库无其他 caller；手动脚本 | 独立复制 legacy SQL/process/schedule 追踪并截止到 DWF | formal `imp_lineage_edge` + Query 只覆盖正式 table graph，不覆盖其 DWF report | **DEPRECATE（保留兼容）** | 中；没有 repo-wide caller，但可能有公开用户手动调用，暂无强删 |
@@ -33,14 +33,16 @@ HTML schedule graph 和正式业务 `lineage_edge` 是不同 contract。
   它先加载 active `ProgramState`，只把 `NEW/CHANGED` 送入既有 builder/audit/
   materialization，再合并 unchanged facts 后 atomic publish。
 - `shared.lineage.evolution` 只提供纯 planner、history reconciliation 和 graph
-  diff；没有复制 Phase 3～6 算法。
+  diff；没有复制 Phase 3～6 算法；`materialization_dws.py` 只负责 DWS repository
+  boundary，不重新解析 SQL 或复制 TMP collapse。
 
 保留：
 
 - `shared/lineage/lineage_builder.py` 作为 `ProductionProvider` adapter、Physical
   DAG normalization 依赖和旧 schedule tool compatibility；
 - schedule/job dependency、字段 mapping、审查摘要和 SEND/receive 入口；它们的
-  输出不是统一表级 `lineage_edge`，强行迁移会改变公开行为。
+  输出不是统一表级 `lineage_edge`，强行迁移会改变公开行为；DWS writer 只新增
+  `lineage_edge` physical projection 与 `lineage_business_edge` formal projection。
 
 Deprecated 但未移除：
 

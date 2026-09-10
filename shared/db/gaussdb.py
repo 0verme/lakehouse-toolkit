@@ -1,25 +1,36 @@
 # !/bin/python
 from __future__ import annotations
 
+import importlib
 import traceback
 from pathlib import Path
 
-import jaydebeapi
-import yaml
+import yaml  # pyright: ignore[reportMissingModuleSource]
 
 from shared.config.env import required_env
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT_DIR / "configs" / "database.local.yaml"
+GENERIC_CONFIG_PATH = ROOT_DIR / "configs" / "database.yaml"
 EXAMPLE_CONFIG_PATH = ROOT_DIR / "configs" / "database.example.yaml"
 DEFAULT_DRIVER = "org.postgresql.Driver"
 DEFAULT_JAR = ROOT_DIR / "resources" / "jars" / "jdbc-driver.jar"
 
 
 def load_db_profiles() -> dict:
-    config_path = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_CONFIG_PATH
-    with open(config_path, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+    config_path = next(
+        (
+            path
+            for path in (CONFIG_PATH, GENERIC_CONFIG_PATH, EXAMPLE_CONFIG_PATH)
+            if path.exists()
+        ),
+        EXAMPLE_CONFIG_PATH,
+    )
+    try:
+        raw_config = config_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw_config) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError("failed to load database profile configuration") from exc
 
     defaults = data.get("defaults", {})
     profiles = data.get("profiles", {})
@@ -51,9 +62,8 @@ def _get_profile_password(config: dict) -> str:
     if password_env:
         return required_env(password_env)
 
-    raise KeyError(
-        "database profile missing required field: password or password_env"
-    )
+    raise KeyError("database profile missing required field: password or password_env")
+
 
 def connect_with_profile(profile: str):
     config = get_db_profile(profile)
@@ -62,6 +72,7 @@ def connect_with_profile(profile: str):
         raise FileNotFoundError(
             f"JDBC driver not found: {jar_path}. Obtain the driver separately and configure jar_path."
         )
+    jaydebeapi = importlib.import_module("jaydebeapi")
     return jaydebeapi.connect(
         config["driver"],
         config["jdbc_url"],
@@ -80,16 +91,21 @@ def _is_autocommit_enabled(conn) -> bool | None:
         return None
 
 
+def _is_auto_commit_error(error: Exception) -> bool:
+    message = str(error)
+    return "autoCommit" in message and "enabled" in message
+
+
 def _commit_if_needed(conn):
     auto_commit_enabled = _is_autocommit_enabled(conn)
-    if auto_commit_enabled is True:
+    if auto_commit_enabled:
         return
 
     try:
         conn.commit()
         return
     except Exception as e:
-        if "autoCommit is enabled" in str(e):
+        if _is_auto_commit_error(e):
             return
 
         jconn = getattr(conn, "jconn", None)
@@ -99,7 +115,7 @@ def _commit_if_needed(conn):
         try:
             jconn.commit()
         except Exception as inner_e:
-            if "autoCommit is enabled" in str(inner_e):
+            if _is_auto_commit_error(inner_e):
                 return
             raise inner_e from e
 

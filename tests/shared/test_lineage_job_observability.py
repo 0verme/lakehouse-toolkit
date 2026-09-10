@@ -273,6 +273,8 @@ class LineageJobObservabilityTests(unittest.TestCase):
     def test_default_parser_arguments_keep_production_defaults(self):
         args = imp_lineage_edge.build_parser().parse_args([])
 
+        self.assertEqual(args.store, "sqlite")
+        self.assertIsNone(args.dws_profile)
         self.assertIsNone(args.profile)
         self.assertIsNone(args.limit)
         self.assertFalse(args.force_rebuild)
@@ -285,6 +287,10 @@ class LineageJobObservabilityTests(unittest.TestCase):
 
         controlled = imp_lineage_edge.build_parser().parse_args(
             [
+                "--store",
+                "dws",
+                "--dws-profile",
+                "demo_dws",
                 "--profile",
                 "profile_a",
                 "--profile",
@@ -299,6 +305,8 @@ class LineageJobObservabilityTests(unittest.TestCase):
                 "--diagnostic",
             ]
         )
+        self.assertEqual(controlled.store, "dws")
+        self.assertEqual(controlled.dws_profile, "demo_dws")
         self.assertEqual(controlled.profile, ["profile_a", "profile_b"])
         self.assertEqual(controlled.limit, 100)
         self.assertTrue(controlled.force_rebuild)

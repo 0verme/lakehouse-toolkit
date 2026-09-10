@@ -144,6 +144,7 @@ class ParserBackend(Protocol):
 
     def analyze(self, script_code: str) -> SqlAnalysis:
         """分析一个 script；不要猜测无法静态确认的 source/target。"""
+        raise NotImplementedError
 
 
 # Issue #41 中的两个命名都保留：实现边界叫 ParserBackend，调用语义叫
