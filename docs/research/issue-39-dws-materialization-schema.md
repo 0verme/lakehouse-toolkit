@@ -9,7 +9,14 @@
 > lifecycle 的机器可读矩阵位于
 > [`issue-39-dws-lifecycle-matrix.json`](issue-39-dws-lifecycle-matrix.json)。
 
-## 1. 真实边界与 Issue 更新
+## 1. 边界与事实核验
+
+本轮是语义纠偏，不新增 lineage 算法。PR #15 已建立 Phase 5 的
+program-scoped TMP collapse，PR #51 只优化了该既有 materialization 的实现；
+Issue #39 只冻结 DWS projection，Issue #40 才负责未来的跨 program/global N-hop
+closure。PR #82 将 DWS 拆成 raw physical `lineage_edge` 与
+`lineage_business_edge`，与现有 runtime contract 不一致；本轮移除这个 semantic
+split。
 
 已确认的 target contract：
 
@@ -26,88 +33,75 @@
 | DWO | 本 Issue 不支持 |
 | closure | `lineage_closure` 属于 Issue #40，本 Issue 不创建 |
 
-本轮对 Issue #39 的更新：
+### 1.1 现有 runtime contract
 
-1. 增加正式的 `dwp.lineage_business_edge` derived materialization contract；
-2. 澄清 TMP：可以是 `lineage_edge` 的 physical node / endpoint，但不得是
-   `lineage_business_edge` 的 formal business endpoint；
-3. `lineage_edge` 在本 DWS production contract 中是 Physical Direct Edge，保留
-   程序内部完整 DAG；`lineage_business_edge` 才是供门户和普通业务上下游使用的
-   collapse projection；
-4. 不把 business collapse 算法、parser、OpenLineage、column lineage 或
-   `lineage_closure` 实现塞进 #39；
-5. 当前 SQLite reference adapter 继续保持现有 runtime 语义，不被隐式改造成
-   DWS production contract。适配迁移需要独立实现 Issue。
+以下事实来自 `shared/lineage/physical_dag.py`、
+`shared/lineage/materialization.py`、`shared/lineage/domain.py`、
+`shared/lineage/materialization_sqlite.py`、`jobs/crontab/imp_lineage_edge.py` 及
+Phase 5 tests；本轮不重写它们：
 
-## 2. 三层模型
+```text
+ProgramPhysicalDAG:
+    A -> TMP1 -> TMP2 -> B
+
+Phase 5 materialization / LineageEdge:
+    A -> B
+```
+
+- `ProgramPhysicalDAG` 保留程序内部完整 physical facts，包括 TMP、cycle、
+  self-reference 和 orphan branch；parser/builder 不负责 collapse。
+- Phase 5 以程序为 scope，从 formal asset 的 outgoing edge 开始穿过 TMP，第一次
+  遇到 formal asset 就生成一条 `LineageEdge` 并停止该路径。
+- 因而 TMP collapse 不跨越 formal asset，不产生 `A -> C` 这样的 transitive edge。
+- `LineageEdge` 是正式 formal-to-formal direct business fact；其两个 endpoint 必须
+  是明确的 `environment + schema.table` `DatasetIdentity`，TMP 不得作为 endpoint。
+- SQLite adapter 和 cron 入口已经复用该结果；它们保存 batch/current/history，
+  但不提供 raw PhysicalEdge DWS writer。
+
+Required examples：
+
+```text
+A -> TMP1 -> TMP2 -> B
+=> LineageEdge: A -> B
+
+A -> FORMAL_B -> TMP -> FORMAL_C
+=> LineageEdge: A -> FORMAL_B
+                 FORMAL_B -> FORMAL_C
+=> 不生成 A -> FORMAL_C
+```
+
+### 1.2 本轮 DWS model
 
 ```text
 ProgramSource
     │
-    ├─ build physical DAG
-    │       DWF.A → TMP_A → TMP_B → DWUPRR.RESULT_A
+    ├─ build ProgramPhysicalDAG
+    │       A -> TMP1 -> TMP2 -> B
+    │       (TMP / cycle / orphan 保留在 runtime)
     │
-    ├─ materialize dwp.lineage_edge             (source of truth)
-    │       DWF.A → TMP_A
-    │       TMP_A → TMP_B
-    │       TMP_B → DWUPRR.RESULT_A
+    ├─ existing Phase 5 TMP collapse
+    │       A -> B
+    │       (formal direct LineageEdge)
     │
-    ├─ derive dwp.lineage_business_edge         (same batch)
-    │       DWF.A ─────────────────────────────→ DWUPRR.RESULT_A
-    │
-    └─ future Issue #40: derive lineage_closure from business lineage
+    └─ publish dwp.lineage_edge
+            (同一 formal direct semantic；TMP endpoint forbidden)
+
+future Issue #40
+    └─ dwp.lineage_closure：跨 program/global N-hop derived index
 ```
 
-### 2.1 Physical lineage：`lineage_edge`
+DWS v0.1 只包含四张表：`lineage_batch`、`lineage_program_state`、
+`lineage_edge`、`lineage_issue`。不创建 `dwp.lineage_business_edge`，不创建
+raw PhysicalEdge table，也不把 ProgramPhysicalDAG 当成 DWS fact table。DWS
+`lineage_edge` 是 current `LineageEdge` 的正式 direct projection；physical path
+和 TMP 只可作为受控 provenance/evidence 保留。
 
-`lineage_edge` 是底层 Physical Direct Edge source of truth：
+## 2. Identity / key contract
 
-- 一行表示一个程序内已经观察到的 direct physical edge，方向固定为
-  `source = upstream`、`target = downstream`；
-- TMP / intermediate table 可以作为任意一端；
-- cycle、self-reference、orphan branch、unresolved node 不在表层静默删除，
-  由 physical edge 加 `lineage_issue` 一起保留；
-- `edge_key` 只由 physical direct edge 的稳定语义生成，不包含 batch、时间、
-  evidence 或随机 `job_key`；
-- 物理节点的 `source_table` / `target_table` 是 node label：正式节点必须保留
-  `schema.table`，TMP 也必须保留其原有 schema boundary；禁止 basename-only、
-  默认 schema 或 fuzzy 合并；
-- 这张表不承担递归查询或 closure 的预计算职责。
+所有 DWS facts 都同时保存物理行 key 与跨 batch stable identity。
+`lineage_batch` 是 control fact，也按同一规则保存 `row_key` 与 `batch_id`。
 
-`lineage_edge` 的物理 endpoint 不等于 DatasetIdentity endpoint。formal node 可以
-投影出 `source_dataset_key` / `target_dataset_key`；TMP 或缺 schema 的节点对应
-DatasetIdentity 为 `NULL`，但其 physical label 仍然落库。
-
-### 2.2 Business lineage：`lineage_business_edge`
-
-`lineage_business_edge` 是 **Derived Materialization**，不是 source of truth：
-
-- 从一个程序的当前 physical DAG collapse 得到；
-- 只接受可安全证明的 formal `schema.table` source/target；TMP 不得落为 formal
-  endpoint；
-- 在同一程序中，沿 TMP 继续走，遇到第一个 formal node 就停止；这不是跨
-  formal asset 的全量 transitive closure；
-- 同一 `business_edge_key` 的多条 physical path 只 materialize 一行，path 的
-  统计是派生属性；
-- 可从同一 batch 的 `lineage_edge` 重新构建，因此不替代 physical source of
-  truth；
-- 资产门户、直接业务上下游和后续 impact/closure 默认消费这一层，不必在
-  query-time 递归 TMP DAG；
-- 无法安全 collapse 时不猜测、不把 TMP 提升为业务资产；可以没有 business row，
-  由同 batch 的 diagnostic `lineage_issue` 表达。
-
-### 2.3 Closure：Issue #40 前置 contract
-
-本 Issue 只约定：未来 closure 应基于 `lineage_business_edge` 构建跨程序 N 层关系。
-不创建 `dwp.lineage_closure`，不为 closure 冻结额外字段，也不把当前 SQLite 的
-BFS API 偷换成 DWS closure 表。
-
-## 3. Identity / key contract
-
-所有 facts 都同时保存物理行 key 与跨 batch stable identity。`lineage_batch` 是
-control fact，也按同一规则保存 `row_key` 与 `batch_id`。
-
-### 3.1 Canonical serialization
+### 2.1 Canonical serialization
 
 stable key 由 writer 在 DDL 外生成，使用 UTF8、固定字段顺序、US（U+001F）separator、
 SHA-256 lowercase hex（64 个 hex 字符；列预留 `VARCHAR(128)`）。不得使用
@@ -115,24 +109,24 @@ Python `hash()`、数据库自增 id、`repr()` 或 batch 内随机 UUID 作为 
 示意：
 
 ```text
-program_key       = sha256("program"       || US || environment || US || source_profile || US || program_name)
-edge_key          = sha256("physical-edge" || US || environment || US || source_profile || US || program_key || US || source_node || US || target_node)
-business_edge_key = sha256("business-edge" || US || environment || US || source_profile || US || program_key || US || source_dataset || US || target_dataset)
-row_key           = sha256("row"           || US || table_name || US || batch_id || US || stable_identity_key)
-dataset_key       = sha256("dataset"       || US || environment || US || canonical_schema || US || canonical_table)
+program_key = sha256("program" || US || environment || US || source_profile || US || program_name)
+edge_key    = sha256("lineage-edge" || US || environment || US || source_profile || US || program_key || US || source_dataset || US || target_dataset)
+row_key     = sha256("row" || US || table_name || US || batch_id || US || stable_identity_key)
+dataset_key = sha256("dataset" || US || environment || US || canonical_schema || US || canonical_table)
 ```
 
+`edge_key` 表示当前 formal direct `LineageEdge` identity，不表示某一条 TMP
+physical path；TMP label、path sample、batch、时间和 evidence 不进入 stable key。
 实际实现必须对长度、UTF8 编码和 null 处理使用单一 shared helper；上面是 contract
 而不是要求本 Issue 新增 helper。
 
-### 3.2 每类 key 的边界
+### 2.2 每类 key 的边界
 
 | 对象 | physical row key | stable identity key | stable identity 不包含 |
 | --- | --- | --- | --- |
 | batch | `row_key`，可以由 batch 生成 | `batch_id` | active 状态、时间、计数 |
 | program state | `row_key`，含 batch | `program_key = environment + source_profile + program_name` | source hash、pipeline、batch |
-| physical edge | `row_key`，含 batch | `edge_key = program identity + physical source node + physical target node` | batch、时间、evidence、随机 job key |
-| business edge | `row_key`，含 batch | `business_edge_key = program identity + formal source dataset + formal target dataset` | TMP path、batch、时间、path sample |
+| lineage edge | `row_key`，含 batch | `edge_key = program identity + formal source dataset + formal target dataset` | TMP path、batch、时间、evidence、job provenance |
 | issue | `row_key`，含 batch | `stable_issue_key`，由 issue type 与稳定 node/branch 语义组成 | message、severity policy、时间、batch |
 
 `program_id` 不作为第二套 identity 引入。#38 已冻结的 canonical program identity
@@ -140,24 +134,23 @@ dataset_key       = sha256("dataset"       || US || environment || US || canonic
 外部系统提供另一个权威 program id，必须另立 contract，不能把它悄悄塞入
 `program_key`。
 
-### 3.3 Dataset boundary
+### 2.3 Dataset boundary
 
-- `DatasetIdentity` 仍严格是 `environment + canonical_schema + canonical_table`；
-- formal endpoint 只接受明确的两段 `schema.table`，schema 不得被猜测；
-- `source_dataset_key` / `target_dataset_key` 仅是该 identity 的稳定技术投影，
+- `DatasetIdentity` 严格是 `environment + canonical_schema + canonical_table`；
+- `lineage_edge` 两端只接受明确的两段 `schema.table`，schema 不得被猜测；
+- `source_dataset_key` / `target_dataset_key` 是 DatasetIdentity 的稳定技术投影，
   不是 Dataset Registry；
-- physical TMP / unresolved node 的 dataset key 为 `NULL`，不因此删除 physical
-  row；
-- business edge 的 source/target 必须同时有 dataset key，且不得是 TMP；
-- environment 是 hard boundary；source_profile 是 #38 中 Program identity 和
-  collection provenance 的边界，不能在不同 profile 间误合并 program facts。
+- TMP、缺 schema 或 unresolved node 不能形成 `LineageEdge`，只保留在
+  `ProgramPhysicalDAG` 和 bounded evidence/issue；
+- environment 是 hard boundary；source_profile 是 #38 的 Program identity 和
+  collection provenance boundary，不能在不同 profile 间误合并 program facts。
 
-## 4. 五张 DWS 表
+## 3. 四张 DWS 表
 
-DDL 的列定义是下面语义的机器可读表达；下列生命周期字段在每张 fact 表中都
-遵守 append-by-batch、active switch 规则。
+DDL 的列定义是下面语义的机器可读表达；每张 fact 表都遵守 append-by-batch、
+active switch 和显式 history 读取规则。
 
-### 4.1 `dwp.lineage_batch`
+### 3.1 `dwp.lineage_batch`
 
 这是 atomic publish 的 control table，不由事实行反推。关键字段：
 
@@ -167,16 +160,17 @@ DDL 的列定义是下面语义的机器可读表达；下列生命周期字段�
 - `snapshot_scope`：canonical JSON text，记录本批完整扫描的
   `environment/source_profile` scope；不使用默认 schema 或 search path；
 - `pipeline_version`：#38 的 semantic version；不是 Git SHA；
-- `program_count`、`physical_edge_count`、`business_edge_count`、`issue_count`：
-  publish 前后必须与同一 batch 的事实行数相等；空 edge 的成功 batch 也必须有
-  `lineage_batch` 行；
-- `publish_status`：candidate 写入和 active switch 的控制状态。失败 publish 不
-  以半批 `FAILED` 行留在 facts 中；需要失败运行日志时使用独立 observability
-  contract，不扩充本 Issue 的事实表；
+- `program_count`、`edge_count`、`issue_count`：publish 前后必须与同一 batch 的
+  事实行数相等；空 edge 的成功 batch 也必须有 `lineage_batch` 行；
+- `publish_status`：candidate 写入和 active switch 的控制状态。失败 publish 不以
+  半批 `FAILED` 行留在 facts 中；失败运行摘要另用 observability contract；
 - `is_active`：当前 snapshot 标记。正常状态最多一个 active batch，也允许首次
   publish 前没有 active batch。
 
-### 4.2 `dwp.lineage_program_state`
+`edge_count` 只统计 `dwp.lineage_edge` formal direct rows，不统计
+`ProgramPhysicalDAG` 的 raw physical edges。
+
+### 3.2 `dwp.lineage_program_state`
 
 每个 active snapshot 中每个当前可见 ProgramIdentity 一行：
 
@@ -190,134 +184,75 @@ DDL 的列定义是下面语义的机器可读表达；下列生命周期字段�
   新 active observation，不猜 rename；
 - `lineage_program_state` 不表示 scheduler run、worker、attempt 或实际执行成功。
 
-### 4.3 `dwp.lineage_edge`
+### 3.3 `dwp.lineage_edge`
 
-列分组：
+`lineage_edge` 是 current `LineageEdge` semantic 的正式 DWS projection：
 
 | 分组 | 字段 | 语义 |
 | --- | --- | --- |
-| key | `row_key`, `edge_key` | 物理行与跨 batch physical identity |
+| key | `row_key`, `edge_key` | 物理行与跨 batch formal direct identity |
 | scope | `environment`, `source_profile` | environment hard boundary、profile provenance |
 | program | `program_key`, `program_name` | #38 Program identity projection |
-| endpoints | `source_table`, `target_table`, `source_node_kind`, `target_node_kind` | 保留完整 physical node label；允许 TMP、self-reference、cycle、unresolved |
-| dataset projection | `source_dataset_key`, `target_dataset_key` | formal `schema.table` 才非空；不做默认 schema inference |
-| provenance | `evidence_type`, `evidence_json`, `source_hash`, `pipeline_version` | 轻量 statement/path provenance；禁止完整 script |
+| endpoints | `source_dataset_key`, `source_table`, `target_dataset_key`, `target_table` | 两端都是明确的 formal `DatasetIdentity`；TMP endpoint forbidden |
+| provenance | `evidence_type`, `evidence_json`, `source_hash`, `pipeline_version` | existing Phase 5 的 bounded collapse/path evidence；禁止完整 script |
 | lifecycle | `batch_id`, `observed_at`, `first_seen_at`, `last_seen_at`, `last_changed_at`, `is_active`, `created_at`, `updated_at` | current/history 与 diff/replay |
 
-同一程序内同一 physical direct pair 的多次 statement observation 应在一行中
-聚合 evidence，而不是制造重复 `edge_key`。cycle/self-reference/orphan 是合法的
-physical fact；诊断在 `lineage_issue`，不通过 DDL `CHECK` 静默删除。
+一行表示一个程序内已经 materialize 的 formal direct fact。多条 physical path
+合并到同一 `LineageEdge` 的 deterministic evidence；不为每个 TMP hop 或 path
+创建 DWS edge row。`ProgramPhysicalDAG` 中的 cycle、self-reference、orphan
+仍由 runtime audit 和 `lineage_issue` 表达，不被 DDL 静默丢弃或提升为 TMP endpoint。
 
-### 4.4 `dwp.lineage_business_edge`
+`lineage_edge` 的 formal stable identity 不因 TMP rename、physical route 变化、
+source hash/pipeline rebuild 或 evidence 顺序变化而自动改变；若 formal source、
+formal target 或 program identity 改变，才是新的 stable direct fact。derived evidence
+和 `last_seen_at` / `updated_at` 可以刷新，`last_changed_at` 只表示 formal direct
+semantic identity 的建立或真正变化。
 
-列分组：
+### 3.4 `dwp.lineage_issue`
 
-| 分组 | 字段 | 语义 |
-| --- | --- | --- |
-| key | `row_key`, `business_edge_key` | row key 可含 batch；stable key 不含 TMP path |
-| scope | `environment`, `source_profile` | 保留 collection profile，避免跨 profile program fact 合并 |
-| program | `program_key`, `program_name` | 该 business edge 来自哪个 static program |
-| dataset | `source_dataset_key`, `source_table`, `target_dataset_key`, `target_table` | 两端必须是明确的 formal `schema.table` |
-| collapse | `collapse_depth` | 派生路径摘要，见 4.4.1；不是 identity；v0.1 不持久化 `path_count` |
-| derivation | `physical_derivation_hash`, `pipeline_version`, `source_hash` | 能从同 batch physical rows 重建；TMP path 不进入 stable key |
-| lifecycle | `batch_id`, `observed_at`, `first_seen_at`, `last_seen_at`, `last_changed_at`, `is_active`, `created_at`, `updated_at` | 与 physical facts 同批发布 |
+Issue 表保存 Issue #36 `AuditFact` 及 `AuditPolicyResult` 的兼容 persistence
+projection，用于 Physical DAG audit 和已完整分类的 materialization negative
+result。不可验证的 materialization failure 随 publish transaction rollback，不在
+这张事实表中留下半批 issue；失败运行摘要另用 observability contract。
 
-#### 4.4.1 collapse 与去重口径
-
-v0.1 冻结以下定义：
-
-- 从一个程序的 physical DAG 中选择 formal source 到 formal target 的安全路径；
-- 经过 TMP 时继续遍历，遇到第一个 formal target 即形成一条 business edge；
-- `collapse_depth` 是安全路径包含的 physical direct-edge hop 数，必须为正整数；
-  direct formal-to-formal edge 的 depth 为 `1`；
-- `DWF.A → TMP1 → TMP2 → DWUPRR.R` 的 `collapse_depth = 3`，包含
-  `source→TMP`、`TMP→TMP`、`TMP→target` 的每一跳；因此 DWS business row 的
-  `collapse_depth` 不允许为 `NULL`；
-- 多条安全路径按 distinct physical node sequence 去重后只写一行；同一 business row
-  的 `collapse_depth` 取这些安全路径中最小的 physical direct-edge hop 数，保证
-  派生结果 deterministic；
-- `path_count` **不属于 DWS v0.1**。当前 reference runtime 的 bounded evidence
-  可以继续保留自己的 `evidence.path_count`，但不能把它映射成 DWS 列，也不能用
-  bounded sample 长度代替完整 distinct path count；未来若要持久化，必须另立 contract；
-- `physical_derivation_hash` 对参与该 business edge 的 canonical physical direct
-  edge set 做 hash，作为可重建的 derived metadata，绝不进入 `business_edge_key`；
-- 不跨越另一个 formal asset 生成 transitive edge；不从 business edge 反推
-  physical path；
-- cycle、self-reference、orphan、missing schema、ambiguous sink 或无法证明
-  complete collapse 时不猜测。受影响 business row 可以缺失，并在 collapse 已经
-  **完整、可验证地得出 negative result** 时随同 batch 写入 diagnostic issue；若
-  collapse 不完整、超限、抛错或无法验证，publish gate 必须 fail closed（见第 6 节）。
-
-`collapse_depth` 不是 business identity。TMP 改名或 physical route 变化不会改变
-`business_edge_key`；depth/hash 等值可以作为当前 batch 的 derived metadata，但不能
-单独触发业务关系的 semantic `last_changed_at`。
-
-#### 4.4.2 TMP 改名与 physical path 变化
-
-v0.1 冻结以下 lifecycle 口径：
-
-1. TMP 改名而 formal source/target 不变：`business_edge_key` 不变；physical
-   `edge_key` 会按 physical endpoint 变化；
-2. `physical_derivation_hash` 包含参与 collapse 的 physical edge topology，因此
-   TMP 改名或 topology 变化可以被识别为 derived metadata change；
-3. 纯 evidence 顺序变化不更新 business `last_changed_at`；
-4. physical route、TMP label、`collapse_depth` 或 derivation hash 变化，但同一
-   program/formal source/formal target 的 stable business identity 不变时，更新
-   当前 batch 的 projection、`last_seen_at`、`updated_at` 和 derived metadata，
-   **不更新 semantic `last_changed_at`**；
-5. `source_hash` 或 `pipeline_version` 变化会触发 physical/business rebuild，但
-   只要 business identity 与 formal endpoint 语义不变，也不更新 business
-   `last_changed_at`。该字段只表示 business identity 首次建立或 business semantic
-   projection 真正改变；stable identity 改变时以新的 business row/first observation
-   记录，不通过 physical metadata 猜测旧关系变化。
-
-### 4.5 `dwp.lineage_issue`
-
-Issue 表保存 `AuditFact` 及其 `AuditPolicyResult` 的兼容 persistence projection，
-用于 physical audit 和已完整分类的 business-collapse diagnostic。
-不可验证的 `publish gate` failure 随 batch transaction rollback，不在这张事实表中留下
-半批 publish issue；
-需要保留失败运行摘要时另用 observability contract。关键字段：
+关键字段：
 
 - `stable_issue_key` 是跨 batch lifecycle key，不能依赖 message、evidence、
   confidence、rule_version、severity、disposition、时间或 Python hash；
 - `program_key` / `program_name` 使 issue 与 ProgramIdentity 对齐；`node_key` /
   `branch_sink` 可以保留 TMP physical 证据；
-- fact 字段使用 Issue #36 已关闭的 Audit Fact / Severity / Disposition contract：
-  `issue_type`、`confidence`、`rule_version`、message/evidence 和 stable identity；
-  `confidence` 只表示
-  `HIGH` / `MEDIUM` / `LOW` / `UNKNOWN` 的离散证据充分性，不是统计概率；
+- fact 字段使用 Issue #36 已关闭的 contract：`issue_type`、`confidence`、
+  `rule_version`、message/evidence 和 stable identity；
 - policy projection 字段为 `severity`、`disposition`、`policy_version`；
   `disposition` 只使用 `OPEN`、`ACCEPTED`、`FALSE_POSITIVE`、`RESOLVED`，不把
   policy 结果写回 fact identity；
 - `disposition_updated_at` / `disposition_updated_by` 记录人工处置 provenance，
   可以为空；人工处置通过不可变的新 batch/history projection 记录，不原地改写旧 row；
 - `IssueLifecycleStatus` 的 `NEW` / `PERSISTING` / `RESOLVED` 是跨 snapshot 的
-  reconciliation 结果，与持久化的 `IssueDisposition` 不是同一个维度。DWS v0.1
-  不新增 `lifecycle_status` 列或新的 enum；`is_active` 与 history projection
-  继续表达当前可见性；
+  reconciliation 结果，不等于 `IssueDisposition`；DWS v0.1 不新增
+  `lifecycle_status` 列或新的 enum；
 - `first_seen_at` / `last_seen_at` / `last_changed_at` 与 `is_active` 用于
   current/history，不能因为 active switch 物理删除旧 issue；
 - `evidence_json` 使用 deterministic JSON text，不保存完整源码、凭据或连接串。
 
-## 5. DWS physical design
+## 4. DWS physical design
 
-### 5.1 ROW / COLUMN 选择
+### 4.1 ROW / COLUMN 选择
 
 | 表 | v0.1 orientation | 选择原因 | 代价与监控 |
 | --- | --- | --- | --- |
 | `lineage_batch` | ROW | 小表、单 active lookup、publish 状态切换和计数校验 | 不用于大扫描；无需 COLUMN |
 | `lineage_program_state` | ROW | current state 按 identity/profile 查询，增量复用和 active switch 是窄写 | 历史量大后按 `last_seen_at` 分区；关注更新放大 |
-| `lineage_edge` | COLUMN | 预计最大、append-by-batch，按 source/target/environment 扫描、审计和重建 physical DAG | 单节点极低延迟点查不一定优于 ROW；索引和 batch filter 必须基准验证 |
-| `lineage_business_edge` | ROW | 门户/上下游是 source/target 的窄查询，行宽小，derived batch 写入和 active 查询优先 | 若未来规模远超预期，再以真实 SLO 评估 COLUMN，不在 #39 预优化 |
+| `lineage_edge` | COLUMN | 预计最大、append-by-batch，按 source/target/environment 扫描、审计和 direct graph 查询 | 单节点极低延迟点查不一定优于 ROW；索引和真实 workload 必须基准验证 |
 | `lineage_issue` | ROW | issue scope、stable key、active/history 和 policy review 以窄行读取为主 | evidence JSON 较宽，按 scope/index 读取，不把全文 evidence 当索引键 |
 
+不因为撤销 semantic split 而改变已经合理冻结的 `lineage_edge` COLUMN 选择。
 这不是机械复制 SQLite schema：SQLite 的 `id INTEGER AUTOINCREMENT`、JSON text
 和本地索引都不直接成为 DWS physical contract。
 
-### 5.2 Distribution
+### 4.2 Distribution
 
-五张表统一：
+四张表统一：
 
 ```sql
 DISTRIBUTE BY HASH (row_key)
@@ -335,20 +270,18 @@ skew；不按 `environment` / `source_profile` 分布，避免单 scope 偏斜�
   diagnostics 监控；
 - 按 source/target 查找可能需要跨 DN 访问，索引和真实 workload 再调；本 Issue
   不引入复杂 distribution key；
-- 每张事实表都冻结为：`PRIMARY KEY (row_key)`，并对同一 batch 内的 stable identity
+- 每张事实表都冻结为 `PRIMARY KEY (row_key)`，并对同一 batch 内的 stable identity
   建立 `UNIQUE (batch_id, stable_key)` 等价约束；`lineage_batch.batch_id` 唯一，
   active batch 通过 filtered unique index 保证最多一个；同一 stable identity 可以
   在不同历史 batch 重复出现；
 - `(batch_id, stable_key)` 的 logical uniqueness 不一定与 `row_key` 分布共址，
   因此 writer 必须在 active switch 前再次做 candidate duplicate validation，
-  不能只依赖 DWS constraint。constraint 与 pre-switch validation 都是本 v0.1
-  publish contract，不等待额外的 production proof 才改变语义。
+  不能只依赖 DWS constraint。
 
-### 5.3 Partition 与 retention
+### 4.3 Partition 与 retention
 
 - `lineage_batch`：不分区，小 control table；
-- `lineage_edge` / `lineage_business_edge`：按 `observed_at` 做 monthly/approved
-  rolling range partition；
+- `lineage_edge`：按 `observed_at` 做 monthly/approved rolling range partition；
 - `lineage_program_state` / `lineage_issue`：按 `last_seen_at` 做 rolling range
   partition，保证 active/history 生命周期与 retention 对齐；
 - DDL 中的 seed/max partition 只是 design placeholder，真正上线前必须由 DWS
@@ -359,30 +292,28 @@ skew；不按 `environment` / `source_profile` 分布，避免单 scope 偏斜�
 - retention 只允许删除已退休且已超出 horizon 的完整历史分区，不能删除 active
   batch；`lineage_issue` 的保留期不得短于其关联事实的对账需要，若 #36 另有更长
   保留要求则取更长者；
-- failed candidate 由 transaction rollback 清理，不靠 retention 清半批；上述规则
-  是 v0.1 retention contract，具体 horizon 是运维配置而不是 schema 字段。
+- failed candidate 由 transaction rollback 清理，不靠 retention 清半批。
 
-## 6. Publish / Snapshot contract
+## 5. Publish / Snapshot contract
 
-### 6.1 一个 batch 的 consistency boundary
+### 5.1 一个 batch 的 consistency boundary
 
 `lineage_batch.batch_id` 是唯一 consistency boundary。一次 successful publish 的
 candidate 必须满足：
 
 ```text
 ProgramSource
-  → physical DAG / audit
+  → ProgramPhysicalDAG / audit
+  → existing Phase 5 TMP collapse
+  → formal LineageEdge rows(batch = B)
   → lineage_edge rows(batch = B)
-  → business derivation(rows from the same B)
-  → lineage_business_edge rows(batch = B)
   → lineage_program_state / lineage_issue rows(batch = B)
-  → validate counts and stable identities
+  → validate counts, formal DatasetIdentity endpoints and stable identities
   → one active switch
 ```
 
-禁止 `lineage_edge = N`、`lineage_business_edge = N-1` 的组合。active 查询应同时
-约束 `fact.is_active = TRUE` 和 `dwp.lineage_batch.is_active = TRUE`，并按
-`fact.batch_id = batch.batch_id` join，而不是相信某一张事实表的 flag 单独正确。
+active 查询应同时约束 `fact.is_active = TRUE` 和 `dwp.lineage_batch.is_active = TRUE`，
+并按 `fact.batch_id = batch.batch_id` join，而不是相信某一张事实表的 flag 单独正确。
 
 推荐的 publish 事务语义（示意，不是本 Issue 的 runtime implementation）：
 
@@ -391,178 +322,150 @@ BEGIN
   insert dwp.lineage_batch(B, inactive/candidate)
   insert dwp.lineage_program_state(B, inactive)
   insert dwp.lineage_edge(B, inactive)
-  insert dwp.lineage_business_edge(B, inactive)
   insert dwp.lineage_issue(B, inactive)
-  validate same batch_id, counts, stable uniqueness, formal business endpoints,
-           and derivation hashes
-  deactivate previous dwp.lineage_batch and all four fact tables
-  activate B in dwp.lineage_batch and all four fact tables
+  validate same batch_id, counts, formal endpoints and stable uniqueness
+  deactivate previous dwp.lineage_batch and all three fact tables
+  activate B in dwp.lineage_batch and all three fact tables
 COMMIT
 ```
 
-任何 build、audit、business derivation、insert、validation 或 active switch 失败都
-`ROLLBACK`。上一成功 snapshot 必须继续完整可读；不得留下半批 active physical
-或 business data。
+任何 build、audit、TMP collapse、insert、validation 或 active switch 失败都
+`ROLLBACK`。上一成功 snapshot 必须继续完整可读；不得留下半批 active data。
 
-### 6.2 Build success / collapse result
+### 5.2 Build success / collapse result
 
-| 情况 | physical candidate | business candidate | publish |
+| 情况 | ProgramPhysicalDAG/runtime | `lineage_edge` candidate | publish |
 | --- | --- | --- | --- |
-| DAG/build 成功，所有 safe boundary collapse 成功 | 写入 B | 写入 B | 允许，同一 B 原子切换 |
-| 有已知 orphan/cycle/self-reference，audit 能完整分类且不能安全生成某条业务边 | physical row 和 issue 写入 B | 受影响边缺失，不猜测；valid edges 仍属于 B | 仅当 derivation 返回 complete negative result；允许 publish |
-| business collapse 抛错、路径遍历超限、无法证明结果完整 | physical 可在 candidate 中保留 | 不得用不完整结果冒充 B | fail closed，整个 B rollback，不替换旧 active |
-| physical build 失败 | 不 publish | 不 publish | fail closed |
+| DAG/build 成功，现有 TMP collapse 成功 | 完整 physical facts 可供 audit/evidence 使用 | 安全 formal direct rows 写入 B | 允许，同一 B 原子切换 |
+| 已知 orphan/cycle/self-reference，audit 能完整分类 | physical facts 保留，诊断进入 issue | 受影响 formal row 缺失，不猜测；valid direct rows 仍属于 B | 仅当结果完整且 deterministic；允许 publish |
+| TMP collapse 抛错、路径遍历超限、无法证明结果完整 | 可只存在于内存或 candidate transaction 内 | 不得用不完整结果冒充 B | fail closed，整个 B rollback，不替换旧 active |
+| physical build/audit 失败 | 不 publish | 不 publish | fail closed |
 
-“允许 business edge 缺失”指有明确 diagnostic 的 safe negative result，不是允许
-physical/business 使用不同 batch。对不可验证的 collapse failure，选择整个 batch
-fail closed，优先保证 portal 不读到伪造的业务关系。
+`lineage_edge` 只接收现有 `LineageEdge` 的 formal direct output；不允许用 raw
+PhysicalEdge 行填充它，也不执行第二套 business collapse 算法。
 
-### 6.3 Empty edge success
+### 5.3 Empty edge success
 
-完整 snapshot 可以成功但没有任何 edge：
+完整 snapshot 可以成功但没有任何 formal direct edge：
 
 ```text
 lineage_batch(B).is_active = TRUE
-physical_edge_count       = 0
-business_edge_count       = 0
+edge_count                = 0
 program_count / issue_count 按实际 candidate 计数
 ```
 
 不能因为没有 edge 就不写 batch，也不能用上一 batch 的 edge 伪装当前 active
-snapshot。若是 partial snapshot，则 scope 外事实仍必须 rebase 到 B。
+snapshot。若是 partial snapshot，则 scope 外 facts 仍必须 rebase 到 B。
 
-### 6.4 Incremental reuse / source change / pipeline rebuild
+### 5.4 Incremental reuse / source change / pipeline rebuild
 
 - `source_hash` 非空且与 active `program_state` 相同、`pipeline_version` 相同：
-  `UNCHANGED`，physical/business/state/issue facts rebase 到新 batch；stable keys
-  不变，`row_key` 因 batch 变化；
+  `UNCHANGED`，formal `LineageEdge` / state / issue facts rebase 到新 batch；stable
+  keys 不变，`row_key` 因 batch 变化；
 - `source_hash` 变化、缺失或 pipeline version 变化：`CHANGED`，同一 ProgramIdentity
-  重建 physical 与 business 两层；不能只刷新一层；
-- rebuild 输出 business key 相同：重新生成当前 batch 的 `collapse_depth` 与
-  derivation metadata，但按 4.4.2 保留 business `last_changed_at`；v0.1 不持久化
-  `path_count`；
-- pipeline semantic version 变化必须能触发 rebuild，即便 source hash 相同；
-- `job_key` 不进入 stable identity，不能用它决定 reuse。
+  重建 Physical DAG、audit 和 Phase 5 materialization；不能只刷新一层；
+- rebuild 输出相同 formal direct key：更新当前 batch 的 evidence/provenance 与
+  `last_seen_at`，按稳定 direct identity 保留 `last_changed_at`；DWS 不增加
+  `path_count` 专用列，也不以 bounded sample 长度替代完整规模；
+- pipeline semantic version 变化必须能触发 rebuild，即使 source hash 相同；
+- `job_key` 不进入 DWS stable identity，不能用它决定 reuse。
 
-### 6.5 Program disappearance / restore
+### 5.5 Program disappearance / restore
 
 - `FULL + complete_snapshot + explicit scope` 才有 scoped disappearance authority；
-- scope 内未出现的 program 及其 physical/business/state facts 不进入新 active
+- scope 内未出现的 program 及其 formal direct/state/issue facts 不进入新 active
   candidate，但旧 batch 保留；
 - `PARTIAL`、limit replay、provider error 或 scope 外缺失一律不能判定 deleted；
   未读取 profile/program 的 active facts 原样 rebase；
 - restore 不通过名字/hash 相似度猜 rename；按 #38 作为新的 active observation，
   history 仍可按旧 batch 读取。
 
-### 6.6 Rollback
+### 5.6 Rollback
 
-如果 B 在 collapse、校验或 switch 阶段失败：
+如果 B 在 TMP collapse、校验或 switch 阶段失败：
 
 ```text
 B 的 candidate rows      = rollback 后不存在/不可见
 previous active batch    = 仍是完整 active snapshot
-physical/business batch  = 不会分裂
+lineage_edge / issue     = 不会分裂或跨 batch active
 ```
 
-不执行“先切 physical、再补 business”的两阶段公开状态。
+不执行“先切 edge、再补 issue”或任何两阶段公开状态。
 
-## 7. Active / history 查询 contract
+## 6. Active / history 查询 contract
 
-业务门户的默认查询必须走 `lineage_business_edge`，physical debug/audit 才走
-`lineage_edge`。两者都必须显式限定 environment，并绑定同一个 active batch：
+业务门户和直接上下游查询都直接消费当前 `dwp.lineage_edge`；不能在 query-time
+递归 TMP，也不能把 raw PhysicalDAG 当成当前 DWS edge：
 
 ```sql
-SELECT be.source_table, be.target_table, be.program_key
-FROM dwp.lineage_business_edge AS be
+SELECT e.source_table, e.target_table, e.program_key
+FROM dwp.lineage_edge AS e
 JOIN dwp.lineage_batch AS b
-  ON b.batch_id = be.batch_id
+  ON b.batch_id = e.batch_id
  AND b.is_active = TRUE
-WHERE be.is_active = TRUE
-  AND be.environment = :environment
-  AND (:source_profile IS NULL OR be.source_profile = :source_profile);
+WHERE e.is_active = TRUE
+  AND e.environment = :environment
+  AND (:source_profile IS NULL OR e.source_profile = :source_profile);
 ```
 
-上例中的 `dwp.` 不是可选风格；`current_schema=public` 时禁止依赖
-`search_path`。Physical debug 查询可读取同一 batch 的 TMP endpoints，但普通业务
-查询不得为了找业务关系在 query-time 递归 TMP。
+上例中的 `dwp.` 不是可选风格；`current_schema=public` 时禁止依赖 `search_path`。
+`source_table` / `target_table` 已经是 formal `LineageEdge` endpoint，不需要通过
+递归 TMP 才能得到直接关系。未来 Issue #40 的跨 program/global N-hop 查询必须从
+明确的 direct-edge contract 构建 `lineage_closure`，不在本 Issue 偷换实现。
 
 History 查询按显式 `batch_id` 读取，不把旧 batch 的 inactive edge 混入 active
 projection。任何只写 `WHERE is_active = TRUE` 而不 join active batch 的查询，均视为
 contract violation。
 
-## 8. SQLite → DWS compatibility matrix
+## 7. SQLite → DWS compatibility matrix
 
-SQLite 继续是 reference adapter，不是隐式 production contract。尤其不能把临时
-验证表、fixture 或当前 `LineageEdge` Python object 的旧语义当成
-`lineage_business_edge` 的 production schema 来源。
+SQLite 继续是 public/demo reference adapter，不是隐式 production contract。它已经
+保存与 DWS v0.1 同语义的 formal `LineageEdge`，但没有真实 DWS writer。PR #82 的
+raw physical split 不是兼容目标；不存在的 `dwp.lineage_business_edge` 也不属于
+本版 matrix。
 
 | DWS table | compatible | transformed | intentionally incompatible | production-only | future |
 | --- | --- | --- | --- | --- | --- |
-| `lineage_batch` | `batch_id`、`observed_at`、`published_at`、edge/issue counts、active snapshot | SQLite `id`/implicit row identity → `row_key`；新增 snapshot mode/scope、program/physical/business counts | SQLite 单一 `edge_count` 不能代表 physical 与 business 两层一致性 | DWS ROW/HASH/partition、显式 `dwp.`、publish gate metadata | retention/failed-run observability 可能另立表 |
+| `lineage_batch` | `batch_id`、`observed_at`、`published_at`、`edge_count`、`issue_count`、active snapshot | SQLite `id`/implicit row identity → `row_key`；新增 snapshot mode/scope、pipeline version 与显式 control metadata | SQLite `edge_count` 不统计 ProgramPhysicalDAG raw edges；不拆出第二种 edge count | DWS ROW/HASH、显式 `dwp.`、partition、publish gate metadata | retention/failed-run observability 可能另立表 |
 | `lineage_program_state` | environment、source_profile、program_name、source_hash、pipeline_version、first/last seen、last changed、batch、active | `id INTEGER AUTOINCREMENT` → `row_key`；三元组 → `program_key` | 不把 batch/runtime run 或 job key 当 program identity | DWS distribution、partition、active-batch join | 外部权威 program id 需独立 contract |
-| `lineage_edge` | environment/profile、program provenance、source/target label、evidence、source_hash、batch、observed/active | SQLite `LineageEdge` 行 → DWS `row_key`/`edge_key`；SQLite evidence text → DWS bounded text；增加 node kind/dataset key | 当前 SQLite `LineageEdge` 是 formal collapsed edge 且拒绝 TMP；DWS `lineage_edge` 是 physical direct edge，允许 TMP；不能直接 rename table 复用 | COLUMN/HASH、physical cycle/orphan preservation、physical batch contract | SQLite physical adapter / migration 另立 Issue |
-| `lineage_business_edge` | 无当前正式 SQLite production contract；只可复用未来 candidate/publish 抽象 | 新增 derived table；由同 batch physical edge 生成；需新 `row_key`/`business_edge_key`/derivation fields | 不把当前 `history.BusinessLineageEdge` diff value object 或临时验证表当 production schema；不把 query-time BFS 当 materialization | DWS formal endpoint、collapse metadata、physical derivation hash、同批 gate | SQLite reference adapter 何时实现由独立 Issue 决定 |
+| `lineage_edge` | SQLite formal `LineageEdge` 的 environment/profile、program provenance、formal source/target、evidence、source_hash、batch、observed/active；两端同样禁止 TMP | SQLite `id` → `row_key`；runtime formal identity/evidence → DWS `edge_key`、DatasetIdentity keys 与 bounded `evidence_json` | 不把 `PhysicalEdge`、ProgramPhysicalDAG raw row 或 TMP endpoint 改名写入 DWS `lineage_edge`；不新增 raw physical writer | COLUMN/HASH、DWS formal endpoint validation、partition、active-batch join | DWS adapter/backfill 的具体实现另立 Issue |
 | `lineage_issue` | environment/profile/program、issue type/message/evidence、stable/first/last/active、batch；以及 #36 fact/policy projection 字段 | `id` → `row_key`；nullable `stable_key` → production `stable_issue_key`；evidence canonicalization；旧 SQLite 缺失 policy 字段按 adapter legacy fallback 读取 | SQLite 的 `IssueLifecycleStatus` reconciliation 不是 DWS 新列；不把 runtime 旧扁平 projection 当成新的 fact/policy identity | #36 的 fact/policy 字段、人工 disposition provenance、DWS active/history publish validation | DWS adapter/backfill 的具体实现另立 Issue |
-| `lineage_closure` | 无 | 无 | 本 Issue 不创建、不把 closure 混入 business edge | 无 | Issue #40 future derived index |
+| `lineage_closure` | 无 | 无 | 本 Issue 不创建、不把 closure 混入 `lineage_edge` | 无 | Issue #40 future cross-program/global N-hop derived index |
 
-## 9. Tests / contract lint scope
+## 8. Tests / contract lint scope
 
-本轮测试只验证 design/contract，不连接真实 DWS，也不实现 collapse：
+本轮测试只验证 design/contract，不连接真实 DWS，也不执行 DDL：
 
-- DDL table/schema/key/orientation/distribution/closure lint；
+- DDL 只声明四张 `dwp` 表，且无 `lineage_business_edge` / `lineage_closure`；
+- `lineage_edge` 的 row/stable key、formal DatasetIdentity endpoints、生命周期、
+  HASH distribution 与 COLUMN orientation；
 - lifecycle JSON 的 same-batch、empty success、rollback、duplicate key、profile
-  isolation、inactive contamination、partial/full disappearance、rebuild 与
-  derived rebuild cases；
+  isolation、inactive contamination、partial/full disappearance、rebuild 与 restore；
+- 现有 `tests/shared/test_lineage_materialization.py` 继续验证：
+  `A -> TMP1 -> TMP2 -> B` 只产生 `LineageEdge A -> B`，以及
+  `A -> FORMAL_B -> TMP -> FORMAL_C` 只产生两条 formal direct edge；
 - 现有 SQLite targeted tests 继续覆盖 failed publish、历史保留、active query、
   duplicate identity 与 partial scoped deletion；
 - 不因本 Issue 重跑无关 parser 全量测试，不修改 `imp_lineage_edge` runtime。
 
-## 10. Frozen decisions
+## 9. Frozen decisions
 
-本轮把以下语义冻结为 #39 v0.1 contract；它们不是待实现时再猜测的默认值：
+本轮把以下语义冻结为 #39 v0.1 contract：
 
 | Decision | v0.1 frozen contract |
 | --- | --- |
-| #36 policy alignment | 复用已 CLOSED 的 Issue #36：fact 保存 `issue_type`、`confidence`、`rule_version`、message/evidence/stable identity；policy projection 保存 `severity`、`disposition`、`policy_version`；人工处置保存 `disposition_updated_at` / `disposition_updated_by`。不把 `IssueLifecycleStatus` 当成 `IssueDisposition`，不新增 enum。 |
-| `collapse_depth` | 安全 business path 的 physical direct-edge hop 数；direct=1；`DWF.A → TMP1 → TMP2 → DWUPRR.R` 为 3；每个 DWS business row 必须为 `INTEGER >= 1`，不可验证时不写伪造 depth。 |
-| `path_count` | 不进入 DWS v0.1 `lineage_business_edge`。reference runtime 的 bounded `evidence.path_count` 与 DWS schema 有意不兼容；不得以 sample 长度填充，未来持久化必须另立 contract。 |
-| business `last_changed_at` | 只表示 business identity/semantic projection 的首次建立或真正业务语义变化。TMP rename、physical route、depth、derivation hash、evidence 顺序、source hash 或 pipeline version 变化，只更新当前 batch projection/metadata 和 `last_seen_at`，同一 stable business identity 不更新 `last_changed_at`。 |
-| business collapse failure | collapse 抛错、超限、超时、结果不完整或无法验证时 fail closed：candidate transaction 全部 rollback，旧 active snapshot 保持不变；只有完整、可验证的 negative result 才能带同 batch diagnostic publish。 |
-| DWS uniqueness | 五张表统一 `PRIMARY KEY (row_key)`；每张事实表对 `(batch_id, stable identity key)` 做 unique；`lineage_batch.batch_id` 唯一且 active batch 最多一个；writer 在 switch 前必须再次校验 duplicate stable identity。分布 key 不改变这些逻辑约束。 |
-| retention | 使用 rolling time partitions；schema 不写死具体月份。运维配置必须保留 active batch、上一成功 snapshot 的 rollback window 和对账窗口；只删除超出 horizon 的完整 retired partitions，issue retention 不短于事实对账需要或 #36 更长要求。 |
-| non-production proof | GaussDB 8.1.3 的 DDL、partition、partial unique index 和 distributed unique 行为必须在非生产环境验证；这不改变本轮已冻结的逻辑 contract，也不连接真实 DWS。 |
+| runtime physical layer | `ProgramPhysicalDAG` 保留 TMP、cycle、self-reference、orphan 与 raw physical direct facts；本 Issue 不新增 raw PhysicalEdge DWS writer |
+| DWS `lineage_edge` | 等于 current formal direct `LineageEdge` semantic；由现有 program-scoped TMP collapse 产出；两个 endpoint 必须是 formal DatasetIdentity；TMP endpoint forbidden |
+| formal boundary | collapse 第一次遇到 formal asset 就停止；不跨 formal asset 产生 transitive edge；`A -> FORMAL_B -> TMP -> FORMAL_C` 不生成 `A -> FORMAL_C` |
+| row/stable key | `row_key` 可含 batch 并标识物理行；`edge_key` 是 batch-independent formal direct identity；两者必须分离 |
+| lifecycle | batch/current/history、source_hash、pipeline_version、partial/full snapshot、rollback、active-batch join 与 retained history 保留 |
+| #36 policy alignment | 复用已 CLOSED 的 Issue #36：fact 保存 `issue_type`、`confidence`、`rule_version`、message/evidence/stable identity；policy projection 保存 `severity`、`disposition`、`policy_version`；人工处置保存 `disposition_updated_at` / `disposition_updated_by`，不新增 enum |
+| evidence | existing runtime 的 bounded `evidence.path_count` 可以作为 runtime evidence 继续存在；DWS v0.1 不增加专用 `path_count` 列，也不以 sample 长度替代完整规模 |
+| materialization failure | collapse 抛错、超限、超时、结果不完整或无法验证时 fail closed：candidate transaction 全部 rollback，旧 active snapshot 保持不变；只有完整、可验证的 negative result 才能带同 batch issue publish |
+| physical design | 已冻结的 ROW/COLUMN 与 `DISTRIBUTE BY HASH (row_key)` 尽量保留；`lineage_edge` 继续 COLUMN；本轮不执行真实 DWS DDL |
+| #40 boundary | `lineage_closure` 是 future cross-program/global N-hop derived index；本 Issue 不实现 closure、不改变当前 BFS/runtime query contract |
+| non-production proof | GaussDB 8.1.3 的 DDL、partition、partial unique index 和 distributed unique 行为必须在非生产环境验证；这不改变本轮逻辑 contract，也不连接真实 DWS |
 
-## 11. 建议独立 Issue：实现 business collapse / publisher
-
-建议标题：
-
-> **lineage: implement fail-closed physical-to-business lineage collapse and same-batch publisher**
-
-建议 scope：
-
-1. 消费同一 candidate batch 的 physical DAG / `lineage_edge`，不重写 parser 或
-   DatasetIdentity；
-2. 实现 formal boundary、TMP traversal、direct-hop depth、deterministic
-   `physical_derivation_hash` 和 stable business key；不要把 bounded sample 当成
-   DWS `path_count`；
-3. 对 cycle、self-reference、orphan、missing schema、ambiguous sink 提供可解释
-   diagnostic；禁止 basename/fuzzy guess；
-4. 实现 candidate validation 与 physical/business 同 batch atomic publish，collapse
-   不可验证时 fail closed 并保留上一 active snapshot；
-5. 覆盖 direct edge、TMP multi-hop、multi-path dedupe、TMP rename、cross-profile、
-   empty batch、partial/full snapshot、rollback 与 rebuild。
-
-Acceptance criteria：
-
-- `DWF.A → TMP1 → TMP2 → DWUPRR.R` 产生一个 formal business edge，TMP 不在业务
-  endpoint，physical rows 三条完整保留，`collapse_depth=3`；
-- direct formal edge 的 `collapse_depth=1`；DWS v0.1 不持久化 `path_count`，不得把
-  bounded sample 当完整计数；
-- TMP rename 不改变 `business_edge_key`；derived metadata 可以变化，但同一业务
-  identity 的 `last_changed_at` 不因 physical path 变化更新；
-- complete negative collapse 不产生猜测 edge，并可有同 batch issue；不可验证失败
-  整个 candidate rollback，不切换 active，也不留下半批 issue；
-- physical 与 business 永远不出现跨 batch active；失败后上一 snapshot 可完整读取。
-
-这个独立 Issue 不在本轮实现，也不包含 `lineage_closure`、parser、OpenLineage 或
-column lineage。
+本轮明确移除 PR #82 引入的 semantic drift：不再将 `lineage_edge` 定义为 raw
+Physical Direct Edge，不再要求独立的 `lineage_business_edge`，不新增 BUSINESS_CLOSURE
+runtime，不修改 parser、Audit semantics、cron 入口或 SQLite runtime。

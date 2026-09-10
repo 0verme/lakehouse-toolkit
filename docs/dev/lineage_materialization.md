@@ -13,14 +13,15 @@ DAG，也不替换现有生产入口。
 `Batch != Runtime Run` 的完整边界见
 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
-> **Issue #39 DWS projection clarification:** 本文下面的 `LineageEdge` 和
-> SQLite reference adapter 继续描述当前 Phase 5 runtime 的 formal direct
-> materialization，不能把它直接当成新的 DWS production table contract。Issue #39
-> 的 DWS schema 将完整 Physical Direct Edge（包括 TMP endpoint）放入
-> `dwp.lineage_edge`，再从同一 batch 派生 `dwp.lineage_business_edge`；详见
+> **Issue #39 DWS boundary correction:** 本文下面的 `LineageEdge` 和
+> SQLite reference adapter 描述的是当前 Phase 5 runtime contract：程序级 TMP
+> collapse 后的 formal direct materialization。DWS v0.1 的 `dwp.lineage_edge`
+> 与该语义一致，两个 endpoint 都必须是 `DatasetIdentity`；TMP 只保留在
+> `ProgramPhysicalDAG` 和 bounded evidence 中，不能作为 DWS endpoint。DWS v0.1
+> 不创建 raw PhysicalEdge writer，也不创建独立的 `dwp.lineage_business_edge`；
+> 跨 program/global N-hop closure 属于 Issue #40。详见
 > [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
-> 本轮不改变 `imp_lineage_edge` runtime，也不把当前 SQLite 临时/参考表当作
-> `lineage_business_edge` 的正式 schema 来源。
+> 本轮不改变 `imp_lineage_edge` runtime。
 
 ## Physical DAG 与 Business Lineage
 
@@ -77,16 +78,15 @@ DWM.B → DWA.C
 
 一个 batch/program 内相同的
 `environment + source_profile + source_table + target_table + program_name + job_key`
-只保留一个业务事实；重复 physical path 会合并到同一条 edge 的 deterministic
-`evidence.physical_paths`。
+只保留一个 `LineageEdge` formal direct fact；重复 physical path 会合并到同一条
+edge 的 deterministic `evidence.physical_paths`。
 
 ### Bounded Evidence Contract
 
 `evidence.path_count` 是当前 SQLite/reference runtime 中该 formal edge 发现的完整
-collapsed physical path 数量，不是 sample 的长度。它是旧 `LineageEdge` evidence
-contract 的 runtime 字段，不是 Issue #39 DWS `lineage_business_edge` 的 schema
-字段；DWS v0.1 明确不持久化 `path_count`，不能把 bounded sample 映射成生产列。
-为避免一个 edge 携带无限 JSON，`physical_paths` 只保留最多 `100`
+collapsed physical path 数量，不是 sample 的长度。它是现有 `LineageEdge` evidence
+contract 的 runtime 字段；DWS v0.1 不增加专用 `path_count` 列，也不能把 bounded
+sample 映射成生产计数。为避免一个 edge 携带无限 JSON，`physical_paths` 只保留最多 `100`
 条按稳定 traversal 顺序取得的 deterministic representative sample，并用
 `physical_paths_truncated` 标识是否还有未保存的 path；explicit fallback 仍会按 bounded
 accumulator 保留 canonical 最小 sample。`source`、`target`、程序身份、`path_count` 和
@@ -97,7 +97,8 @@ statement evidence summary 不因 sample 截断而丢失。
 `physical_edge_pairs_truncated`、`collapsed_tmp_nodes_truncated` 和
 `statement_indices_truncated` 表示截断。SQLite 仍将 evidence 作为 JSON 文本保存，
 因此没有额外的表迁移；SQLite consumer 必须使用 runtime `path_count` 判断完整规模，
-不能用 `len(physical_paths)` 代替；DWS consumer 不得假设存在同名列。
+不能用 `len(physical_paths)` 代替；DWS consumer 不得假设存在同名列。DWS
+`lineage_edge` 只接收 formal direct `LineageEdge`，不接收 raw PhysicalEdge。
 
 Materialization 对无环 TMP 子图使用 deterministic DAG dynamic programming：formal
 boundary 的 exact `path_count`、能参与该 boundary 的 physical edge/node summary 都由

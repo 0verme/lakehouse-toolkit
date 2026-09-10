@@ -6,12 +6,15 @@ materialization → Query 主链上增加演进能力。它不改变 `LineageEdg
 restore、Batch 与 runtime boundary 的完整 V1 contract 见
 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
-> **Issue #39 DWS boundary:** 本文的 `LineageEdge`、SQLite history/diff 和 Query
-> 仍是当前 reference runtime contract。新的 DWS production schema 把完整
-> Physical Direct Edge 放入显式的 `dwp.lineage_edge`，并要求从相同 `batch_id`
-> 派生 `dwp.lineage_business_edge`；两者不能跨 batch active。详见
+> **Issue #39 DWS boundary correction:** 本文的 `LineageEdge`、SQLite
+> history/diff 和 Query 仍是当前 reference runtime contract。DWS v0.1 的
+> `dwp.lineage_edge` 与 runtime 一致：它只保存既有 program-scoped TMP collapse
+> 产生的 formal direct edge；完整 TMP/cycle/orphan facts 仍保留在
+> `ProgramPhysicalDAG` runtime 中，TMP 不能作为 DWS endpoint。DWS v0.1 不创建 raw
+> PhysicalEdge writer 或独立的 `dwp.lineage_business_edge`；跨 program/global
+> N-hop closure 属于 Issue #40。详见
 > [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
-> 本说明不改变现有 `imp_lineage_edge` runtime，也不创建 closure。
+> 本说明不改变现有 `imp_lineage_edge` runtime。
 >
 > **Issue #36 alignment:** #36 已 CLOSED；DWS `lineage_issue` 复用其 Audit Fact /
 > Severity / Disposition contract 的 fact/policy
@@ -22,9 +25,9 @@ restore、Batch 与 runtime boundary 的完整 V1 contract 见
 > reconciliation 结果，不是 `IssueDisposition`（`OPEN` / `ACCEPTED` /
 > `FALSE_POSITIVE` / `RESOLVED`）。
 >
-> DWS business projection 的 `last_changed_at` 只表示业务 identity/semantic
-> projection 的首次建立或真正变化；TMP rename、physical route、collapse depth、
-> derivation hash、source hash 或 pipeline version 变化，在 stable business identity
+> DWS formal direct `lineage_edge` 的 `last_changed_at` 只表示 formal direct
+> identity/semantic projection 的首次建立或真正变化；TMP rename、physical route、
+> evidence 顺序、source hash 或 pipeline version 变化，在 stable direct identity
 > 不变时只更新当前 batch metadata/`last_seen_at`，不更新该字段。DWS history 使用
 > rolling partitions；active、上一成功 snapshot 的 rollback window 和对账窗口受
 > retention 保护，具体 horizon 属于运维配置而非 runtime adapter 默认值。
@@ -222,7 +225,7 @@ lookup/兼容匹配层扩大候选，不改写 Dataset Identity。
 {"nodes": [], "edges": [], "truncated": false}
 ```
 
-## Legacy decision 与 closure
+## Legacy decision 与 #40 closure boundary
 
 真实调用关系和逐入口决定见
 [`lineage_legacy_migration.md`](lineage_legacy_migration.md)。Phase 7 只把
@@ -300,7 +303,7 @@ bounded evidence finalize。`build status=SUCCESS` 的 `slow_programs`、
 `STARTED`/`SUCCESS`。`program_id` 是不含程序名的稳定短 hash，可在同一受控 sample
 的重复运行中比对长尾；不应为定位方便而把源码、SQL 或表名写进生产日志。
 
-### `lineage_closure` decision
+### `lineage_closure` / Issue #40 boundary
 
 ```text
 Decision: NO
@@ -318,5 +321,7 @@ Edges: 1000   Query: downstream   Depth: 7   Max nodes: 300   Approx: 0.055495s/
 Edges: 10000  Query: downstream   Depth: 7   Max nodes: 300   Approx: 0.362386s/run
 Closure required: NO
 ```
+
+这里的 closure boundary 仍由 Issue #40 负责；本阶段不创建 DWS closure 表。
 
 该结果受本机硬件、Python、SQLite 和数据形状影响，不是 CI timing gate。

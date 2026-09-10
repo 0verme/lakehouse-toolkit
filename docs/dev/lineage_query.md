@@ -68,7 +68,7 @@ result = service.query_downstream(
 - 已经返回的节点之间的 edge（包括 cycle edge）仍可展示；
 - 每个 scope 内的 Viewer graph edge identity 是
   `source_table + target_table`，所以不同 program、job 或 profile 产生的相同
-  business edge 只输出一条逻辑边；Phase 5 持久化事实不被修改。
+  formal direct edge 只输出一条逻辑边；Phase 5 持久化事实不被修改。
 
 输出只包含已返回节点两端都存在的 edge。若 depth 或 max_nodes 之外仍存在
 可达的新节点，则 `truncated = true`；图自然结束，或限制边界外只有已访问的
