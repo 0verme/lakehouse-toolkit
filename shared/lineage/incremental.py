@@ -9,16 +9,19 @@ from .evolution import (  # pyright: ignore[reportMissingImports]
     LINEAGE_PIPELINE_VERSION,
     IncrementalPlan,
     IncrementalStatus,
+    PipelineVersionMigrationRequired,
     SnapshotScope,
     build_program_states,
     plan_incremental,
     program_identity_key,
+    validate_pipeline_version_migration,
 )
 
 __all__ = [
     "IncrementalPlan",
     "IncrementalStatus",
     "LINEAGE_PIPELINE_VERSION",
+    "PipelineVersionMigrationRequired",
     "ProgramIdentity",
     "ProgramSource",
     "ProgramState",
@@ -26,4 +29,5 @@ __all__ = [
     "build_program_states",
     "plan_incremental",
     "program_identity_key",
+    "validate_pipeline_version_migration",
 ]

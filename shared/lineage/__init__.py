@@ -110,6 +110,7 @@ from .evolution import (  # pyright: ignore[reportMissingImports]
     IncrementalPlan,
     IncrementalStatus,
     IssueLifecycle,
+    PipelineVersionMigrationRequired,
     IssueLifecycleResult,
     IssueLifecycleStatus,
     LineageBatchDiff,
@@ -123,6 +124,7 @@ from .evolution import (  # pyright: ignore[reportMissingImports]
     plan_incremental,
     program_identity_key,
     reconcile_issue_lifecycle,
+    validate_pipeline_version_migration,
 )
 from .materialization import (  # pyright: ignore[reportMissingImports]
     LineageEvidenceError,
@@ -388,6 +390,7 @@ __all__ = [
     "IncrementalPlan",
     "IncrementalStatus",
     "IssueLifecycle",
+    "PipelineVersionMigrationRequired",
     "IssueLifecycleResult",
     "IssueLifecycleStatus",
     "LineageBatchDiff",
@@ -401,6 +404,7 @@ __all__ = [
     "plan_incremental",
     "program_identity_key",
     "reconcile_issue_lifecycle",
+    "validate_pipeline_version_migration",
     "replay_audit_policy",
     "analyze_blast_radius",
     "query_downstream",

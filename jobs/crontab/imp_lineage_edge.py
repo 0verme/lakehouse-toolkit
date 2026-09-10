@@ -45,11 +45,13 @@ from shared.lineage.domain import (  # noqa: E402
 from shared.lineage.evolution import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     IncrementalPlan,
     IncrementalStatus,
+    PipelineVersionMigrationRequired,
     SnapshotScope,
     build_program_states,
     detect_broken_lineage_branches,
     issue_identity_key,
     plan_incremental,
+    validate_pipeline_version_migration,
 )
 import shared.lineage.materialization as materialization_module  # noqa: E402
 from shared.lineage.materialization import (  # noqa: E402  # pyright: ignore[reportMissingImports]
@@ -609,12 +611,18 @@ def build_incremental_candidate_batch(
     coverage: LineageCoverageAccumulator | None = None,
     policy: AuditPolicy | None = None,
     force_rebuild: bool = False,
+    partial_replay: bool = False,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
     diagnostic: bool = False,
     physical_dags: list[ProgramPhysicalDAG] | None = None,
 ) -> MaterializationBatch:
-    """只重建 NEW/CHANGED，并把 candidate 合并成完整 snapshot。"""
+    """只重建 NEW/CHANGED，并把 candidate 合并成完整 snapshot。
+
+    Pipeline version migration requires a complete replay of every stale
+    snapshot scope; ``partial_replay`` is reserved for bounded replays such as
+    ``--limit`` and cannot bypass that preflight.
+    """
 
     progress_every = _validate_progress_every(progress_every)
     slow_threshold_ms = _validate_slow_threshold_ms(slow_threshold_ms)
@@ -627,13 +635,27 @@ def build_incremental_candidate_batch(
     plan_started_at = time.perf_counter()
     _emit_log("incremental_plan", "STARTED")
     try:
-        previous_states = store.read_program_states(active_only=True)
+        previous_states = tuple(store.read_program_states(active_only=True))
         base_plan = plan_incremental(
             sources,
             previous_states,
             complete_snapshot=complete_snapshot,
             snapshot_scopes=snapshot_scopes,
         )
+        try:
+            validate_pipeline_version_migration(
+                base_plan,
+                previous_states,
+                partial_replay=partial_replay,
+            )
+        except PipelineVersionMigrationRequired as error:
+            _emit_log(
+                "pipeline_migration_preflight",
+                "FAILED",
+                **error.log_fields,
+                action="rerun_with_all_stale_profiles_without_limit",
+            )
+            raise
         if force_rebuild:
             plan = IncrementalPlan(
                 new=base_plan.new,
@@ -939,6 +961,7 @@ def materialize_sources(
         coverage=coverage,
         policy=policy,
         force_rebuild=force_rebuild,
+        partial_replay=controlled_partial_replay,
         progress_every=progress_every,
         slow_threshold_ms=slow_threshold_ms,
         diagnostic=diagnostic,

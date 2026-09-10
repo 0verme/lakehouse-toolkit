@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
+import re
 from typing import Any
 
 from .audit import (
@@ -170,6 +171,64 @@ def _normalize_pipeline_version(value: object) -> str:
     return value.strip()
 
 
+_SAFE_MIGRATION_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+def _safe_migration_value(value: str) -> str:
+    candidate = value.strip()
+    return candidate if _SAFE_MIGRATION_VALUE.fullmatch(candidate) else "<redacted>"
+
+
+class PipelineVersionMigrationRequired(ValueError):
+    """当前 active snapshot 需要一次覆盖完整 stale scope 的迁移。"""
+
+    def __init__(
+        self,
+        *,
+        current_pipeline_version: str,
+        stale_states: Iterable[ProgramState],
+    ) -> None:
+        self.current_pipeline_version = _normalize_pipeline_version(
+            current_pipeline_version
+        )
+        states = tuple(stale_states)
+        if any(not isinstance(state, ProgramState) for state in states):
+            raise TypeError("stale_states must contain ProgramState values")
+        if not states:
+            raise ValueError("stale_states must not be empty")
+        self.stale_program_count = len(states)
+        self.stale_profiles = tuple(
+            sorted({state.source_profile for state in states})
+        )
+        self.stale_profile_count = len(self.stale_profiles)
+        self.safe_current_pipeline_version = _safe_migration_value(
+            self.current_pipeline_version
+        )
+        self.safe_stale_profiles = tuple(
+            _safe_migration_value(profile) for profile in self.stale_profiles
+        )
+        profile_text = ",".join(self.safe_stale_profiles)
+        super().__init__(
+            "pipeline migration required: "
+            f"current={self.safe_current_pipeline_version} "
+            f"stale_programs={self.stale_program_count} "
+            f"stale_profile_count={self.stale_profile_count} "
+            f"stale_profiles={profile_text}; "
+            "rerun with all stale profiles and without --limit"
+        )
+
+    @property
+    def log_fields(self) -> dict[str, object]:
+        """返回不包含 program identity 的可安全阶段日志字段。"""
+
+        return {
+            "current_pipeline_version": self.safe_current_pipeline_version,
+            "stale_programs": self.stale_program_count,
+            "stale_profile_count": self.stale_profile_count,
+            "stale_profiles": ",".join(self.safe_stale_profiles),
+        }
+
+
 def _normalize_scope_values(
     scopes: Iterable[SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]]
     | None,
@@ -301,6 +360,46 @@ def plan_incremental(
         complete_snapshot=complete_snapshot,
         snapshot_scopes=scopes,
         pipeline_version=resolved_pipeline_version,
+    )
+
+
+def validate_pipeline_version_migration(
+    plan: IncrementalPlan,
+    previous_states: Iterable[ProgramState],
+    *,
+    partial_replay: bool = False,
+) -> None:
+    """在 parser/DAG 前阻止不完整的 pipeline version migration。
+
+    stale active state 只能在一次 complete snapshot 中由所有 stale scope
+    共同重建。``partial_replay`` 覆盖 ``--limit`` 等即使声明了 scope 也
+    不完整的 replay；它不能取得 migration authority。
+    """
+
+    if not isinstance(plan, IncrementalPlan):
+        raise TypeError("plan must be an IncrementalPlan")
+    if not isinstance(partial_replay, bool):
+        raise TypeError("partial_replay must be a boolean")
+    previous = _active_state_map(tuple(previous_states))
+    stale_states = tuple(
+        state
+        for state in previous.values()
+        if state.pipeline_version != plan.pipeline_version
+    )
+    if not stale_states:
+        return
+
+    stale_scopes = {state.identity.scope for state in stale_states}
+    selected_scopes = {scope.key for scope in plan.snapshot_scopes}
+    if (
+        plan.complete_snapshot
+        and not partial_replay
+        and stale_scopes.issubset(selected_scopes)
+    ):
+        return
+    raise PipelineVersionMigrationRequired(
+        current_pipeline_version=plan.pipeline_version,
+        stale_states=stale_states,
     )
 
 

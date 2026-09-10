@@ -788,6 +788,50 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             1,
         )
 
+    def test_pipeline_version_invariant_remains_defensive(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:demo",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-mixed-version",
+            observed_at=OBSERVED_AT,
+        )
+        mixed_state = ProgramState(
+            environment="DEV",
+            source_profile="profile_b",
+            program_name="DEMO_OTHER",
+            source_hash="sha256:other",
+            first_seen_at=OBSERVED_AT,
+            last_seen_at=OBSERVED_AT,
+            last_changed_at=OBSERVED_AT,
+            batch_id=batch.batch_id,
+            pipeline_version="lineage-pipeline-v8-program-target-hint-selection",
+        )
+        mixed_batch = replace(
+            batch,
+            program_states=(*batch.program_states, mixed_state),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "all program states in a DWS batch must share pipeline_version",
+        ):
+            self.store.publish(
+                mixed_batch,
+                physical_dags=(dag,),
+                complete_snapshot=True,
+                snapshot_scopes=(
+                    ("DEV", "fixture"),
+                    ("DEV", "profile_b"),
+                ),
+            )
+
     def test_complete_snapshot_requires_explicit_nonempty_scope(self) -> None:
         batch = MaterializationBatch(
             batch_id="batch-dws-scope-required",
