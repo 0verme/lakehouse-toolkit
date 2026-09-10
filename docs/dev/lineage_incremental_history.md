@@ -6,15 +6,13 @@ materialization → Query 主链上增加演进能力。它不改变 `LineageEdg
 restore、Batch 与 runtime boundary 的完整 V1 contract 见
 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
-> **Issue #39 DWS boundary correction:** 本文的 `LineageEdge`、SQLite
-> history/diff 和 Query 仍是当前 reference runtime contract。DWS v0.1 的
-> `dwp.lineage_edge` 与 runtime 一致：它只保存既有 program-scoped TMP collapse
-> 产生的 formal direct edge；完整 TMP/cycle/orphan facts 仍保留在
-> `ProgramPhysicalDAG` runtime 中，TMP 不能作为 DWS endpoint。DWS v0.1 不创建 raw
-> PhysicalEdge writer 或独立的 `dwp.lineage_business_edge`；跨 program/global
-> N-hop closure 属于 Issue #40。详见
+> **Issue #39 DWS Materialization Writer:** SQLite history/diff 和 Query 继续消费
+> formal direct `LineageEdge` reference contract；DWS 同时把同一 pipeline 的
+> `ProgramPhysicalDAG` direct `PhysicalEdge` 写入 `dwp.lineage_edge`（TMP endpoint
+> 允许），把 formal direct `LineageEdge` 写入 `dwp.lineage_business_edge`（TMP
+> endpoint 禁止）。五张表共用 batch/lifecycle，`edge_count` 统计 physical rows；
+> 跨 program/global N-hop closure 仍属于 Issue #40。详见
 > [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
-> 本说明不改变现有 `imp_lineage_edge` runtime。
 >
 > **Issue #36 alignment:** #36 已 CLOSED；DWS `lineage_issue` 复用其 Audit Fact /
 > Severity / Disposition contract 的 fact/policy
@@ -25,7 +23,7 @@ restore、Batch 与 runtime boundary 的完整 V1 contract 见
 > reconciliation 结果，不是 `IssueDisposition`（`OPEN` / `ACCEPTED` /
 > `FALSE_POSITIVE` / `RESOLVED`）。
 >
-> DWS formal direct `lineage_edge` 的 `last_changed_at` 只表示 formal direct
+> DWS formal direct `lineage_business_edge` 的 `last_changed_at` 只表示 formal direct
 > identity/semantic projection 的首次建立或真正变化；TMP rename、physical route、
 > evidence 顺序、source hash 或 pipeline version 变化，在 stable direct identity
 > 不变时只更新当前 batch metadata/`last_seen_at`，不更新该字段。DWS history 使用
@@ -103,7 +101,7 @@ unchanged facts      → rebase 到新 batch
 new/changed facts    → 复用既有 Phase 3/4/5 builder/audit/materialization
 outside-scope facts  → 保留
 complete scope 中 deleted facts → omit
-全部合并             → SQLite atomic publish
+全部合并             → selected backend atomic publish（默认 SQLite，可显式选择 DWS）
 ```
 
 因此 `950 unchanged + 50 changed` 仍发布完整 snapshot；changed rebuild 中途

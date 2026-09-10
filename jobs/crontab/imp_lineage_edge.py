@@ -57,13 +57,21 @@ from shared.lineage.materialization import (  # noqa: E402  # pyright: ignore[re
     build_materialization_batch,
     new_batch_id,
 )
+from shared.lineage.materialization_dws import (  # noqa: E402
+    DWSMaterializationStore,
+    DWSPublishMetrics,
+    DWSPublishResult,
+)
 from shared.lineage.materialization_sqlite import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     DEFAULT_MATERIALIZATION_DB_PATH,
     PublishResult,
     SQLiteMaterializationStore,
     SQLitePublishMetrics,
 )
-from shared.lineage.physical_dag import build_program_physical_dag  # noqa: E402
+from shared.lineage.physical_dag import (  # noqa: E402
+    ProgramPhysicalDAG,
+    build_program_physical_dag,
+)
 from shared.lineage.providers import (  # noqa: E402
     ProgramSourceProvider,
     iter_program_sources,
@@ -148,7 +156,10 @@ def _emit_log(stage: str, status: str, **fields: object) -> None:
 
 
 def _elapsed_ms(started_at: float) -> int:
-    return int((time.perf_counter() - started_at) * 1000)
+    try:
+        return int((time.perf_counter() - started_at) * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _exception_name(error: Exception) -> str:
@@ -157,20 +168,26 @@ def _exception_name(error: Exception) -> str:
     return type(error).__name__
 
 
-def _publish_metric_fields(metrics: SQLitePublishMetrics) -> dict[str, int]:
+def _publish_metric_fields(metrics: object) -> dict[str, int]:
+    def metric(name: str) -> int:
+        value = getattr(metrics, name, 0)
+        return value if isinstance(value, int) else 0
+
     return {
-        "prepare_ms": metrics.prepare_ms,
-        "insert_ms": metrics.insert_ms,
-        "validate_ms": metrics.validate_ms,
-        "active_switch_ms": metrics.active_switch_ms,
-        "commit_ms": metrics.commit_ms,
-        "prepared_edges": metrics.prepared_edge_rows,
-        "prepared_issues": metrics.prepared_issue_rows,
-        "prepared_programs": metrics.prepared_program_rows,
-        "validated_edges": metrics.validated_edge_rows,
-        "validated_issues": metrics.validated_issue_rows,
-        "validated_programs": metrics.validated_program_rows,
-        "serialization_calls": metrics.evidence_serialization_calls,
+        "prepare_ms": metric("prepare_ms"),
+        "insert_ms": metric("insert_ms"),
+        "validate_ms": metric("validate_ms"),
+        "active_switch_ms": metric("active_switch_ms"),
+        "commit_ms": metric("commit_ms"),
+        "prepared_edges": metric("prepared_edge_rows"),
+        "prepared_business_edges": metric("prepared_business_rows"),
+        "prepared_issues": metric("prepared_issue_rows"),
+        "prepared_programs": metric("prepared_program_rows"),
+        "validated_edges": metric("validated_edge_rows"),
+        "validated_business_edges": metric("validated_business_rows"),
+        "validated_issues": metric("validated_issue_rows"),
+        "validated_programs": metric("validated_program_rows"),
+        "serialization_calls": metric("evidence_serialization_calls"),
     }
 
 
@@ -412,6 +429,7 @@ def build_candidate_batch(
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
     timing: _ProgramTimingStats | None = None,
     diagnostic: bool = False,
+    physical_dags: list[ProgramPhysicalDAG] | None = None,
 ) -> MaterializationBatch:
     """完成计算但不写库，返回可校验的 candidate batch。"""
 
@@ -462,6 +480,8 @@ def build_candidate_batch(
         )
         if result is None:
             raise RuntimeError("program observer received no materialization result")
+        if physical_dags is not None:
+            physical_dags.append(result.dag)
         common_fields.update(
             {
                 "physical_nodes": len(result.dag.nodes),
@@ -574,7 +594,7 @@ def _rebase_issue(
 def build_incremental_candidate_batch(
     program_sources: Iterable[ProgramSource],
     *,
-    store: SQLiteMaterializationStore,
+    store: SQLiteMaterializationStore | DWSMaterializationStore,
     batch_id: str,
     observed_at: datetime,
     job_keys: Mapping[str, str] | None = None,
@@ -589,6 +609,7 @@ def build_incremental_candidate_batch(
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
     diagnostic: bool = False,
+    physical_dags: list[ProgramPhysicalDAG] | None = None,
 ) -> MaterializationBatch:
     """只重建 NEW/CHANGED，并把 candidate 合并成完整 snapshot。"""
 
@@ -668,6 +689,7 @@ def build_incremental_candidate_batch(
             slow_threshold_ms=slow_threshold_ms,
             timing=timing,
             diagnostic=diagnostic,
+            physical_dags=physical_dags,
         )
         candidate_finalize_started_at = time.perf_counter()
 
@@ -785,6 +807,23 @@ def build_incremental_candidate_batch(
     return candidate
 
 
+def _resolve_materialization_store(
+    store: SQLiteMaterializationStore | DWSMaterializationStore | None,
+    *,
+    db_path: str | Path,
+    store_backend: str,
+    dws_profile: str | None,
+) -> SQLiteMaterializationStore | DWSMaterializationStore:
+    backend = store_backend.strip().lower() if isinstance(store_backend, str) else ""
+    if backend not in {"sqlite", "dws"}:
+        raise ValueError("store_backend must be sqlite or dws")
+    if store is not None:
+        return store
+    if backend == "dws":
+        return DWSMaterializationStore(profile=dws_profile)
+    return SQLiteMaterializationStore(db_path)
+
+
 def materialize_sources(
     program_sources: Iterable[ProgramSource],
     *,
@@ -792,7 +831,9 @@ def materialize_sources(
     batch_id: str | None = None,
     observed_at: datetime | None = None,
     job_keys: Mapping[str, str] | None = None,
-    store: SQLiteMaterializationStore | None = None,
+    store: SQLiteMaterializationStore | DWSMaterializationStore | None = None,
+    store_backend: str = "sqlite",
+    dws_profile: str | None = None,
     complete_snapshot: bool = False,
     snapshot_scopes: Iterable[
         SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]
@@ -806,8 +847,8 @@ def materialize_sources(
     limit: int | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
     diagnostic: bool = False,
-) -> PublishResult:
-    """增量计算完整 candidate，再交给 SQLite adapter 做 atomic publish。
+) -> PublishResult | DWSPublishResult:
+    """增量计算完整 candidate，再交给选定 adapter 做 atomic publish。
 
     ``complete_snapshot`` 默认为 False，防止部分 Provider 扫描误报 DELETED；
     定时任务 ``main`` 在所有 provider 成功迭代后显式启用完整 snapshot。
@@ -823,19 +864,27 @@ def materialize_sources(
     # snapshot because its deletion authority is restricted to that profile.
     controlled_partial_replay = limit is not None
     effective_complete_snapshot = complete_snapshot and not controlled_partial_replay
-    resolved_snapshot_scopes = snapshot_scopes
-    if selected_profiles and snapshot_scopes is not None:
+    resolved_snapshot_scopes = (
+        None if snapshot_scopes is None else tuple(snapshot_scopes)
+    )
+    if selected_profiles and resolved_snapshot_scopes is not None:
         selected = set(selected_profiles)
         resolved_snapshot_scopes = tuple(
             scope
-            for scope in snapshot_scopes
+            for scope in resolved_snapshot_scopes
             if _snapshot_scope_profile(scope) in selected
         )
     resolved_batch_id = batch_id if batch_id is not None else new_batch_id()
     resolved_observed_at = (
         observed_at if observed_at is not None else datetime.now(timezone.utc)
     )
-    materialization_store = store or SQLiteMaterializationStore(db_path)
+    materialization_store = _resolve_materialization_store(
+        store,
+        db_path=db_path,
+        store_backend=store_backend,
+        dws_profile=dws_profile,
+    )
+    rebuilt_physical_dags: list[ProgramPhysicalDAG] = []
 
     source_started_at = time.perf_counter()
     _emit_log("source_load", "STARTED")
@@ -890,16 +939,30 @@ def materialize_sources(
         progress_every=progress_every,
         slow_threshold_ms=slow_threshold_ms,
         diagnostic=diagnostic,
+        physical_dags=rebuilt_physical_dags,
     )
 
     publish_started_at = time.perf_counter()
-    publish_metrics = SQLitePublishMetrics()
+    publish_metrics: DWSPublishMetrics | SQLitePublishMetrics = SQLitePublishMetrics()
     _emit_log("publish", "STARTED")
     try:
-        result = materialization_store.publish(
-            candidate,
-            instrumentation=publish_metrics,
-        )
+        if isinstance(materialization_store, DWSMaterializationStore):
+            dws_metrics = DWSPublishMetrics()
+            publish_metrics = dws_metrics
+            result = materialization_store.publish(
+                candidate,
+                physical_dags=rebuilt_physical_dags,
+                complete_snapshot=effective_complete_snapshot,
+                snapshot_scopes=resolved_snapshot_scopes,
+                instrumentation=dws_metrics,
+            )
+        else:
+            sqlite_metrics = SQLitePublishMetrics()
+            publish_metrics = sqlite_metrics
+            result = materialization_store.publish(
+                candidate,
+                instrumentation=sqlite_metrics,
+            )
     except Exception as error:
         _emit_log(
             "publish",
@@ -909,15 +972,22 @@ def materialize_sources(
             elapsed_ms=_elapsed_ms(publish_started_at),
         )
         raise
+    publish_summary: dict[str, object] = {
+        "batch_id": _safe_batch_id(result.batch_id),
+        "edges": result.edge_count,
+        "issues": result.issue_count,
+        "previous": (
+            _safe_batch_id(result.previous_batch_id)
+            if result.previous_batch_id
+            else "-"
+        ),
+    }
+    if isinstance(result, DWSPublishResult):
+        publish_summary["business_edges"] = result.business_edge_count
     _emit_log(
         "publish",
         "SUCCESS",
-        batch_id=_safe_batch_id(result.batch_id),
-        edges=result.edge_count,
-        issues=result.issue_count,
-        previous=_safe_batch_id(result.previous_batch_id)
-        if result.previous_batch_id
-        else "-",
+        **publish_summary,
         **_publish_metric_fields(publish_metrics),
         elapsed_ms=_elapsed_ms(publish_started_at),
     )
@@ -949,12 +1019,10 @@ def _selected_providers(
 
 def _provider_snapshot_complete(provider: ProgramSourceProvider) -> bool:
     value = getattr(provider, "snapshot_complete", None)
-    if value is False:
+    if isinstance(value, bool) and not value:
         return False
     status = getattr(provider, "snapshot_status", None)
-    if isinstance(status, str) and status in {"PARTIAL", "FAILED"}:
-        return False
-    return True
+    return not (isinstance(status, str) and status in {"PARTIAL", "FAILED"})
 
 
 def _provider_diagnostic_reasons(provider: ProgramSourceProvider) -> str:
@@ -1061,6 +1129,18 @@ def build_parser() -> argparse.ArgumentParser:
         description=("Build lineage facts and emit a sanitized parser coverage report.")
     )
     parser.add_argument(
+        "--store",
+        choices=("sqlite", "dws"),
+        default="sqlite",
+        help="materialization backend; sqlite is the backward-compatible default",
+    )
+    parser.add_argument(
+        "--dws-profile",
+        default=os.getenv("PYTOOLS_LINEAGE_DWS_PROFILE") or None,
+        metavar="DATABASE_PROFILE",
+        help="database profile used by the DWS backend",
+    )
+    parser.add_argument(
         "--db-path",
         type=Path,
         default=MATERIALIZATION_DB_PATH,
@@ -1118,6 +1198,8 @@ def cli(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     return main(
         db_path=args.db_path,
+        store_backend=args.store,
+        dws_profile=args.dws_profile,
         coverage_report_path=args.coverage_report,
         force_rebuild=args.force_rebuild,
         progress_every=args.progress_every,
@@ -1135,6 +1217,9 @@ def main(
     batch_id: str | None = None,
     observed_at: datetime | None = None,
     job_keys: Mapping[str, str] | None = None,
+    store: SQLiteMaterializationStore | DWSMaterializationStore | None = None,
+    store_backend: str = "sqlite",
+    dws_profile: str | None = None,
     complete_snapshot: bool = True,
     snapshot_scopes: Iterable[
         SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]
@@ -1204,6 +1289,9 @@ def main(
             db_path=db_path,
             batch_id=batch_id,
             observed_at=observed_at,
+            store=store,
+            store_backend=store_backend,
+            dws_profile=dws_profile,
             job_keys=job_keys,
             complete_snapshot=effective_complete_snapshot,
             snapshot_scopes=resolved_scopes or None,
@@ -1232,12 +1320,17 @@ def main(
             _emit_log("coverage", "FAILED", reason="REPORT_WRITE_FAILED")
     for coverage_line in coverage_report.log_lines():
         print(coverage_line, flush=True)
+    job_summary: dict[str, object] = {
+        "batch_id": _safe_batch_id(result.batch_id),
+        "edges": result.edge_count,
+        "issues": result.issue_count,
+    }
+    if isinstance(result, DWSPublishResult):
+        job_summary["business_edges"] = result.business_edge_count
     _emit_log(
         "job",
         "SUCCESS",
-        batch_id=_safe_batch_id(result.batch_id),
-        edges=result.edge_count,
-        issues=result.issue_count,
+        **job_summary,
         elapsed_ms=_elapsed_ms(job_started_at),
     )
     return 0

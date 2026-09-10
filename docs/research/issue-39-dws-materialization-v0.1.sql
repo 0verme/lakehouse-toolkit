@@ -1,11 +1,11 @@
--- Issue #39 DWS Materialization Schema v0.2
+-- Issue #39 DWS Materialization Schema v0.3 / writer contract
 --
 -- EXECUTABLE SMOKE SCHEMA
 --
--- This version is based on real intranet DWS validation.
+-- This public contract is based on the completed DWS reconnaissance.
 -- Goal: keep the first production schema simple enough to CREATE / INSERT / SELECT reliably.
 --
--- Intentionally omitted in v0.2:
+-- Intentionally omitted in v0.3 smoke schema:
 --   - PRIMARY KEY
 --   - UNIQUE constraints / unique indexes
 --   - CHECK constraints
@@ -18,7 +18,7 @@
 --
 -- Target:
 --   Engine: GaussDB / DWS
---   Database: czcb
+--   Database: supplied by deployment configuration (no real database name in public DDL)
 --   Schema: dwp
 --
 -- Notes:
@@ -46,8 +46,7 @@ CREATE TABLE dwp.lineage_batch (
     published_at         TIMESTAMP(6) WITH TIME ZONE,
 
     program_count        BIGINT DEFAULT 0,
-    physical_edge_count  BIGINT DEFAULT 0,
-    business_edge_count  BIGINT DEFAULT 0,
+    edge_count           BIGINT DEFAULT 0,
     issue_count          BIGINT DEFAULT 0,
 
     is_active            BOOLEAN DEFAULT FALSE,
@@ -115,6 +114,7 @@ CREATE TABLE dwp.lineage_edge (
     source_table            VARCHAR(512) NOT NULL,
     target_table            VARCHAR(512) NOT NULL,
 
+    -- Values: formal_asset / temporary_asset; TMP rows keep NULL dataset keys.
     source_node_kind        VARCHAR(32),
     target_node_kind        VARCHAR(32),
 
@@ -144,7 +144,7 @@ DISTRIBUTE BY HASH(edge_key);
 
 
 -- ============================================================================
--- 3. Business lineage
+-- 3. Collapsed business lineage
 -- ============================================================================
 --
 -- Derived from physical lineage by collapsing safe TMP paths.
@@ -213,12 +213,15 @@ CREATE TABLE dwp.lineage_issue (
 
     issue_type              VARCHAR(128) NOT NULL,
 
-    confidence              VARCHAR(16),
-    rule_version            VARCHAR(256),
+    -- Confidence values follow Issue #36: HIGH / MEDIUM / LOW / UNKNOWN.
+    confidence              VARCHAR(16) NOT NULL,
+    rule_version            VARCHAR(256) NOT NULL,
 
-    severity                VARCHAR(32),
-    disposition             VARCHAR(32),
-    policy_version          VARCHAR(256),
+    -- Severity is policy-defined; disposition values follow Issue #36:
+    -- OPEN / ACCEPTED / FALSE_POSITIVE / RESOLVED.
+    severity                VARCHAR(32) NOT NULL,
+    disposition             VARCHAR(32) NOT NULL,
+    policy_version          VARCHAR(256) NOT NULL,
 
     node_key                VARCHAR(512),
     branch_sink             VARCHAR(512),

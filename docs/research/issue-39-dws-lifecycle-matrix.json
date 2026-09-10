@@ -1,20 +1,28 @@
 {
   "contract": "issue-39-dws-materialization",
-  "version": "0.1",
-  "status": "design-only",
-  "active_boundary": "one batch_id shared by lineage_batch, lineage_program_state, lineage_edge, and lineage_issue",
+  "version": "0.3",
+  "status": "writer-contract",
+  "tables": [
+    "lineage_batch",
+    "lineage_program_state",
+    "lineage_edge",
+    "lineage_business_edge",
+    "lineage_issue"
+  ],
+  "active_boundary": "one batch_id shared by lineage_batch, lineage_program_state, lineage_edge, lineage_business_edge, and lineage_issue",
   "invariants": [
     "A successful active snapshot has one shared batch_id across formal direct lineage and audit facts.",
-    "ProgramPhysicalDAG is the runtime physical fact graph: TMP, cycles, self-reference and orphan branches remain available to audit/materialization; it is not a second DWS raw-edge table.",
-    "dwp.lineage_edge stores the current LineageEdge semantic: program-scoped TMP collapse produces formal direct endpoints and stops at the first formal asset boundary.",
-    "TMP endpoints are forbidden in dwp.lineage_edge; TMP may remain in ProgramPhysicalDAG and bounded lineage_edge evidence.",
+    "ProgramPhysicalDAG is the runtime physical fact graph: TMP, cycles, self-reference and orphan branches remain available to audit/materialization.",
+    "dwp.lineage_edge stores direct ProgramPhysicalDAG PhysicalEdge rows and may contain TMP endpoints.",
+    "dwp.lineage_business_edge stores the existing LineageEdge semantic: program-scoped TMP collapse produces formal direct endpoints and stops at the first formal asset boundary.",
+    "TMP endpoints are forbidden in dwp.lineage_business_edge; TMP may remain in dwp.lineage_edge.",
     "A fact is active only when its is_active flag and its joined lineage_batch.is_active flag are true.",
     "A row_key is unique per physical row and may contain batch_id; stable edge_key and other stable identity keys are batch-independent.",
     "A partial snapshot has no disappearance authority outside its declared scope.",
     "An unverified TMP collapse/materialization failure fails closed and cannot replace the previous active snapshot.",
-    "A successful empty snapshot is still a published active batch with zero lineage_edge rows.",
-    "Each fact table enforces row_key primary-key uniqueness and (batch_id, stable identity) uniqueness; the writer repeats duplicate validation before active switch.",
-    "TMP rename, physical route, evidence order, source hash, or pipeline version changes do not update lineage-edge last_changed_at when the stable formal direct identity is unchanged.",
+    "A successful empty snapshot is still a published active batch with zero physical and business edge rows.",
+    "The smoke schema defers database constraints; the writer repeats row_key and stable-identity duplicate validation for every fact table before active switch.",
+    "TMP rename, physical route, evidence order, source hash, or pipeline version changes do not update formal business-edge last_changed_at when its stable direct identity is unchanged.",
     "Retention deletes only complete retired partitions beyond the configured horizon; active and rollback-window snapshots remain protected."
   ],
   "states": [
@@ -23,6 +31,7 @@
       "batch_status": "CANDIDATE",
       "active_batch": false,
       "lineage_edge_active": false,
+      "lineage_business_edge_active": false,
       "issue_active": false,
       "meaning": "Rows are being inserted and validated inside the publish transaction; readers must not see them as current."
     },
@@ -31,14 +40,16 @@
       "batch_status": "PUBLISHED",
       "active_batch": true,
       "lineage_edge_active": true,
+      "lineage_business_edge_active": true,
       "issue_active": true,
-      "meaning": "The four tables passed same-batch validation and the snapshot is the sole current projection."
+      "meaning": "The five tables passed same-batch validation and the snapshot is the sole current projection."
     },
     {
       "id": "retired",
       "batch_status": "RETIRED",
       "active_batch": false,
       "lineage_edge_active": false,
+      "lineage_business_edge_active": false,
       "issue_active": false,
       "meaning": "Historical rows remain readable by explicit batch_id but do not participate in current queries."
     }
@@ -53,47 +64,57 @@
       "publish": true,
       "active_result": "new batch is active with edge_count=0",
       "deletion_authority": "declared full scope only",
-      "same_batch": true
+      "same_batch": true,
+      "business_edge_result": "zero dwp.lineage_business_edge rows",
+      "physical_edge_result": "zero dwp.lineage_edge rows"
     },
     {
       "id": "program_build_success",
       "input": "ProgramSource build, audit and existing Phase 5 TMP collapse complete",
       "program_physical_dag_result": "all direct physical edges, including TMP endpoints, cycles and orphan facts, remain in the runtime DAG",
-      "lineage_edge_result": "formal direct LineageEdge rows after program-scoped TMP collapse",
+      "lineage_edge_result": "direct physical rows from ProgramPhysicalDAG, including TMP endpoints",
       "issue_result": "audit issues, if any, use the same batch_id",
       "publish": true,
       "active_result": "lineage_edge and issue rows switch active with program state in one batch",
-      "same_batch": true
+      "same_batch": true,
+      "business_edge_result": "formal direct LineageEdge rows after existing program-scoped TMP collapse",
+      "physical_edge_result": "all direct physical edges, including TMP endpoints, are written to dwp.lineage_edge"
     },
     {
       "id": "tmp_chain_collapse",
       "input": "A -> TMP1 -> TMP2 -> B within one program, where A and B are formal DatasetIdentity values",
       "program_physical_dag_result": "A -> TMP1 -> TMP2 -> B is retained as runtime physical facts",
-      "lineage_edge_result": "one dwp.lineage_edge row A -> B; neither endpoint is TMP",
+      "lineage_edge_result": "three dwp.lineage_edge direct rows retain A -> TMP1 -> TMP2 -> B",
       "issue_result": "no transitive edge beyond B is emitted",
       "publish": true,
       "active_result": "the collapsed formal direct fact is published with the same batch_id",
-      "same_batch": true
+      "same_batch": true,
+      "business_edge_result": "one dwp.lineage_business_edge row A -> B; neither endpoint is TMP",
+      "physical_edge_result": "three dwp.lineage_edge direct rows retain A -> TMP1 -> TMP2 -> B"
     },
     {
       "id": "formal_boundary_stop",
       "input": "A -> FORMAL_B -> TMP -> FORMAL_C within one program",
       "program_physical_dag_result": "all four runtime nodes and three direct physical edges remain available",
-      "lineage_edge_result": "A -> FORMAL_B and FORMAL_B -> FORMAL_C; A -> FORMAL_C is forbidden",
+      "lineage_edge_result": "three dwp.lineage_edge direct rows retain every physical hop",
       "issue_result": "no guessed transitive edge is emitted",
       "publish": true,
       "active_result": "both formal direct facts use the same batch_id",
-      "same_batch": true
+      "same_batch": true,
+      "business_edge_result": "A -> FORMAL_B and FORMAL_B -> FORMAL_C; A -> FORMAL_C is forbidden",
+      "physical_edge_result": "three dwp.lineage_edge direct rows retain all physical hops"
     },
     {
       "id": "known_negative_materialization",
       "input": "Physical graph contains a classified orphan/cycle/self-reference or unresolved path with no safe formal direct edge",
       "program_physical_dag_result": "physical facts remain in the runtime DAG for audit and diagnosis",
-      "lineage_edge_result": "affected formal direct edge is absent; no guessed TMP/formal endpoint is emitted",
+      "lineage_edge_result": "physical rows remain available; no guessed business endpoint is emitted",
       "issue_result": "same-batch audit issue explains the classified negative result",
       "publish": true,
       "active_result": "publish is allowed only after the existing materialization result is complete and deterministic",
-      "same_batch": true
+      "same_batch": true,
+      "business_edge_result": "affected formal direct edge is absent; no guessed TMP/formal endpoint is emitted",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "lineage_materialization_failure",
@@ -104,7 +125,9 @@
       "publish": false,
       "active_result": "previous successful snapshot remains complete and active",
       "same_batch": true,
-      "rollback": true
+      "rollback": true,
+      "business_edge_result": "candidate is not promoted",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "failed_publish",
@@ -115,7 +138,9 @@
       "publish": false,
       "active_result": "previous active batch is unchanged",
       "same_batch": true,
-      "rollback": true
+      "rollback": true,
+      "business_edge_result": "candidate dwp.lineage_business_edge rows rollback",
+      "physical_edge_result": "candidate dwp.lineage_edge rows rollback"
     },
     {
       "id": "duplicate_program_identity",
@@ -126,18 +151,22 @@
       "publish": false,
       "active_result": "previous active batch remains readable",
       "same_batch": true,
-      "reject_duplicate_stable_identity": true
+      "reject_duplicate_stable_identity": true,
+      "business_edge_result": "candidate rejected before active switch",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "duplicate_lineage_edge_identity",
       "input": "Two LineageEdge rows in one batch share edge_key",
       "program_physical_dag_result": "candidate input may be valid but duplicate direct facts are not merged silently",
-      "lineage_edge_result": "candidate rejected; repeated physical-path evidence must be aggregated into one formal direct row",
+      "lineage_edge_result": "candidate rejected; duplicate physical stable identity is not silently merged",
       "issue_result": "validation error",
       "publish": false,
       "active_result": "previous active batch remains readable",
       "same_batch": true,
-      "reject_duplicate_stable_identity": true
+      "reject_duplicate_stable_identity": true,
+      "business_edge_result": "candidate rejected; repeated physical-path evidence must be aggregated into one formal direct row",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "cross_profile_isolation",
@@ -148,7 +177,9 @@
       "publish": true,
       "active_result": "one new active batch contains both profiles without merging their program keys",
       "same_batch": true,
-      "deletion_authority": "profile_A only if explicitly complete; never profile_B"
+      "deletion_authority": "profile_A only if explicitly complete; never profile_B",
+      "business_edge_result": "profile_A is rebuilt/rebased; profile_B formal direct facts are copied to the new candidate",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "inactive_edge_contamination",
@@ -159,7 +190,9 @@
       "publish": true,
       "active_result": "N-1 cannot contaminate N",
       "same_batch": true,
-      "query_requires_active_batch_join": true
+      "query_requires_active_batch_join": true,
+      "business_edge_result": "current business query joins active lineage_batch and filters dwp.lineage_business_edge",
+      "physical_edge_result": "current query joins active lineage_batch and filters dwp.lineage_edge"
     },
     {
       "id": "partial_snapshot_scoped_deletion",
@@ -170,7 +203,9 @@
       "publish": true,
       "active_result": "absence is not interpreted as deletion outside scope",
       "same_batch": true,
-      "deletion_authority": "none outside declared complete scope"
+      "deletion_authority": "none outside declared complete scope",
+      "business_edge_result": "omitted program formal direct facts are rebased unless inside an explicitly complete scope",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "full_snapshot_scoped_disappearance",
@@ -181,7 +216,9 @@
       "publish": true,
       "active_result": "scoped disappearance is effective; historical batch remains readable",
       "same_batch": true,
-      "deletion_authority": "declared environment/source_profile scope"
+      "deletion_authority": "declared environment/source_profile scope",
+      "business_edge_result": "program formal direct facts are absent from the new active candidate in that scope",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "incremental_reuse",
@@ -192,7 +229,9 @@
       "publish": true,
       "active_result": "stable keys stay equal; row_keys change because batch_id changes",
       "same_batch": true,
-      "rebuild": false
+      "rebuild": false,
+      "business_edge_result": "formal direct facts are rebased to the new batch without rebuilding",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "source_hash_change",
@@ -203,7 +242,9 @@
       "publish": true,
       "active_result": "program_key and edge_key may remain stable; evidence metadata may change without changing formal identity",
       "same_batch": true,
-      "rebuild": true
+      "rebuild": true,
+      "business_edge_result": "formal direct facts rebuild from the new materialization result; no one-layer reuse",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "pipeline_version_rebuild",
@@ -214,18 +255,22 @@
       "publish": true,
       "active_result": "no reuse based on hash alone",
       "same_batch": true,
-      "rebuild": true
+      "rebuild": true,
+      "business_edge_result": "formal direct facts rebuild from the new materialization result",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "tmp_rename",
       "input": "TMP node name changes while formal direct source and target stay equal",
       "program_physical_dag_result": "physical node/edge labels change in the runtime DAG",
-      "lineage_edge_result": "edge_key stays equal for the same formal direct identity; bounded collapse evidence may change and never exposes TMP as an endpoint",
+      "lineage_edge_result": "physical edge keys follow the changed TMP labels; formal business identity remains stable",
       "issue_result": "no basename-only merge; diagnostics remain tied to physical evidence",
       "publish": true,
       "active_result": "formal direct identity is stable; last_changed_at remains unchanged",
       "same_batch": true,
-      "stable_lineage_identity": true
+      "stable_lineage_identity": true,
+      "business_edge_result": "edge_key stays equal for the same formal direct identity; bounded collapse evidence may change and never exposes TMP as an endpoint",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     },
     {
       "id": "physical_path_change_same_endpoint",
@@ -236,7 +281,9 @@
       "publish": true,
       "active_result": "formal direct identity remains stable; last_changed_at remains unchanged",
       "same_batch": true,
-      "stable_lineage_identity": true
+      "stable_lineage_identity": true,
+      "business_edge_result": "one same business_edge_key is rebuilt and bounded evidence is refreshed",
+      "physical_edge_result": "new direct physical rows replace the current batch projection"
     },
     {
       "id": "restore_after_scoped_disappearance",
@@ -246,7 +293,14 @@
       "issue_result": "old issue history is not silently mutated",
       "publish": true,
       "active_result": "restore is not rename inference; first_seen follows #38 restore semantics",
-      "same_batch": true
+      "same_batch": true,
+      "business_edge_result": "new candidate rows use the current batch and safe formal direct materialization",
+      "physical_edge_result": "physical direct rows follow ProgramPhysicalDAG.edges; TMP endpoints remain representable"
     }
+  ],
+  "notes": [
+    "lineage_edge is the physical direct projection and may contain TMP endpoints.",
+    "lineage_business_edge is the existing formal direct LineageEdge projection; the writer does not re-run TMP collapse.",
+    "edge_count is the physical lineage_edge count; the batch schema has no physical_edge_count or business_edge_count aliases (publish results may report business_edge_count separately)."
   ]
 }
