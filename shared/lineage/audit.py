@@ -23,6 +23,8 @@ from shared.lineage.domain import (
     PhysicalEdge,
     PhysicalNode,
     PhysicalNodeKind,
+    is_business_asset,
+    is_technical_asset,
     is_temporary_asset,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
@@ -174,11 +176,11 @@ class AuditPolicyResult:
 
     @property
     def issue_type(self) -> IssueType:
-        return self.fact.issue_type
+        return IssueType(self.fact.issue_type)
 
     @property
     def confidence(self) -> AuditConfidence:
-        return self.fact.confidence
+        return AuditConfidence(self.fact.confidence)
 
     @property
     def rule_version(self) -> str:
@@ -920,6 +922,30 @@ def _node_kind_value(
     return PhysicalNodeKind.FORMAL_ASSET.value
 
 
+def _is_business_sink(
+    sink: str,
+    node_map: Mapping[str, PhysicalNode],
+    *,
+    environment: str,
+) -> bool:
+    node = node_map.get(sink)
+    asset_name = node.asset_name if node is not None else sink
+    return is_business_asset(asset_name, environment=environment)
+
+
+def _is_technical_sink(
+    sink: str,
+    node_map: Mapping[str, PhysicalNode],
+    *,
+    environment: str,
+) -> bool:
+    node = node_map.get(sink)
+    if node is not None and node.kind is PhysicalNodeKind.TEMPORARY_ASSET:
+        return False
+    asset_name = node.asset_name if node is not None else sink
+    return is_technical_asset(asset_name, environment=environment)
+
+
 def compute_lineage_issue_stable_key(
     environment: str,
     source_profile: str,
@@ -1058,6 +1084,16 @@ class ProgramLineageAuditor:
             if _node_kind_value(sink, node_map) == PhysicalNodeKind.FORMAL_ASSET.value
         )
         formal_sinks = _unique_sorted(formal_sink_candidates)
+        business_sink_candidates = tuple(
+            sink
+            for sink in formal_sink_candidates
+            if _is_business_sink(
+                sink,
+                node_map,
+                environment=dag.program_source.environment,
+            )
+        )
+        business_sinks = _unique_sorted(business_sink_candidates)
         temporary_sinks = tuple(
             sink
             for sink in sinks
@@ -1068,7 +1104,7 @@ class ProgramLineageAuditor:
         target_selection = select_materialization_target(
             authoritative_target=dag.expected_target,
             target_hint=dag.program_source.target_hint,
-            formal_sinks=formal_sink_candidates,
+            formal_sinks=business_sink_candidates,
         )
 
         facts: list[AuditFact] = []
@@ -1131,33 +1167,66 @@ class ProgramLineageAuditor:
                 )
             )
 
-        if len(sinks) > 1:
+        technical_sink_present = any(
+            _is_technical_sink(
+                sink,
+                node_map,
+                environment=dag.program_source.environment,
+            )
+            for sink in sinks
+        )
+        all_sinks_are_technical = bool(sinks) and all(
+            _is_technical_sink(
+                sink,
+                node_map,
+                environment=dag.program_source.environment,
+            )
+            for sink in sinks
+        )
+        if len(sinks) > 1 and not all_sinks_are_technical:
             expected_text = dag.expected_target or "unknown"
+            if technical_sink_present:
+                multi_sink_message = (
+                    f"Program {dag.program_source.program_name} has "
+                    f"{len(sinks)} candidate sinks ({', '.join(sinks)}); "
+                    f"Business candidates are {', '.join(business_sinks) or 'none'}; "
+                    f"expected target is {expected_text}."
+                )
+            else:
+                multi_sink_message = (
+                    f"Program {dag.program_source.program_name} has "
+                    f"{len(sinks)} candidate sinks ({', '.join(sinks)}); "
+                    f"expected target is {expected_text}."
+                )
+            multi_sink_evidence: dict[str, object] = {
+                "sink_count": len(sinks),
+                "sinks": list(sinks),
+                "sorted_sinks": list(sinks),
+                "formal_sinks": list(formal_sinks),
+                "temporary_sinks": list(temporary_sinks),
+                "sink_kinds": sink_kinds,
+                "expected_target": dag.expected_target,
+                "authoritative_target": target_selection.authoritative_target,
+                "target_hint": target_selection.target_hint,
+                "hint_match_count": target_selection.hint_match_count,
+                "selected_materialization_target": (
+                    target_selection.selected_materialization_target
+                ),
+                "selection_mode": target_selection.selection_mode.value,
+            }
+            if technical_sink_present:
+                multi_sink_evidence.update(
+                    {
+                        "business_sinks": list(business_sinks),
+                        "all_sinks": list(sinks),
+                    }
+                )
             facts.append(
                 _make_fact(
                     dag,
                     IssueType.MULTI_SINK_CANDIDATE,
-                    message=(
-                        f"Program {dag.program_source.program_name} has "
-                        f"{len(sinks)} candidate sinks ({', '.join(sinks)}); "
-                        f"expected target is {expected_text}."
-                    ),
-                    evidence={
-                        "sink_count": len(sinks),
-                        "sinks": list(sinks),
-                        "sorted_sinks": list(sinks),
-                        "formal_sinks": list(formal_sinks),
-                        "temporary_sinks": list(temporary_sinks),
-                        "sink_kinds": sink_kinds,
-                        "expected_target": dag.expected_target,
-                        "authoritative_target": target_selection.authoritative_target,
-                        "target_hint": target_selection.target_hint,
-                        "hint_match_count": target_selection.hint_match_count,
-                        "selected_materialization_target": (
-                            target_selection.selected_materialization_target
-                        ),
-                        "selection_mode": target_selection.selection_mode.value,
-                    },
+                    message=multi_sink_message,
+                    evidence=multi_sink_evidence,
                 )
             )
 
@@ -1169,6 +1238,7 @@ class ProgramLineageAuditor:
             expected_target is not None and expected_target in sinks
         )
         actual_formal_sinks = list(formal_sinks)
+        actual_business_sinks = list(business_sinks)
         # ``sinks`` is a graph-terminal fact.  A written target that is not
         # terminal must be explained by its graph facts, not relabeled as a
         # target mismatch.  In particular, a self-loop must not imply that the
@@ -1178,19 +1248,20 @@ class ProgramLineageAuditor:
             and not expected_target_is_sink
             and not expected_target_written
         ):
-            if actual_formal_sinks:
+            if actual_business_sinks:
                 facts.append(
                     _make_fact(
                         dag,
                         IssueType.TARGET_MISMATCH,
                         message=(
                             f"Program {dag.program_source.program_name} writes "
-                            f"formal sink(s) {', '.join(actual_formal_sinks)} "
+                            f"Business sink(s) {', '.join(actual_business_sinks)} "
                             f"instead of expected target {expected_target}."
                         ),
                         evidence={
                             "expected_target": expected_target,
                             "actual_formal_sinks": actual_formal_sinks,
+                            "actual_business_sinks": actual_business_sinks,
                             "all_sinks": list(sinks),
                             "written_targets": list(written_targets),
                             "expected_target_written": False,
@@ -1205,7 +1276,7 @@ class ProgramLineageAuditor:
                         IssueType.TARGET_NOT_FOUND,
                         message=(
                             f"Program {dag.program_source.program_name} did not "
-                            f"write expected target {expected_target}; no formal "
+                            f"write expected target {expected_target}; no Business "
                             "result sink was found."
                         ),
                         evidence={
@@ -1213,6 +1284,7 @@ class ProgramLineageAuditor:
                             "written_targets": list(written_targets),
                             "sinks": list(sinks),
                             "formal_sinks": actual_formal_sinks,
+                            "business_sinks": actual_business_sinks,
                             "temporary_sinks": list(temporary_sinks),
                         },
                     )

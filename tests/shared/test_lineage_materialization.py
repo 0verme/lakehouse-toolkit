@@ -47,6 +47,7 @@ from tests.fixtures.lineage.pathological_materialization import (
     make_parallel_tmp_dag,
 )
 from tests.fixtures.lineage.phase5_materialization_programs import (  # pyright: ignore[reportMissingImports]
+    BUSINESS_THROUGH_TECHNICAL_PROGRAM,
     CYCLE_PROGRAM,
     DIRECT_FORMAL_EDGE_PROGRAM,
     DUPLICATE_PHYSICAL_PATHS_PROGRAM,
@@ -57,6 +58,8 @@ from tests.fixtures.lineage.phase5_materialization_programs import (  # pyright:
     ORPHAN_BRANCH_PROGRAM,
     SELF_REFERENCE_PROGRAM,
     SINGLE_TMP_PROGRAM,
+    TECHNICAL_ONLY_MULTI_SINK_PROGRAM,
+    TECHNICAL_TO_DWF_PROGRAM,
     TMP_FANOUT_PROGRAM,
     UNKNOWN_TARGET_PROGRAM,
 )
@@ -230,6 +233,93 @@ def legacy_collapse_paths_to_edges(
 
 
 class LineageMaterializationTests(unittest.TestCase):
+    def test_technical_chain_to_dwf_has_no_business_edge(self):
+        dag = build_dag(
+            TECHNICAL_TO_DWF_PROGRAM,
+            expected_target="DWF.DEMO_RESULT",
+        )
+        result = materialize_program(
+            dag,
+            batch_id="batch-business-boundary-technical",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            dag.edge_pairs,
+            {
+                ("DLO.DEMO_SOURCE", "DWO.DEMO_STAGE"),
+                ("DWO.DEMO_STAGE", "DWF.DEMO_RESULT"),
+            },
+        )
+        self.assertEqual(result.edges, ())
+        self.assertEqual(result.issues, ())
+
+    def test_business_assets_through_technical_nodes_collapse_to_business_edge(self):
+        result = materialize_program(
+            build_dag(
+                BUSINESS_THROUGH_TECHNICAL_PROGRAM,
+                expected_target="DWM.DEMO_RESULT",
+            ),
+            batch_id="batch-business-boundary-through",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            edge_pairs(result),
+            {("DWF.DEMO_SOURCE", "DWM.DEMO_RESULT")},
+        )
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        self.assertEqual(
+            evidence["collapsed_technical_nodes"],
+            ["DLO.DEMO_STAGE", "DWO.DEMO_STAGE_2"],
+        )
+        self.assertEqual(
+            evidence["physical_edge_pairs"],
+            [
+                ["DLO.DEMO_STAGE", "DWO.DEMO_STAGE_2"],
+                ["DWF.DEMO_SOURCE", "DLO.DEMO_STAGE"],
+                ["DWO.DEMO_STAGE_2", "DWM.DEMO_RESULT"],
+            ],
+        )
+
+    def test_technical_only_multi_sink_preserves_physical_without_business_issue(self):
+        dag = build_dag(
+            TECHNICAL_ONLY_MULTI_SINK_PROGRAM,
+            expected_target=None,
+        )
+        result = materialize_program(
+            dag,
+            batch_id="batch-business-boundary-only",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(len(dag.edges), 2)
+        self.assertEqual(result.edges, ())
+        self.assertEqual(result.issues, ())
+
+    def test_create_temp_name_remains_in_tmp_evidence(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="DEMO_CREATE_TEMP_EVIDENCE",
+            script_code=(
+                "CREATE TEMPORARY TABLE SESSION_STAGE AS SELECT * FROM DWF.SOURCE;"
+                " INSERT INTO DWM.RESULT SELECT * FROM SESSION_STAGE;"
+            ),
+            expected_target="DWM.RESULT",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            batch_id="batch-create-temp-evidence",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(len(result.edges), 1)
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        self.assertEqual(evidence["collapsed_tmp_nodes"], ["SESSION_STAGE"])
+        self.assertEqual(evidence["collapsed_technical_nodes"], [])
+
     def test_single_tmp_collapses_to_one_formal_edge(self):
         result = materialize_program(
             build_dag(SINGLE_TMP_PROGRAM),
@@ -931,25 +1021,34 @@ class LineageMaterializationTests(unittest.TestCase):
                 "005:DWS_DM.RESULT_A:1:00",
                 "DM.RESULT_A",
                 "DLO.SOURCE_A",
+                False,
             ),
             (
                 "005:DWS_DWM.RESULT_A:1:00",
                 "DWM.RESULT_A",
                 "DLO.SOURCE_A",
+                False,
             ),
             (
                 "005:DWS_DWUPRR.RESULT_A:1:00",
                 "DWUPRR.RESULT_A",
                 "DWM.SOURCE_A",
+                True,
             ),
             (
                 "005:DLK_DLO.RESULT_A:1:00",
                 "DLO.RESULT_A",
                 "ODS.SOURCE_A",
+                False,
             ),
         )
 
-        for program_name, expected_target, source_table in cases:
+        for (
+            program_name,
+            expected_target,
+            source_table,
+            expect_business_edge,
+        ) in cases:
             with self.subTest(program_name=program_name):
                 source = ProgramSource(
                     environment="DEV",
@@ -978,8 +1077,13 @@ class LineageMaterializationTests(unittest.TestCase):
                 issue_types = {issue.issue_type for issue in audit.issues}
                 self.assertNotIn(IssueType.TARGET_MISMATCH, issue_types)
                 self.assertNotIn(IssueType.TARGET_NOT_FOUND, issue_types)
-                self.assertEqual(edge_pairs(result), {(source_table, expected_target)})
-                self.assertGreater(len(result.edges), 0)
+                if expect_business_edge:
+                    self.assertEqual(
+                        edge_pairs(result), {(source_table, expected_target)}
+                    )
+                    self.assertGreater(len(result.edges), 0)
+                else:
+                    self.assertEqual(result.edges, ())
 
     def test_cycle_and_self_reference_have_visited_protection(self):
         cycle = materialize_program(
@@ -1273,6 +1377,35 @@ class SQLiteMaterializationTests(unittest.TestCase):
                 }
                 self.assertIn("pipeline_version", program_state_columns)
             connection.close()
+
+    def test_legacy_technical_business_rows_are_hidden_from_sqlite_reads(self):
+        dag = build_dag(SINGLE_TMP_PROGRAM, program_name="DEMO_PROGRAM_LEGACY_TECHNICAL")
+        batch = materialize_batch(
+            [audit_dag(dag)], batch_id="batch-legacy-technical", observed_at=OBSERVED_AT
+        )
+
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "lineage.db"
+            store = SQLiteMaterializationStore(db_path)
+            store.publish(batch)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "UPDATE lineage_edge SET source_table = ?, target_table = ?",
+                    ("DLO.LEGACY_SOURCE", "DWF.LEGACY_TARGET"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(store.read_edges(active_only=True), ())
+            self.assertEqual(
+                store.read_outgoing_edges(
+                    environment="DEV",
+                    source_table="DLO.LEGACY_SOURCE",
+                ),
+                (),
+            )
 
     def test_bounded_evidence_roundtrips_through_sqlite(self):
         dag = make_parallel_tmp_dag(1000)

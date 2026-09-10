@@ -21,6 +21,9 @@ from .domain import (
     ProgramIdentity,
     ProgramNameDiagnostic,
     ProgramSource,
+    is_business_asset,
+    is_technical_asset,
+    is_temporary_asset,
 )
 from .physical_dag import ProgramPhysicalDAG
 
@@ -82,6 +85,7 @@ class _ProfileCoverageAccumulator:
     lineage_edge_count: int = 0
     lineage_programs: set[ProgramIdentity] = field(default_factory=set)
     physical_edge_programs: set[ProgramIdentity] = field(default_factory=set)
+    business_boundary_programs: set[ProgramIdentity] = field(default_factory=set)
     program_name_programs: set[ProgramIdentity] = field(default_factory=set)
     logical_target_steps: dict[str, set[int]] = field(default_factory=dict)
     target_resolved: int = 0
@@ -108,6 +112,7 @@ class ProfileCoverage:
     programs_with_physical_nodes: int
     programs_with_physical_edges: int
     programs_with_lineage_edges: int
+    programs_with_business_boundary_only: int
     sql_candidate_count: int
     sql_step_count: int
     write_target_count: int
@@ -151,6 +156,9 @@ class ProfileCoverage:
             "lineage_edge_program_ratio": _ratio(
                 self.programs_with_lineage_edges, denominator
             ),
+            "business_boundary_only_program_ratio": _ratio(
+                self.programs_with_business_boundary_only, denominator
+            ),
         }
 
     def to_dict(self) -> dict[str, object]:
@@ -168,6 +176,7 @@ class ProfileCoverage:
             "programs_with_physical_nodes": self.programs_with_physical_nodes,
             "programs_with_physical_edges": self.programs_with_physical_edges,
             "programs_with_lineage_edges": self.programs_with_lineage_edges,
+            "programs_with_business_boundary_only": self.programs_with_business_boundary_only,
             "sql_candidate_count": self.sql_candidate_count,
             "sql_step_count": self.sql_step_count,
             "write_target_count": self.write_target_count,
@@ -234,6 +243,7 @@ class LineageCoverageReport:
                 f"programs_with_physical_edges={profile.programs_with_physical_edges} "
                 f"lineage_edges={profile.lineage_edge_count} "
                 f"programs_with_lineage_edges={profile.programs_with_lineage_edges} "
+                f"programs_with_business_boundary_only={profile.programs_with_business_boundary_only} "
                 f"target_resolved={profile.target_resolved} "
                 f"target_unresolved={profile.target_unresolved} "
                 f"step_resolved={profile.step_resolved} "
@@ -353,6 +363,32 @@ class LineageCoverageAccumulator:
                     )
                 )
 
+    def observe_materialization(
+        self,
+        result: object,
+        *,
+        observe_edges: bool = True,
+    ) -> None:
+        """Observe one program result, including an intentional boundary-only result.
+
+        A program with Physical edges but no Business edges is not automatically a
+        parser/materialization failure.  The materialization result carries the
+        audited graph needed to distinguish a DLO/DWO-only path from a real
+        collapse failure; Physical coverage remains counted independently.
+        """
+
+        from .materialization import ProgramMaterialization
+
+        if not isinstance(result, ProgramMaterialization):
+            raise TypeError("result must be a ProgramMaterialization")
+        self._finalized_lineage_failures = False
+        if observe_edges:
+            self.observe_materialized_edges(result.edges)
+        if _is_business_boundary_only(result):
+            source = result.dag.program_source
+            profile = self._profile(source.environment, source.source_profile)
+            profile.business_boundary_programs.add(source.identity)
+
     def report(
         self,
         *,
@@ -388,7 +424,11 @@ class LineageCoverageAccumulator:
             return
         for profile in self._profiles.values():
             profile.lineage_failure_reasons.clear()
-            missing = profile.physical_edge_programs - profile.lineage_programs
+            missing = (
+                profile.physical_edge_programs
+                - profile.lineage_programs
+                - profile.business_boundary_programs
+            )
             if missing:
                 profile.lineage_failure_reasons[
                     CoverageReason.NO_LINEAGE_EDGE.value
@@ -435,6 +475,52 @@ def primary_failure_reason(dag: ProgramPhysicalDAG) -> CoverageReason:
     return CoverageReason.NO_PHYSICAL_EDGE
 
 
+def _is_business_boundary_only(result: object) -> bool:
+    """Classify a clean Physical result with no Business endpoint pair."""
+
+    edges = getattr(result, "edges", ())
+    dag = getattr(result, "dag", None)
+    issues = getattr(result, "issues", ())
+    if not dag or not dag.edges or edges or issues:
+        return False
+
+    source = dag.program_source
+    node_map = {node.node_key: node for node in dag.nodes}
+    graph_nodes = set(node_map)
+    graph_nodes.update(edge.source for edge in dag.edges)
+    graph_nodes.update(edge.target for edge in dag.edges)
+    asset_names = {
+        node_key: node_map[node_key].asset_name
+        if node_key in node_map
+        else node_key
+        for node_key in graph_nodes
+    }
+    business_nodes = {
+        node_key
+        for node_key, asset_name in asset_names.items()
+        if is_business_asset(asset_name, environment=source.environment)
+    }
+    technical_nodes = {
+        node_key
+        for node_key, asset_name in asset_names.items()
+        if is_technical_asset(asset_name, environment=source.environment)
+    }
+    if not technical_nodes or len(business_nodes) > 1:
+        return False
+    # Only hide the intentional DLO/DWO boundary.  Unknown references or a
+    # TMP-only graph must remain a real NO_LINEAGE_EDGE coverage candidate.
+    non_business_nodes = graph_nodes - business_nodes
+    return all(
+        node_key in technical_nodes
+        or (
+            node_map.get(node_key) is not None
+            and node_map[node_key].is_temporary
+        )
+        or is_temporary_asset(node_key)
+        for node_key in non_business_nodes
+    )
+
+
 def write_json_report(
     report: LineageCoverageReport,
     output_path: str | Path = DEFAULT_COVERAGE_REPORT_PATH,
@@ -475,6 +561,7 @@ def _snapshot_profile(profile: _ProfileCoverageAccumulator) -> ProfileCoverage:
         programs_with_physical_nodes=profile.programs_with_physical_nodes,
         programs_with_physical_edges=profile.programs_with_physical_edges,
         programs_with_lineage_edges=len(profile.lineage_programs),
+        programs_with_business_boundary_only=len(profile.business_boundary_programs),
         sql_candidate_count=profile.sql_candidate_count,
         sql_step_count=profile.sql_step_count,
         write_target_count=profile.write_target_count,

@@ -482,6 +482,11 @@ def build_candidate_batch(
             raise RuntimeError("program observer received no materialization result")
         if physical_dags is not None:
             physical_dags.append(result.dag)
+        if coverage is not None:
+            coverage.observe_materialization(
+                result,
+                observe_edges=observe_materialized_edges,
+            )
         common_fields.update(
             {
                 "physical_nodes": len(result.dag.nodes),
@@ -524,8 +529,6 @@ def build_candidate_batch(
     )
     timing.json_safe_calls = materialization_metrics.json_safe_calls
     timing.json_dumps_calls = materialization_metrics.json_dumps_calls
-    if coverage is not None and observe_materialized_edges:
-        coverage.observe_materialized_edges(candidate.edges)
     return candidate
 
 

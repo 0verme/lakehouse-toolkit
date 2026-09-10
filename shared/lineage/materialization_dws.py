@@ -1,9 +1,9 @@
 """DWS production adapter for the existing lineage materialization pipeline.
 
 The adapter deliberately keeps DWS SQL at the repository boundary.  It receives
-an already-built :class:`MaterializationBatch` (the existing formal/business
+an already-built :class:`MaterializationBatch` (the existing Business
 projection) and the ``ProgramPhysicalDAG`` objects produced during that same
-build.  It never parses SQL or performs TMP collapse itself.
+build.  It never parses SQL or performs TMP/DLO/DWO collapse itself.
 
 The first DWS schema is an executable smoke schema without database-side
 uniqueness/check/partition/foreign-key constraints.  Consequently this module
@@ -36,6 +36,8 @@ from shared.lineage.domain import (
     ProgramIdentity,
     ProgramSource,
     ProgramState,
+    is_business_asset,
+    is_technical_asset,
     is_temporary_asset,
 )
 from shared.lineage.dws_timestamp import (
@@ -873,6 +875,11 @@ def _business_row_from_edge(
 ) -> DWSBusinessEdgeRow:
     if is_temporary_asset(edge.source_table) or is_temporary_asset(edge.target_table):
         raise ValueError("business lineage endpoints must be formal assets")
+    if not is_business_asset(edge.source_table, environment=edge.environment) or not is_business_asset(
+        edge.target_table,
+        environment=edge.environment,
+    ):
+        raise ValueError("business lineage endpoints must be Business Assets")
     if edge.program_name is None:
         raise ValueError("business edge program_name must be non-empty")
     source_identity = edge.source_dataset_identity
@@ -1167,6 +1174,8 @@ def _validate_business_row(row: DWSBusinessEdgeRow) -> DWSBusinessEdgeRow:
         or is_temporary_asset(row.target_table)
     ):
         raise ValueError("stored business edge endpoint is not formal")
+    if not is_business_asset(source_identity) or not is_business_asset(target_identity):
+        raise ValueError("stored business edge endpoint is not a Business Asset")
     if row.source_dataset_key != dataset_key(row.environment, row.source_table):
         raise ValueError("stored business source_dataset_key is inconsistent")
     if row.target_dataset_key != dataset_key(row.environment, row.target_table):
@@ -1284,6 +1293,26 @@ def _physical_from_row(row: Any) -> DWSPhysicalEdgeRow:
         raise ValueError("stored DWS physical edge is invalid") from exc
 
 
+def _is_legacy_technical_business_row(row: Any) -> bool:
+    """Exclude pre-boundary DLO/DWO rows from the Business read projection."""
+
+    try:
+        environment = _stored_required_text(row[2], "environment")
+        source_table = _stored_required_text(row[7], "source_table")
+        target_table = _stored_required_text(row[9], "target_table")
+    except (IndexError, TypeError, ValueError):
+        # Let _business_from_row report malformed persisted rows with its normal
+        # validation error instead of treating malformed data as legacy data.
+        return False
+    return is_technical_asset(
+        source_table,
+        environment=environment,
+    ) or is_technical_asset(
+        target_table,
+        environment=environment,
+    )
+
+
 def _business_from_row(row: Any) -> DWSBusinessEdgeRow:
     try:
         depth = _stored_int(row[10], "collapse_depth")
@@ -1317,6 +1346,12 @@ def _business_from_row(row: Any) -> DWSBusinessEdgeRow:
         return _validate_business_row(parsed)
     except (IndexError, TypeError, ValueError) as exc:
         raise ValueError("stored DWS business edge is invalid") from exc
+
+
+def _business_from_row_or_none(row: Any) -> DWSBusinessEdgeRow | None:
+    if _is_legacy_technical_business_row(row):
+        return None
+    return _business_from_row(row)
 
 
 def _issue_from_row(row: Any) -> DWSIssueRow:
@@ -1633,7 +1668,7 @@ class DWSMaterializationStore:
             "e", batch_id=batch_id, active_only=active_only
         )
         join = ACTIVE_BATCH_JOIN if active_only else ""
-        return self._fetch_rows(
+        rows = self._fetch_rows(
             connection,
             BUSINESS_EDGE_SELECT_SQL,
             join,
@@ -1641,8 +1676,9 @@ class DWSMaterializationStore:
             params,
             " ORDER BY e.environment, e.source_profile, e.program_name, "
             "e.source_table, e.target_table, e.business_edge_key",
-            _business_from_row,
+            _business_from_row_or_none,
         )
+        return tuple(row for row in rows if row is not None)
 
     def _fetch_issue_rows(
         self,
@@ -2115,6 +2151,12 @@ class DWSMaterializationStore:
                 raise ValueError(
                     "business edge endpoints must be formal DatasetIdentity values"
                 )
+            if not is_business_asset(source_identity) or not is_business_asset(
+                target_identity
+            ):
+                raise ValueError(
+                    "business edge endpoints must be Business Asset values"
+                )
             if is_temporary_asset(row.source_table) or is_temporary_asset(
                 row.target_table
             ):
@@ -2383,6 +2425,12 @@ class DWSMaterializationStore:
                     table_name: self._count_active(connection, table_name)
                     for table_name in visible_active_counts
                 }
+                # Old snapshots may contain DLO/DWO rows in the former
+                # Business projection.  They are intentionally omitted by
+                # _fetch_business_rows and will be retired by this publish;
+                # compare the visible Business projection rather than counting
+                # those legacy rows as current facts.
+                stored_active_counts["lineage_business_edge"] = len(previous_business)
                 if stored_active_counts != visible_active_counts:
                     raise ValueError(
                         "active projections are not attached to the active batch: "
@@ -2673,9 +2721,9 @@ class DWSMaterializationStore:
                 tuple(params),
                 " ORDER BY e.environment, e.source_profile, e.source_table, "
                 "e.target_table, e.business_edge_key",
-                _business_from_row,
+                _business_from_row_or_none,
             )
-        return tuple(_business_to_edge(row) for row in rows)
+        return tuple(_business_to_edge(row) for row in rows if row is not None)
 
     def read_outgoing_edges(
         self,

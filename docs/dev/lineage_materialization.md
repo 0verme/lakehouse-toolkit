@@ -1,9 +1,10 @@
-# Lineage Phase 5：TMP 折叠与血缘落库
+# Lineage Phase 5：Business Asset Boundary、TMP/技术节点折叠与血缘落库
 
 Phase 5 消费 Phase 3 的 `ProgramPhysicalDAG` 和 Phase 4 的
-`LineageAuditResult`，完成纯的 TMP collapse、正式 direct lineage
-materialization、issue 落库和完整批次发布。它不重新解析程序、不修改 Physical
-DAG，也不替换现有生产入口。
+`LineageAuditResult`，完成纯的 Business Asset projection、TMP/DLO/DWO collapse、
+正式 direct lineage materialization、issue 落库和完整批次发布。它不重新解析程序、
+不修改 Physical DAG，也不替换现有生产入口。Business Asset Boundary 的独立 contract
+见 [`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
 
 正式 `LineageEdge` 的 endpoint 遵循
 [`lineage_dataset_identity.md`](lineage_dataset_identity.md)：只有
@@ -13,11 +14,11 @@ DAG，也不替换现有生产入口。
 `Batch != Runtime Run` 的完整边界见
 [`lineage_program_identity.md`](lineage_program_identity.md)。
 
-> **Issue #39 DWS Materialization Writer:** 本文的 Phase 5 formal direct
+> **Issue #39 DWS Materialization Writer:** 本文的 Phase 5 Business direct
 > `LineageEdge` 仍由既有 materialization 产生；DWS writer 将同一 pipeline 的
-> `ProgramPhysicalDAG` direct `PhysicalEdge` 写入 `dwp.lineage_edge`（TMP endpoint
-> 允许），并将 formal `LineageEdge` 写入 `dwp.lineage_business_edge`（TMP endpoint
-> 禁止）。writer 不重新解析 SQL 或复制 TMP collapse。五张表共用 batch/lifecycle，
+> `ProgramPhysicalDAG` direct `PhysicalEdge` 写入 `dwp.lineage_edge`（TMP/DLO/DWO
+> endpoint 允许），并将 Business `LineageEdge` 写入 `dwp.lineage_business_edge`（TMP/DLO/DWO endpoint
+> 禁止）。writer 不重新解析 SQL 或复制 TMP/DLO/DWO collapse。五张表共用 batch/lifecycle，
 > `edge_count` 统计 physical `lineage_edge` rows；跨 program/global N-hop closure
 > 属于 Issue #40。详见
 > [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
@@ -33,7 +34,8 @@ DWM.C ─────────────────↗
 DWA.D ─────────────────────────────→ DWA.F
 ```
 
-正式 `LineageEdge` 只表示正式业务资产之间的**直接**关系：
+正式 `LineageEdge` 只表示 Business Asset 之间的**直接**关系；DLO/DWO 只能留在
+Physical DAG 或 Business edge 的 collapse evidence 中：
 
 ```text
 ODS.A → DWA.F
@@ -42,16 +44,20 @@ DWM.C → DWA.F
 DWA.D → DWA.F
 ```
 
-TMP 只作为正式业务 endpoint 被禁止；它可作为 physical `lineage_edge` endpoint
-落库，并在 business `lineage_business_edge` 中由既有 collapse 结果隐藏。
+TMP、DLO、DWO 都不能作为 Business endpoint；TMP/DLO/DWO 可作为 physical
+`lineage_edge` endpoint 落库，并在 business `lineage_business_edge` 中由既有 collapse
+结果隐藏。DLO/DWO 的 boundary 规则与 normalization 见
+[`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
 
-## TMP Collapse 与正式资产边界
+## TMP/DLO/DWO Collapse 与 Business Asset 边界
 
-Collapse 从每个正式节点的 outgoing edge 开始：遇到 TMP 就继续沿路径走，第一次
-遇到正式节点便生成一条 `U → V` 并停止该路径。它不是 transitive closure。
+Collapse 从每个 Business Asset 节点的 outgoing edge 开始：遇到 TMP、DLO 或 DWO
+就继续沿路径走，第一次遇到下一个 Business Asset 便生成一条 `U → V` 并停止该路径。
+DLO/DWO 不会因为 `PhysicalNodeKind.FORMAL_ASSET` 而变成 Business boundary；该算法
+也不是 transitive closure。
 
 ```text
-A(formal) → TMP1 → TMP2 → B(formal) → TMP3 → C(formal)
+A(Business) → TMP1 → DLO.B → DWO.C → B(Business) → TMP3 → C(Business)
 ```
 
 生成：
@@ -64,27 +70,29 @@ B → C
 不会生成 `A → C`。因此：
 
 ```text
-ODS.A → DWM.B → TMP1 → DWA.C
+DWF.A → DLO.T1 → DWO.T2 → DWM.B → TMP1 → DWA.C
 ```
 
 只 materialize：
 
 ```text
-ODS.A → DWM.B
+DWF.A → DWM.B
 DWM.B → DWA.C
 ```
 
-`DWM.B` 是正式资产边界，不能被 TMP collapse 越过。
+`DWM.B` 是 Business Asset 边界，不能被 TMP/DLO/DWO collapse 越过。若路径为
+`DLO.A → DWO.B → DWF.C`，Physical rows 仍保留，但不会伪造 DLO/DWO endpoint 的
+Business edge。
 
 一个 batch/program 内相同的
 `environment + source_profile + source_table + target_table + program_name + job_key`
-只保留一个 `LineageEdge` formal direct fact；重复 physical path 会合并到同一条
+只保留一个 `LineageEdge` Business direct fact；重复 physical path 会合并到同一条
 business edge 的 deterministic `evidence.physical_paths`。每一条 raw
 `PhysicalEdge` 仍独立写入 physical projection。
 
 ### Bounded Evidence Contract
 
-`evidence.path_count` 是当前 SQLite/reference runtime 中该 formal edge 发现的完整
+`evidence.path_count` 是当前 SQLite/reference runtime 中该 Business edge 发现的完整
 collapsed physical path 数量，不是 sample 的长度。它是现有 `LineageEdge` evidence
 contract 的 runtime 字段；DWS writer 不增加专用 `path_count` 列，也不能把 bounded
 sample 映射成生产计数。为避免一个 edge 携带无限 JSON，`physical_paths` 只保留最多 `100`
@@ -93,24 +101,24 @@ sample 映射成生产计数。为避免一个 edge 携带无限 JSON，`physica
 accumulator 保留 canonical 最小 sample。`source`、`target`、程序身份、`path_count` 和
 statement evidence summary 不因 sample 截断而丢失。
 
-聚合摘要也有固定边界：`physical_edge_pairs`、`collapsed_tmp_nodes` 和
-`statement_indices` 默认各保留最多 `200` 个 canonical 值，并分别用
-`physical_edge_pairs_truncated`、`collapsed_tmp_nodes_truncated` 和
-`statement_indices_truncated` 表示截断。SQLite 仍将 evidence 作为 JSON 文本保存，
+聚合摘要也有固定边界：`physical_edge_pairs`、`collapsed_tmp_nodes`、
+`collapsed_technical_nodes` 和 `statement_indices` 默认各保留最多 `200` 个 canonical
+值，并分别用对应的 `*_truncated` 字段表示截断。SQLite 仍将 evidence 作为 JSON 文本保存，
 因此没有额外的表迁移；SQLite consumer 必须使用 runtime `path_count` 判断完整规模，
 不能用 `len(physical_paths)` 代替。DWS `lineage_edge` 接收 raw direct `PhysicalEdge`；DWS
-`lineage_business_edge` 才接收 formal direct `LineageEdge`。两个 projection 使用同
+`lineage_business_edge` 才接收 Business direct `LineageEdge`。两个 projection 使用同
 一批次和同一 program pipeline。
 
-Materialization 对无环 TMP 子图使用 deterministic DAG dynamic programming：formal
-boundary 的 exact `path_count`、能参与该 boundary 的 physical edge/node summary 都由
-reachability 和拓扑计数得到，不显式保存或遍历全部 collapsed path；随后只用 bounded
-representative traversal 生成最多 `100` 条 sample path。每个 formal edge 只创建一次
+Materialization 对无环 TMP/DLO/DWO 可折叠子图使用 deterministic DAG dynamic
+programming：Business boundary 的 exact `path_count`、能参与该 boundary 的 physical
+edge/node summary 都由 reachability 和拓扑计数得到，不显式保存或遍历全部 collapsed
+path；随后只用 bounded
+representative traversal 生成最多 `100` 条 sample path。每个 Business edge 只创建一次
 `_EdgeEvidenceAccumulator` 和一次最终 `LineageEdge`，不会执行
 `path → temporary LineageEdge → merge`。
 
-含 TMP cycle 的图无法直接把 simple-path 数量替换为普通 DAG DP，因此保留 explicit
-simple-path fallback。只有该 fallback 受 `MAX_COLLAPSED_PATHS=100000` 和
+含 TMP/DLO/DWO 可折叠节点 cycle 的图无法直接把 simple-path 数量替换为普通 DAG DP，
+因此保留 explicit simple-path fallback。只有该 fallback 受 `MAX_COLLAPSED_PATHS=100000` 和
 `MAX_COLLAPSED_TRAVERSAL_STATES=1000000` 限制，超限抛出 `LineagePathEnumerationError`
 并由 job 记录为 `PATHOLOGICAL`；无环 dense graph 不通过降低上限处理，而是保留 exact
 `path_count` 并只采 bounded evidence。`_json_safe` 同时拒绝 recursive cycle、超过
@@ -219,7 +227,7 @@ repository 可以复用 `MaterializationBatch`，不必绑定 SQLite。
 | 字段 | 含义 |
 | --- | --- |
 | `environment` / `source_profile` | 来源环境和 profile |
-| `source_table` / `target_table` | 正式上游、正式下游 |
+| `source_table` / `target_table` | Business Asset 上游、Business Asset 下游 |
 | `program_name` / `job_key` | 程序名称和可选作业 provenance；不等于 runtime Job identity |
 | `evidence_type` / `evidence` | provenance 类型和 deterministic JSON |
 | `source_hash` | Provider 提供的 source/content version 原值；增量语义见 [`lineage_program_identity.md`](lineage_program_identity.md) |
@@ -228,7 +236,7 @@ repository 可以复用 `MaterializationBatch`，不必绑定 SQLite。
 | `is_active` | 是否属于当前 active snapshot |
 
 索引覆盖 source、target、`batch_id + is_active`，并在同一 batch 上按业务 identity
-建立 unique index。TMP endpoint 在领域对象层即被拒绝。
+建立 unique index。TMP/DLO/DWO endpoint 在 Business 领域对象层即被拒绝。
 
 ### `lineage_issue`
 
@@ -271,9 +279,9 @@ batch 的 edge、issue 和 program state 都保留为 historical snapshot。`pip
 
 `shared/lineage/materialization_dws.py` 复用同一 `MaterializationBatch`，并由
 `imp_lineage_edge.py` 把本轮 rebuilt 的 `ProgramPhysicalDAG` 一并传入。它集中管理
-显式 `dwp.<table>` SQL：physical direct rows 写入 `lineage_edge`，formal direct rows
+显式 `dwp.<table>` SQL：physical direct rows 写入 `lineage_edge`，Business direct rows
 写入 `lineage_business_edge`，program state 与 Issue #36 projection 写入另外两张
-事实表。DWS 不在 adapter 内重新执行 parser 或 TMP collapse；所有 DWS connection
+事实表。DWS 不在 adapter 内重新执行 parser 或 TMP/DLO/DWO collapse；所有 DWS connection
 都来自 `gaussdb.connect_with_profile()`，profile/password 不写入日志。
 
 CLI 默认保持 SQLite；只有 `--store dws --dws-profile <DATABASE_PROFILE>` 才启用

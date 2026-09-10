@@ -117,12 +117,12 @@ Fake backend contract test 对同一个 `SqlAnalysis` 走完整的 SQLStep → P
 Audit → Materialization 链路，比较 sources、target、statement type、parse reason、
 edge 和 issue 结果。
 
-`LINEAGE_PIPELINE_VERSION` 保持当前的
-`lineage-pipeline-v8-program-target-hint-selection`：本次只是 adapter layer，默认
-输入到下游的事实没有变化，不应无理由让增量 cache rebuild。`legacy-parser-v1` 是
-backend metadata，不会单独改变现有 pipeline cache identity。将来若 production
-backend 的事实语义改变，必须同时说明并 bump pipeline version；shadow backend 的
-结果不应写入 production facts 或 cache。
+`LINEAGE_PIPELINE_VERSION` 当前为
+`lineage-pipeline-v9-business-asset-boundary`。就本节 parser adapter 而言仍只是
+adapter layer：默认输入到下游的事实没有变化，`legacy-parser-v1` backend metadata
+不会单独改变 pipeline cache identity；v9 是后续 Business Asset Boundary/materialization
+语义变更带来的版本升级。将来若 production backend 的事实语义改变，必须同时说明并
+bump pipeline version；shadow backend 的结果不应写入 production facts 或 cache。
 
 adapter 只增加一次轻量 `SqlAnalysis` 对象和 metadata，不进行第二次 SQL parse，也
 不保存源码。默认 backend 不引入 SQLGlot/SQLLineage；因此预期性能影响为微小的
