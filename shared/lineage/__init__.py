@@ -103,6 +103,17 @@ from .domain import (
     parse_declared_primary_target,
     parse_program_name,
 )
+from .environment_scope import (
+    DISABLED_LINEAGE_ENVIRONMENT,
+    LINEAGE_SCOPE_CONFIG_INVALID,
+    LINEAGE_SCOPE_CONFIG_NOT_FOUND,
+    UNKNOWN_LINEAGE_ENVIRONMENT,
+    LineageEnvironmentScope,
+    LineageEnvironmentScopeError,
+    LineageEnvironmentScopeResolver,
+    load_lineage_environment_scope_resolver,
+    load_lineage_environment_scopes,
+)
 from .evolution import (  # pyright: ignore[reportMissingImports]
     BatchMetadata,
     BusinessLineageEdge,
@@ -368,6 +379,15 @@ __all__ = [
     "physical_edge_key",
     "program_key",
     "ActiveSnapshotNotFoundError",
+    "DISABLED_LINEAGE_ENVIRONMENT",
+    "LINEAGE_SCOPE_CONFIG_INVALID",
+    "LINEAGE_SCOPE_CONFIG_NOT_FOUND",
+    "UNKNOWN_LINEAGE_ENVIRONMENT",
+    "LineageEnvironmentScope",
+    "LineageEnvironmentScopeError",
+    "LineageEnvironmentScopeResolver",
+    "load_lineage_environment_scope_resolver",
+    "load_lineage_environment_scopes",
     "LineageReconciliationError",
     "LineageReconciliationResult",
     "LineageReconciliationRow",
