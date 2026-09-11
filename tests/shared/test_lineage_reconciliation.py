@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from shared.lineage.domain import LineageEdge
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
     ReconciliationStatus,
+    ReconciliationTiming,
     SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
     SQL_ACTIVE_SNAPSHOT_NOT_FOUND,
     ScheduleLineageSnapshot,
@@ -55,6 +57,7 @@ class FakeSQLReader:
         self.batch_id = batch_id
         self.scopes = scopes
         self.calls: list[tuple[str | None, bool]] = []
+        self.target_tables_calls: list[Iterable[str] | None] = []
 
     def get_active_batch_id(self) -> str | None:
         return self.batch_id
@@ -68,9 +71,14 @@ class FakeSQLReader:
         return self.scopes
 
     def read_edges(
-        self, *, batch_id: str | None = None, active_only: bool = False
+        self,
+        *,
+        batch_id: str | None = None,
+        active_only: bool = False,
+        target_tables: Iterable[str] | None = None,
     ) -> tuple[LineageEdge, ...]:
         self.calls.append((batch_id, active_only))
+        self.target_tables_calls.append(target_tables)
         return self.edges
 
 
@@ -84,15 +92,30 @@ class FakeScheduleReader:
         self.rows = rows
         self.batch_id = batch_id
         self.calls: list[tuple[str | None, bool]] = []
+        self.target_tables_calls: list[Iterable[str] | None] = []
 
     def get_active_batch_id(self) -> str | None:
         return self.batch_id
 
     def read_rows(
-        self, *, batch_id: str | None = None, active_only: bool = False
+        self,
+        *,
+        batch_id: str | None = None,
+        active_only: bool = False,
+        target_tables: Iterable[str] | None = None,
     ) -> tuple[FakeScheduleRow, ...]:
         self.calls.append((batch_id, active_only))
+        self.target_tables_calls.append(target_tables)
         return self.rows
+
+
+class FakeScheduleMetadataReader(FakeScheduleReader):
+    def __init__(self, rows, *, metadata):
+        super().__init__(rows)
+        self.metadata = metadata
+
+    def get_active_snapshot_metadata(self):
+        return self.metadata
 
 
 def sql_edge(
@@ -489,6 +512,27 @@ class ReconciliationDomainTests(unittest.TestCase):
             {"DWM.RESULT_B"},
         )
 
+    def test_multiple_target_filter_keeps_empty_target_summary(self):
+        result = reconcile_lineage_snapshots(
+            sql_snapshot(sql_edge("DWF.A", "DWM.RESULT_A")),
+            schedule_snapshot(schedule_edge("DWF.A", "DWM.RESULT_A")),
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_tables=("DWM.RESULT_A", "DWM.RESULT_EMPTY"),
+        )
+
+        self.assertEqual(
+            {summary.target_table for summary in result.target_summaries},
+            {"DWM.RESULT_A", "DWM.RESULT_EMPTY"},
+        )
+        empty = next(
+            summary
+            for summary in result.target_summaries
+            if summary.target_table == "DWM.RESULT_EMPTY"
+        )
+        self.assertEqual(empty.status, TargetSummaryStatus.CONSISTENT)
+        self.assertEqual(empty.sql_source_count, 0)
+
     def test_deterministic_target_then_source_ordering(self):
         result = reconcile_lineage_snapshots(
             sql_snapshot(
@@ -662,6 +706,32 @@ class ActiveReaderContractTests(unittest.TestCase):
         )
         self.assertEqual(snapshot.edges, (selected,))
 
+    def test_schedule_compact_metadata_proves_empty_requested_target(self):
+        row = FakeScheduleRow(
+            schedule_edge("DWF.A", "DWM.RESULT_A"),
+            "batch-schedule",
+        )
+        reader = FakeScheduleMetadataReader(
+            (row,),
+            metadata=SimpleNamespace(
+                batch_id="batch-schedule",
+                snapshot_scope=((ENVIRONMENT, PROFILE),),
+                observed_at=OBSERVED_AT,
+                is_active=True,
+            ),
+        )
+
+        snapshot = read_active_schedule_snapshot(
+            reader,
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_tables=("DWM.RESULT_B",),
+        )
+
+        self.assertEqual(snapshot.edges, ())
+        self.assertEqual(snapshot.observed_at, OBSERVED_AT)
+        self.assertEqual(reader.target_tables_calls, [("DWM.RESULT_B",)])
+
     def test_schedule_rows_from_other_scope_fail_closed(self):
         other = schedule_edge(
             "DWF.A",
@@ -700,7 +770,71 @@ class ActiveReaderContractTests(unittest.TestCase):
             )
         self.assertEqual(context.exception.code, SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
 
-    def test_combined_active_reader_reconciliation_returns_both_snapshot_ids(self):
+    def test_combined_active_reader_pushes_normalized_target_batch_and_records_timing(
+        self,
+    ):
+        sql_edges = (
+            sql_edge("DWF.A", "DWS_DWM.RESULT_A", batch_id="batch-sql"),
+            sql_edge("DWF.B", "DWM.RESULT_B", batch_id="batch-sql"),
+        )
+        schedule_rows = (
+            FakeScheduleRow(
+                schedule_edge("DWF.A", "DWS_DWM.RESULT_A"),
+                "batch-schedule",
+            ),
+            FakeScheduleRow(
+                schedule_edge("DWF.C", "DWM.RESULT_B"),
+                "batch-schedule",
+            ),
+        )
+        sql_reader = FakeSQLReader(sql_edges)
+        schedule_reader = FakeScheduleReader(schedule_rows)
+        timing = ReconciliationTiming()
+
+        result = reconcile_active_dws_lineage(
+            sql_reader,
+            schedule_reader,
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_tables=(
+                " DWS_DWM.RESULT_A ",
+                "DWM.RESULT_B",
+                "DWM.RESULT_A",
+            ),
+            timing=timing,
+        )
+
+        self.assertEqual(
+            sql_reader.target_tables_calls,
+            [("DWM.RESULT_A", "DWM.RESULT_B")],
+        )
+        self.assertEqual(
+            schedule_reader.target_tables_calls,
+            [("DWM.RESULT_A", "DWM.RESULT_B")],
+        )
+        self.assertEqual(
+            {row.target_table for row in result.rows},
+            {"DWM.RESULT_A", "DWM.RESULT_B"},
+        )
+        self.assertEqual(timing.sql_rows_read, 2)
+        self.assertEqual(timing.schedule_rows_read, 2)
+        self.assertEqual(timing.reconciliation_rows, 3)
+        self.assertGreaterEqual(timing.total_ms, 0)
+        self.assertEqual(
+            set(timing.as_dict()),
+            {
+                "sql_target_scoped_read_ms",
+                "schedule_target_scoped_read_ms",
+                "reconciliation_cpu_ms",
+                "suppression_lookup_ms",
+                "total_ms",
+                "sql_rows_read",
+                "schedule_rows_read",
+                "reconciliation_rows",
+            },
+        )
+
+    def test_combined_active_reader_returns_both_snapshot_ids(self):
         sql = sql_edge("DWF.A", "DWM.RESULT_A", batch_id="batch-sql")
         schedule = schedule_edge("DWF.A", "DWM.RESULT_A")
         result = reconcile_active_dws_lineage(
@@ -783,6 +917,22 @@ class CliReportTests(unittest.TestCase):
         self.assertEqual(args.sql_source_profile, PROFILE)
         self.assertEqual(args.schedule_source_profile, PROFILE)
         self.assertEqual(args.output_format, "json")
+
+    def test_cli_parser_accepts_repeated_targets_for_one_batch(self):
+        args = build_parser().parse_args(
+            [
+                "--environment",
+                ENVIRONMENT,
+                "--profile",
+                PROFILE,
+                "--target",
+                "DWM.RESULT_A",
+                "--target",
+                "DWM.RESULT_B",
+            ]
+        )
+
+        self.assertEqual(args.target, ["DWM.RESULT_A", "DWM.RESULT_B"])
 
     def test_cli_parser_supports_different_side_profiles(self):
         args = build_parser().parse_args(

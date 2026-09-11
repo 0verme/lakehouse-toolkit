@@ -202,6 +202,48 @@ def normalize_legacy_program_namespace(target: object) -> str | None:
     return candidate
 
 
+def normalize_lineage_comparison_table_key(value: object) -> str:
+    """Normalize a qualified table key for SQL/schedule comparison only.
+
+    Stored physical identities and DWS facts remain untouched.  The explicit
+    legacy namespace registry is reused and unknown namespaces are never
+    guessed by basename.
+    """
+
+    canonical = canonicalize_dataset_name(normalize_asset_name(decode_code(value)))
+    if canonical is None:
+        raise ValueError("comparison table must be a qualified schema.table")
+    mapped = normalize_legacy_program_namespace(canonical)
+    return canonical if mapped is None else mapped
+
+
+def normalize_program_inventory_target(program_name: object) -> str | None:
+    """Return the declared target used only by the program inventory contract.
+
+    Program inventory deliberately has a smaller, independent responsibility
+    than :func:`parse_program_name`: it reads the second segment from the
+    supported three- or four-part legacy shapes and reuses the explicit
+    namespace registry.  It never grants target authority, resolves steps, or
+    changes the legacy parser contract.  Non-legacy names do not provide
+    inventory evidence; malformed colon-delimited legacy declarations raise so
+    callers can fail open instead of suppressing an actionable row.
+    """
+
+    normalized_name = decode_code(program_name).strip()
+    if not normalized_name or ":" not in normalized_name:
+        return None
+    parts = normalized_name.split(":")
+    if parts[0].strip().upper() != PROGRAM_NAME_LEGACY_MARKER:
+        return None
+    if len(parts) not in (3, 4):
+        raise ValueError("program inventory name must have three or four segments")
+    target_token = parts[1].strip()
+    target = normalize_legacy_program_namespace(target_token)
+    if target is None:
+        raise ValueError("program inventory target is not a qualified table")
+    return target
+
+
 def _normalize_program_name_target_token(target_token: object) -> str | None:
     return normalize_legacy_program_namespace(target_token)
 

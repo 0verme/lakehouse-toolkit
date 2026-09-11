@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from shared.lineage.domain import LineageEdge
+from shared.lineage.domain import LineageEdge, ProgramState
 from shared.lineage.dws_timestamp import TIMESTAMPTZ_PARAM_SQL
 from shared.lineage.environment_scope import LineageEnvironmentScope
 from shared.lineage.reconciliation import (
@@ -18,9 +18,13 @@ from shared.lineage.reconciliation import (
 )
 from shared.lineage.reconciliation_suppression import (
     DWSReconciliationSuppressionStore,
+    LEGACY_SUPPRESSION_CLASSIFIER_VERSION,
+    ProgramInventoryStatus,
     ReconciliationSuppression,
     ReconciliationSuppressionReason,
     SUPPRESSION_CLASSIFIER_VERSION,
+    build_active_program_target_inventory,
+    classify_program_inventory_status,
     classify_reconciliation_suppressions,
     compute_reconciliation_suppression_key,
     compute_reconciliation_suppression_row_key,
@@ -121,6 +125,35 @@ def make_schedule_snapshot(
     )
 
 
+def program_state(
+    program_name: str,
+    *,
+    environment: str = ENVIRONMENT,
+    profile: str = SQL_PROFILE,
+    batch_id: str | None = "batch-sql-1",
+    is_active: bool = True,
+) -> ProgramState:
+    return ProgramState(
+        environment=environment,
+        source_profile=profile,
+        program_name=program_name,
+        source_hash="sha256:demo-program",
+        first_seen_at=OBSERVED_AT,
+        last_seen_at=OBSERVED_AT,
+        last_changed_at=OBSERVED_AT,
+        batch_id=batch_id,
+        is_active=is_active,
+    )
+
+
+def inventory(*program_names: str, **kwargs) -> tuple[ProgramState, ...]:
+    return tuple(program_state(name, **kwargs) for name in program_names)
+
+
+def default_inventory() -> tuple[ProgramState, ...]:
+    return inventory("005:DEMO_DWM.RESULT_A:1:00")
+
+
 def make_result(
     sql_snapshot: SQLBusinessLineageSnapshot,
     schedule_snapshot: ScheduleLineageSnapshot,
@@ -149,7 +182,9 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
     def test_sql_only_without_either_internal_producer_is_suppressed(self):
         sql, schedule, result = make_no_producer_result()
 
-        suppressions = classify_reconciliation_suppressions(result, sql, schedule)
+        suppressions = classify_reconciliation_suppressions(
+            result, sql, schedule, program_states=default_inventory()
+        )
 
         self.assertEqual(len(suppressions), 1)
         candidate = suppressions[0]
@@ -158,11 +193,11 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         self.assertEqual(candidate.raw_status, ReconciliationStatus.SQL_ONLY)
         self.assertEqual(
             candidate.suppression_reason,
-            ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+            ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
         )
         self.assertEqual(candidate.classifier_version, SUPPRESSION_CLASSIFIER_VERSION)
 
-    def test_sql_producer_prevents_suppression(self):
+    def test_sql_producer_does_not_prevent_suppression(self):
         sql = make_sql_snapshot(
             sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),
             sql_edge("DEMO_DWF.INTERNAL_A", "DEMO_DWF.REFERENCE_A"),
@@ -172,13 +207,18 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            classify_reconciliation_suppressions(
-                make_result(sql, schedule), sql, schedule
+            len(
+                classify_reconciliation_suppressions(
+                    make_result(sql, schedule),
+                    sql,
+                    schedule,
+                    program_states=default_inventory(),
+                )
             ),
-            (),
+            1,
         )
 
-    def test_schedule_producer_prevents_suppression(self):
+    def test_schedule_producer_does_not_prevent_suppression(self):
         sql = make_sql_snapshot(sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"))
         schedule = make_schedule_snapshot(
             schedule_edge("DEMO_DWF.INTERNAL_A", "DEMO_DWF.REFERENCE_A"),
@@ -186,13 +226,18 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            classify_reconciliation_suppressions(
-                make_result(sql, schedule), sql, schedule
+            len(
+                classify_reconciliation_suppressions(
+                    make_result(sql, schedule),
+                    sql,
+                    schedule,
+                    program_states=default_inventory(),
+                )
             ),
-            (),
+            1,
         )
 
-    def test_both_producer_types_prevent_suppression(self):
+    def test_business_and_schedule_edges_do_not_define_internal_program(self):
         sql = make_sql_snapshot(
             sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),
             sql_edge("DEMO_DWF.SQL_PRODUCER", "DEMO_DWF.REFERENCE_A"),
@@ -203,13 +248,18 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            classify_reconciliation_suppressions(
-                make_result(sql, schedule), sql, schedule
+            len(
+                classify_reconciliation_suppressions(
+                    make_result(sql, schedule),
+                    sql,
+                    schedule,
+                    program_states=default_inventory(),
+                )
             ),
-            (),
+            1,
         )
 
-    def test_producer_target_uses_formal_comparison_normalization(self):
+    def test_program_inventory_target_uses_formal_comparison_normalization(self):
         sql = make_sql_snapshot(
             sql_edge("DWF.REFERENCE_A", "DWM.RESULT_A"),
             sql_edge("DWF.INTERNAL_A", "DWS_DWF.REFERENCE_A"),
@@ -227,8 +277,89 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            classify_reconciliation_suppressions(result, sql, schedule), ()
+            classify_reconciliation_suppressions(
+                result,
+                sql,
+                schedule,
+                program_states=inventory(
+                    "005:DWS_DWF.REFERENCE_A:1:00",
+                ),
+            ),
+            (),
         )
+
+    def test_program_inventory_status_has_explicit_two_state_contract(self):
+        active_targets = build_active_program_target_inventory(
+            inventory("005:DWS_DWF.REFERENCE_A:00"),
+            environment=ENVIRONMENT,
+            active_batch_id="batch-sql-1",
+        )
+
+        self.assertEqual(
+            classify_program_inventory_status(
+                "DWF.REFERENCE_A", active_targets
+            ),
+            ProgramInventoryStatus.HAS_INTERNAL_PROGRAM,
+        )
+        self.assertEqual(
+            classify_program_inventory_status("DWF.OTHER_A", active_targets),
+            ProgramInventoryStatus.NO_INTERNAL_PROGRAM,
+        )
+
+    def test_environment_wide_inventory_ignores_sql_profile(self):
+        sql = make_sql_snapshot(
+            sql_edge("DWF.F_NCMS_ALS_CODE_LIBRARY", "DWM.RESULT_A")
+        )
+        schedule = make_schedule_snapshot(
+            schedule_edge("DWF.OTHER_A", "DWM.OTHER_RESULT")
+        )
+        result = make_result(sql, schedule)
+
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=inventory(
+                "005:DWS_DWF.F_NCMS_ALS_CODE_LIBRARY:00",
+                profile="mysql_dev_b_data",
+            ),
+        )
+
+        self.assertEqual(suppressions, ())
+
+    def test_inactive_and_other_environment_inventory_is_ignored(self):
+        sql, schedule, result = make_no_producer_result()
+
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=(
+                program_state(
+                    "005:DWF.REFERENCE_A:00",
+                    is_active=False,
+                ),
+                program_state(
+                    "005:DWF.REFERENCE_A:00",
+                    environment=OTHER_ENVIRONMENT,
+                ),
+            ),
+        )
+
+        self.assertEqual(len(suppressions), 1)
+
+    def test_missing_or_malformed_inventory_fails_open(self):
+        sql, schedule, result = make_no_producer_result()
+
+        with self.assertRaisesRegex(Exception, "inventory"):
+            classify_reconciliation_suppressions(result, sql, schedule)
+        with self.assertRaisesRegex(Exception, "inventory"):
+            classify_reconciliation_suppressions(
+                result,
+                sql,
+                schedule,
+                program_states=(program_state("DEMO_PROGRAM"),),
+            )
 
     def test_match_and_schedule_only_are_never_suppressed(self):
         sql = make_sql_snapshot(
@@ -250,7 +381,9 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
                 ReconciliationStatus.SQL_ONLY,
             ],
         )
-        suppressions = classify_reconciliation_suppressions(result, sql, schedule)
+        suppressions = classify_reconciliation_suppressions(
+            result, sql, schedule, program_states=default_inventory()
+        )
         self.assertEqual(
             [(item.source_table, item.target_table) for item in suppressions],
             [("DEMO_DWF.SQL_ONLY_A", "DEMO_DWM.RESULT_A")],
@@ -286,7 +419,9 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
         result = make_result(sql, schedule)
 
-        suppressions = classify_reconciliation_suppressions(result, sql, schedule)
+        suppressions = classify_reconciliation_suppressions(
+            result, sql, schedule, program_states=default_inventory()
+        )
 
         self.assertEqual(
             [(item.source_table, item.target_table) for item in suppressions],
@@ -302,8 +437,12 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         sql, schedule, result = make_no_producer_result()
         original_rows = result.rows
 
-        first = classify_reconciliation_suppressions(result, sql, schedule)
-        second = classify_reconciliation_suppressions(result, sql, schedule)
+        first = classify_reconciliation_suppressions(
+            result, sql, schedule, program_states=default_inventory()
+        )
+        second = classify_reconciliation_suppressions(
+            result, sql, schedule, program_states=default_inventory()
+        )
 
         self.assertEqual(first, second)
         self.assertEqual(result.rows, original_rows)
@@ -317,14 +456,24 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
             observed_at=sql.observed_at,
         )
         with self.assertRaisesRegex(Exception, "scope"):
-            classify_reconciliation_suppressions(result, incomplete_sql, schedule)
+            classify_reconciliation_suppressions(
+                result,
+                incomplete_sql,
+                schedule,
+                program_states=default_inventory(),
+            )
 
         stale_schedule = make_schedule_snapshot(
             *schedule.edges,
             batch_id="batch-schedule-old",
         )
         with self.assertRaisesRegex(Exception, "batch"):
-            classify_reconciliation_suppressions(result, sql, stale_schedule)
+            classify_reconciliation_suppressions(
+                result,
+                sql,
+                stale_schedule,
+                program_states=default_inventory(),
+            )
 
     def test_stable_suppression_identity_excludes_batch_ids(self):
         first = ReconciliationSuppression(
@@ -334,7 +483,7 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
             source_table="DEMO_DWF.REFERENCE_A",
             target_table="DEMO_DWM.RESULT_A",
             raw_status=ReconciliationStatus.SQL_ONLY,
-            suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+            suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
             sql_batch_id="batch-sql-1",
             schedule_batch_id="batch-schedule-1",
             observed_at=OBSERVED_AT,
@@ -363,7 +512,7 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
                 schedule_source_profile=SCHEDULE_PROFILE,
                 source_table="DEMO_DWF.REFERENCE_A",
                 target_table="DEMO_DWM.RESULT_A",
-                suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+                suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
             ),
         )
         self.assertEqual(
@@ -414,7 +563,11 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
         self.store = DWSReconciliationSuppressionStore(connection=self.connection)
         self.sql, self.schedule, self.result = make_no_producer_result()
         self.candidates = classify_reconciliation_suppressions(
-            self.result, self.sql, self.schedule, observed_at=OBSERVED_AT
+            self.result,
+            self.sql,
+            self.schedule,
+            program_states=default_inventory(),
+            observed_at=OBSERVED_AT,
         )
 
     def tearDown(self) -> None:
@@ -455,6 +608,97 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
             observed_at=observed_at,
         )
 
+    def test_v1_active_rows_are_not_usable_and_are_retired_by_v2_publish(self):
+        legacy = ReconciliationSuppression(
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+            source_table="DEMO_DWF.REFERENCE_A",
+            target_table="DEMO_DWM.RESULT_A",
+            raw_status=ReconciliationStatus.SQL_ONLY,
+            suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+            sql_batch_id="batch-sql-legacy",
+            schedule_batch_id="batch-schedule-legacy",
+            classifier_version=LEGACY_SUPPRESSION_CLASSIFIER_VERSION,
+            observed_at=OBSERVED_AT,
+        )
+        timestamp = OBSERVED_AT.isoformat()
+        self.database.execute(
+            """
+            INSERT INTO dwp.lineage_reconciliation_suppression(
+                row_key, suppression_key, environment, sql_source_profile,
+                schedule_source_profile, source_table, target_table, raw_status,
+                suppression_reason, sql_batch_id, schedule_batch_id,
+                classifier_version, observed_at, first_seen_at, last_seen_at,
+                is_active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                legacy.row_key,
+                legacy.suppression_key,
+                legacy.environment,
+                legacy.sql_source_profile,
+                legacy.schedule_source_profile,
+                legacy.source_table,
+                legacy.target_table,
+                (
+                    legacy.raw_status.value
+                    if isinstance(legacy.raw_status, ReconciliationStatus)
+                    else legacy.raw_status
+                ),
+                (
+                    legacy.suppression_reason.value
+                    if isinstance(
+                        legacy.suppression_reason,
+                        ReconciliationSuppressionReason,
+                    )
+                    else legacy.suppression_reason
+                ),
+                legacy.sql_batch_id,
+                legacy.schedule_batch_id,
+                legacy.classifier_version,
+                timestamp,
+                timestamp,
+                timestamp,
+                1,
+                timestamp,
+                timestamp,
+            ),
+        )
+        self.database.commit()
+        legacy_rows = self.store.read_rows(active_only=True)
+        self.assertEqual(usable_suppressed_edge_keys(self.result, legacy_rows), frozenset())
+
+        self.publish(self.candidates)
+
+        active = self.store.read_rows(active_only=True)
+        history = self.store.read_rows()
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].classifier_version, SUPPRESSION_CLASSIFIER_VERSION)
+        self.assertFalse(
+            next(row for row in history if row.row_key == legacy.row_key).is_active
+        )
+
+    def test_target_filter_reads_only_requested_suppression_rows(self):
+        self.publish(self.candidates)
+
+        self.assertEqual(
+            len(
+                self.store.read_rows(
+                    active_only=True,
+                    target_tables=("DEMO_DWM.RESULT_A",),
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.store.read_rows(
+                active_only=True,
+                target_tables=("DWM.OTHER_RESULT",),
+            ),
+            (),
+        )
+
     def test_publish_reads_audit_row_and_preserves_provenance(self):
         published = self.publish(self.candidates)
 
@@ -464,7 +708,7 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
         self.assertEqual(active[0].raw_status, ReconciliationStatus.SQL_ONLY)
         self.assertEqual(
             active[0].suppression_reason,
-            ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+            ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
         )
         self.assertEqual(active[0].sql_batch_id, "batch-sql-1")
         self.assertEqual(active[0].schedule_batch_id, "batch-schedule-1")
@@ -511,7 +755,7 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
             source_table="DEMO_DWF.OTHER_REFERENCE",
             target_table="DEMO_DWM.RESULT_A",
             raw_status=ReconciliationStatus.SQL_ONLY,
-            suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+            suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
             sql_batch_id="other-sql",
             schedule_batch_id="other-schedule",
             observed_at=OBSERVED_AT,
@@ -562,8 +806,10 @@ class _FakeScheduleRow:
 
 
 class _FakeSQLReader:
-    def __init__(self, edges):
+    def __init__(self, edges, program_states=()):
         self.edges = tuple(edges)
+        self.program_states = tuple(program_states)
+        self.program_state_calls = []
 
     def get_active_batch_id(self):
         return "batch-sql-command"
@@ -574,8 +820,20 @@ class _FakeSQLReader:
     def get_active_snapshot_scope(self):
         return ((ENVIRONMENT, SQL_PROFILE),)
 
-    def read_edges(self, *, batch_id=None, active_only=False):
+    def read_edges(self, *, batch_id=None, active_only=False, target_tables=None):
         return self.edges
+
+    def read_program_states(
+        self, *, batch_id=None, active_only=False, environment=None
+    ):
+        self.program_state_calls.append(
+            {
+                "batch_id": batch_id,
+                "active_only": active_only,
+                "environment": environment,
+            }
+        )
+        return self.program_states
 
 
 class _FakeScheduleReader:
@@ -587,7 +845,7 @@ class _FakeScheduleReader:
     def get_active_batch_id(self):
         return "batch-schedule-command"
 
-    def read_rows(self, *, batch_id=None, active_only=False):
+    def read_rows(self, *, batch_id=None, active_only=False, target_tables=None):
         return self.rows
 
 
@@ -611,7 +869,11 @@ class MaterializationCommandTests(unittest.TestCase):
         )
         self.sql_factory = Mock(
             return_value=_FakeSQLReader(
-                (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),)
+                (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
+                inventory(
+                    "005:DEMO_DWM.RESULT_A:1:00",
+                    batch_id="batch-sql-command",
+                ),
             )
         )
         self.schedule_factory = Mock(
@@ -639,6 +901,30 @@ class MaterializationCommandTests(unittest.TestCase):
         self.assertEqual(summaries[0].actionable_sql_only_count, 0)
         self.suppression_factory.assert_not_called()
 
+    def test_inventory_failure_is_fail_open_and_does_not_publish(self):
+        bad_sql_factory = Mock(
+            return_value=_FakeSQLReader(
+                (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
+                (
+                    program_state(
+                        "DEMO_PROGRAM",
+                        batch_id="batch-sql-command",
+                    ),
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, ENVIRONMENT):
+            run(
+                (self.scope,),
+                observed_at=OBSERVED_AT,
+                sql_store_factory=bad_sql_factory,
+                schedule_store_factory=self.schedule_factory,
+                suppression_store_factory=self.suppression_factory,
+            )
+
+        self.suppression_factory.assert_not_called()
+
     def test_environment_filter_only_materializes_requested_scope(self):
         summaries = run(
             (self.scope, self.other_scope),
@@ -653,6 +939,17 @@ class MaterializationCommandTests(unittest.TestCase):
         self.suppression_store.publish.assert_called_once()
         self.sql_factory.assert_called_once_with(self.scope)
         self.schedule_factory.assert_called_once_with(self.scope)
+        sql_reader = self.sql_factory.return_value
+        self.assertEqual(
+            sql_reader.program_state_calls,
+            [
+                {
+                    "batch_id": None,
+                    "active_only": True,
+                    "environment": ENVIRONMENT,
+                }
+            ],
+        )
 
     def test_jobs_crontab_entrypoint_main_remains_independently_runnable(self):
         from jobs.crontab.imp_lineage_suppression import main

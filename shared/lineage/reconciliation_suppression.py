@@ -17,7 +17,11 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, cast
 
-from shared.lineage.domain import LineageEdge
+from shared.lineage.domain import (
+    ProgramState,
+    normalize_lineage_comparison_table_key,
+    normalize_program_inventory_target,
+)
 from shared.lineage.dws_timestamp import dws_timestamp_param, parse_dws_timestamp
 from shared.lineage.materialization_dws import (
     DWSMaterializationStore,
@@ -30,20 +34,28 @@ from shared.lineage.reconciliation import (
     ReconciliationStatus,
     ScheduleLineageSnapshot,
     SQLBusinessLineageSnapshot,
-    normalize_lineage_comparison_table_key,
+    normalize_lineage_comparison_target_tables,
 )
-from shared.lineage.schedule import ScheduleLineageEdge
 
 SUPPRESSION_TABLE_NAME = "lineage_reconciliation_suppression"
-SUPPRESSION_CLASSIFIER_VERSION = "reconciliation-suppression-v1"
+SUPPRESSION_CLASSIFIER_VERSION = "reconciliation-suppression-v2"
+LEGACY_SUPPRESSION_CLASSIFIER_VERSION = "reconciliation-suppression-v1"
 SUPPRESSION_KEY_SEPARATOR = "\x1f"
 DWS_KEY_MAX_LENGTH = 128
 
 
 class ReconciliationSuppressionReason(str, Enum):
-    """V1 suppression reasons kept separate from raw reconciliation status."""
+    """Suppression reasons, including the historical v1 value for migration."""
 
+    NO_INTERNAL_PROGRAM = "NO_INTERNAL_PROGRAM"
     NO_INTERNAL_PRODUCER = "NO_INTERNAL_PRODUCER"
+
+
+class ProgramInventoryStatus(str, Enum):
+    """Decision made from the environment-level active program inventory."""
+
+    HAS_INTERNAL_PROGRAM = "HAS_INTERNAL_PROGRAM"
+    NO_INTERNAL_PROGRAM = "NO_INTERNAL_PROGRAM"
 
 
 class ReconciliationSuppressionError(RuntimeError):
@@ -99,13 +111,19 @@ class ReconciliationSuppression:
         object.__setattr__(self, "raw_status", raw_status)
 
         reason = _reason_value(self.suppression_reason)
-        if reason != ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER.value:
-            raise ValueError("unsupported reconciliation suppression reason")
-        object.__setattr__(
-            self,
-            "suppression_reason",
-            ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
-        )
+        supported_contract = {
+            (
+                SUPPRESSION_CLASSIFIER_VERSION,
+                ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM.value,
+            ),
+            (
+                LEGACY_SUPPRESSION_CLASSIFIER_VERSION,
+                ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER.value,
+            ),
+        }
+        if (self.classifier_version, reason) not in supported_contract:
+            raise ValueError("unsupported reconciliation suppression reason/version")
+        object.__setattr__(self, "suppression_reason", ReconciliationSuppressionReason(reason))
 
         if self.observed_at is not None:
             _validate_timestamp(self.observed_at, "observed_at")
@@ -197,7 +215,10 @@ def compute_reconciliation_suppression_key(
     """Compute a stable identity that deliberately excludes both batch IDs."""
 
     reason = _reason_value(suppression_reason)
-    if reason != ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER.value:
+    if reason not in {
+        ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM.value,
+        ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER.value,
+    }:
         raise ValueError("unsupported reconciliation suppression reason")
     source = normalize_lineage_comparison_table_key(source_table)
     target = normalize_lineage_comparison_table_key(target_table)
@@ -283,55 +304,115 @@ def _validate_classifier_inputs(
     return scope
 
 
+def build_active_program_target_inventory(
+    program_states: Iterable[ProgramState],
+    *,
+    environment: str,
+    active_batch_id: str,
+) -> frozenset[str]:
+    """Build the environment-level active Program Inventory Target set.
+
+    This function consumes only DWS-materialized ``ProgramState`` values.  A
+    state from another environment or an inactive state is irrelevant; an
+    active state in the requested environment must have a valid supported
+    inventory shape and the requested active batch provenance.  Any ambiguity
+    is an error so the caller can fail open rather than hide SQL_ONLY rows.
+    """
+
+    if not isinstance(environment, str) or not environment.strip():
+        raise ReconciliationSuppressionError("program inventory environment is invalid")
+    if not isinstance(active_batch_id, str) or not active_batch_id.strip():
+        raise ReconciliationSuppressionError("program inventory batch is invalid")
+    try:
+        states = tuple(program_states)
+    except Exception as exc:  # noqa: BLE001 - inventory reads must fail open
+        raise ReconciliationSuppressionError(
+            "active program inventory could not be read"
+        ) from exc
+
+    targets: set[str] = set()
+    normalized_environment = environment.strip()
+    normalized_batch_id = active_batch_id.strip()
+    for state in states:
+        if not isinstance(state, ProgramState):
+            raise ReconciliationSuppressionError(
+                "active program inventory contains an invalid state"
+            )
+        if state.environment != normalized_environment or not state.is_active:
+            continue
+        if state.batch_id != normalized_batch_id:
+            raise ReconciliationSuppressionError(
+                "active program inventory batch provenance is incomplete"
+            )
+        try:
+            target = normalize_program_inventory_target(state.program_name)
+        except (TypeError, ValueError) as exc:
+            raise ReconciliationSuppressionError(
+                "active program inventory target normalization failed"
+            ) from exc
+        if target is None:
+            raise ReconciliationSuppressionError(
+                "active program state has no valid inventory target"
+            )
+        targets.add(target)
+    return frozenset(targets)
+
+
+def classify_program_inventory_status(
+    source_table: str,
+    active_program_targets: Iterable[str],
+) -> ProgramInventoryStatus:
+    """Classify one source using only the active Program Inventory Target set."""
+
+    source = normalize_lineage_comparison_table_key(source_table)
+    targets = frozenset(
+        normalize_lineage_comparison_table_key(target)
+        for target in active_program_targets
+    )
+    return (
+        ProgramInventoryStatus.HAS_INTERNAL_PROGRAM
+        if source in targets
+        else ProgramInventoryStatus.NO_INTERNAL_PROGRAM
+    )
+
+
 def classify_reconciliation_suppressions(
     result: LineageReconciliationResult,
     sql_snapshot: SQLBusinessLineageSnapshot,
     schedule_snapshot: ScheduleLineageSnapshot,
     *,
+    program_states: Iterable[ProgramState] | None = None,
     observed_at: datetime | None = None,
 ) -> tuple[ReconciliationSuppression, ...]:
-    """Classify conservative ``NO_INTERNAL_PRODUCER`` candidates.
+    """Classify SQL_ONLY rows from the verified active program inventory.
 
-    This is a pure function: it only consumes already-verified snapshots and a
-    reconciliation result.  It does not connect to DWS, load configuration, or
-    mutate the result.  A missing/ambiguous snapshot boundary raises
+    Raw reconciliation remains strictly SQL business edges versus schedule
+    edges.  Program inventory is consulted only for SQL_ONLY presentation
+    suppression.  Missing or malformed inventory raises
     :class:`ReconciliationSuppressionError`; callers must fail open and keep
-    the raw ``SQL_ONLY`` rows visible.
+    the raw SQL_ONLY rows visible.
     """
 
     environment, sql_profile, schedule_profile = _validate_classifier_inputs(
         result, sql_snapshot, schedule_snapshot
     )
     effective_observed_at = _snapshot_observation_time(result, observed_at)
-
-    sql_produced_targets: set[str] = set()
-    for edge in sql_snapshot.edges:
-        if edge.environment != environment or edge.source_profile != sql_profile:
-            continue
-        if not isinstance(edge, LineageEdge):
-            raise ReconciliationSuppressionError("SQL producer edge type is invalid")
-        sql_produced_targets.add(
-            normalize_lineage_comparison_table_key(edge.target_table)
+    if program_states is None:
+        raise ReconciliationSuppressionError(
+            "active program inventory is required for suppression"
         )
-
-    schedule_produced_targets: set[str] = set()
-    for edge in schedule_snapshot.edges:
-        if edge.environment != environment or edge.source_profile != schedule_profile:
-            continue
-        if not isinstance(edge, ScheduleLineageEdge):
-            raise ReconciliationSuppressionError(
-                "schedule producer edge type is invalid"
-            )
-        schedule_produced_targets.add(
-            normalize_lineage_comparison_table_key(edge.target_table)
-        )
+    active_program_targets = build_active_program_target_inventory(
+        program_states,
+        environment=environment,
+        active_batch_id=result.sql_batch_id,
+    )
 
     candidates: list[ReconciliationSuppression] = []
     for row in result.rows:
         if row.status is not ReconciliationStatus.SQL_ONLY:
             continue
         source = normalize_lineage_comparison_table_key(row.source_table)
-        if source in sql_produced_targets or source in schedule_produced_targets:
+        if source in active_program_targets:
             continue
         candidates.append(
             ReconciliationSuppression(
@@ -341,7 +422,7 @@ def classify_reconciliation_suppressions(
                 source_table=source,
                 target_table=row.target_table,
                 raw_status=row.status,
-                suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+                suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
                 sql_batch_id=result.sql_batch_id,
                 schedule_batch_id=result.schedule_batch_id,
                 classifier_version=SUPPRESSION_CLASSIFIER_VERSION,
@@ -462,7 +543,7 @@ def usable_suppressed_edge_keys(
             or row.classifier_version != SUPPRESSION_CLASSIFIER_VERSION
             or row.raw_status is not ReconciliationStatus.SQL_ONLY
             or row.suppression_reason
-            != ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER
+            != ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM
         ):
             continue
         keys.add(row.edge_identity)
@@ -472,14 +553,14 @@ def usable_suppressed_edge_keys(
 def load_usable_suppressed_edge_keys(
     result: LineageReconciliationResult,
     store: Any | None,
+    *,
+    target_tables: Iterable[object] | str | None = None,
 ) -> frozenset[tuple[str, str]]:
-    """Read current suppression keys without ever hiding on reader failure.
+    """Read one batched, current-v2 suppression lookup fail-open.
 
-    The UI calls this helper after it has obtained a raw reconciliation result.
-    The store is expected to expose the existing read-only ``read_rows`` API;
-    the exact scope and both batch IDs are passed to the query boundary.  Any
-    connection, missing-table, malformed-row, or unexpected reader error
-    returns an empty key set, which is the fail-open-to-visible behavior.
+    The UI passes the complete normalized target set once for a multi-target
+    request.  The store receives scope, both snapshot batch IDs, classifier v2,
+    and the target predicate; it never performs classification.
     """
 
     if not isinstance(result, LineageReconciliationResult):
@@ -490,14 +571,21 @@ def load_usable_suppressed_edge_keys(
     if not callable(read_rows):
         return frozenset()
     try:
-        rows = read_rows(
-            environment=result.environment,
-            sql_source_profile=result.sql_source_profile,
-            schedule_source_profile=result.schedule_source_profile,
-            sql_batch_id=result.sql_batch_id,
-            schedule_batch_id=result.schedule_batch_id,
-            active_only=True,
-        )
+        kwargs: dict[str, object] = {
+            "environment": result.environment,
+            "sql_source_profile": result.sql_source_profile,
+            "schedule_source_profile": result.schedule_source_profile,
+            "sql_batch_id": result.sql_batch_id,
+            "schedule_batch_id": result.schedule_batch_id,
+            "classifier_version": SUPPRESSION_CLASSIFIER_VERSION,
+            "suppression_reason": ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
+            "active_only": True,
+        }
+        if target_tables is not None:
+            kwargs["target_tables"] = normalize_lineage_comparison_target_tables(
+                target_tables
+            )
+        rows = read_rows(**kwargs)
         return usable_suppressed_edge_keys(
             result,
             cast(Iterable[DWSReconciliationSuppressionRow], rows),
@@ -564,6 +652,12 @@ ACTIVATE_SUPPRESSION_SQL = """
 """
 
 
+def _normalize_target_tables(
+    target_tables: Iterable[object],
+) -> tuple[str, ...]:
+    return normalize_lineage_comparison_target_tables(target_tables)
+
+
 class DWSReconciliationSuppressionStore:
     """Atomic, scope-local repository for suppression audit observations."""
 
@@ -620,6 +714,9 @@ class DWSReconciliationSuppressionStore:
         schedule_source_profile: str | None = None,
         sql_batch_id: str | None = None,
         schedule_batch_id: str | None = None,
+        classifier_version: str | None = None,
+        suppression_reason: ReconciliationSuppressionReason | str | None = None,
+        target_tables: Iterable[object] | None = None,
         active_only: bool = False,
     ) -> tuple[DWSReconciliationSuppressionRow, ...]:
         conditions: list[str] = []
@@ -630,11 +727,23 @@ class DWSReconciliationSuppressionStore:
             ("schedule_source_profile", schedule_source_profile),
             ("sql_batch_id", sql_batch_id),
             ("schedule_batch_id", schedule_batch_id),
+            ("classifier_version", classifier_version),
+            (
+                "suppression_reason",
+                None
+                if suppression_reason is None
+                else _reason_value(suppression_reason),
+            ),
         )
         for field_name, value in filters:
             if value is not None:
                 conditions.append(f"{field_name} = ?")
                 params.append(_required_text(value, field_name))
+        if target_tables is not None:
+            targets = _normalize_target_tables(target_tables)
+            placeholders = ", ".join("?" for _ in targets)
+            conditions.append(f"target_table IN ({placeholders})")
+            params.extend(targets)
         if active_only:
             conditions.append("is_active = TRUE")
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
@@ -854,6 +963,9 @@ class DWSReconciliationSuppressionStore:
         schedule_source_profile: str | None = None,
         sql_batch_id: str | None = None,
         schedule_batch_id: str | None = None,
+        classifier_version: str | None = None,
+        suppression_reason: ReconciliationSuppressionReason | str | None = None,
+        target_tables: Iterable[object] | None = None,
         active_only: bool = False,
     ) -> tuple[DWSReconciliationSuppressionRow, ...]:
         with self._connection_scope() as connection:
@@ -864,6 +976,9 @@ class DWSReconciliationSuppressionStore:
                 schedule_source_profile=schedule_source_profile,
                 sql_batch_id=sql_batch_id,
                 schedule_batch_id=schedule_batch_id,
+                classifier_version=classifier_version,
+                suppression_reason=suppression_reason,
+                target_tables=target_tables,
                 active_only=active_only,
             )
 
@@ -952,7 +1067,9 @@ __all__ = [
     "DWSReconciliationSuppressionRow",
     "DWSReconciliationSuppressionStore",
     "DWSSuppressionPublishResult",
+    "LEGACY_SUPPRESSION_CLASSIFIER_VERSION",
     "INSERT_SUPPRESSION_SQL",
+    "ProgramInventoryStatus",
     "ReconciliationSuppression",
     "ReconciliationSuppressionError",
     "ReconciliationSuppressionReason",
@@ -961,6 +1078,8 @@ __all__ = [
     "SUPPRESSION_CLASSIFIER_VERSION",
     "SUPPRESSION_TABLE_NAME",
     "UPDATE_SUPPRESSION_SQL",
+    "build_active_program_target_inventory",
+    "classify_program_inventory_status",
     "classify_reconciliation_suppressions",
     "compute_reconciliation_suppression_key",
     "compute_reconciliation_suppression_row_key",

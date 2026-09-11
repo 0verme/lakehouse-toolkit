@@ -408,6 +408,32 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         self.assertEqual(len(self.store.read_rows(active_only=True)), 1)
         self.assertEqual(self.store.get_active_batch_id(), "batch-schedule-2")
 
+    def test_schedule_edge_reads_push_target_predicate_and_metadata_is_compact(self):
+        first = make_edge(
+            "DEMO_PROCESS_A",
+            source="DWS_DWF.A",
+            target="DWS_DWM.RESULT_A",
+        )
+        second = make_edge(
+            "DEMO_PROCESS_B",
+            source="DWS_DWF.B",
+            target="DWS_DWM.RESULT_B",
+        )
+        self.publish((first, second), "batch-schedule-targets")
+
+        metadata = self.store.get_active_snapshot_metadata()
+        filtered = self.store.read_rows(
+            active_only=True,
+            target_tables=("DWM.RESULT_A", "DWS_DWM.RESULT_A"),
+        )
+
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata.batch_id, "batch-schedule-targets")
+        self.assertEqual(metadata.snapshot_scope, (("DEV", "mysql_dev_a"),))
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].target_table, "DWM.RESULT_A")
+
     def test_duplicate_configuration_is_one_fact_but_process_provenance_survives(self):
         first = make_edge("DEMO_PROCESS_A")
         duplicate = make_edge("DEMO_PROCESS_A")
