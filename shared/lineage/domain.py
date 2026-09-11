@@ -99,6 +99,12 @@ PROGRAM_NAME_DEFAULT_SUFFIX = "00"
 # 也不代表可以配置多个 program-name prefix；legacy grammar 只有固定 marker。
 DEFAULT_PROGRAM_NAME_TARGET_PREFIX: str | None = None
 
+# Program Inventory 是比 canonical program-name parser 更窄的独立职责：它只回答
+# “当前 environment 是否存在一个 active 内部程序声明自己加工某张 schema.table”。
+# 这里只登记真实 active program state 已确认的 prefix；它不是 program-name
+# grammar，也不授予 target authority、step semantics 或 stable identity。
+PROGRAM_INVENTORY_PREFIXES = frozenset({"001", "005"})
+
 _PROGRAM_NAME_STEP_RE = re.compile(r"^[1-9]\d*$")
 _DECLARED_TARGET_RE = re.compile(
     r"^(?P<schema>[A-Z][A-Z0-9_]*)\.(?P<table>[A-Z][A-Z0-9_$]*)$"
@@ -221,26 +227,36 @@ def normalize_program_inventory_target(program_name: object) -> str | None:
     """Return the declared target used only by the program inventory contract.
 
     Program inventory deliberately has a smaller, independent responsibility
-    than :func:`parse_program_name`: it reads the second segment from the
-    supported three- or four-part legacy shapes and reuses the explicit
-    namespace registry.  It never grants target authority, resolves steps, or
-    changes the legacy parser contract.  Non-legacy names do not provide
-    inventory evidence; malformed colon-delimited legacy declarations raise so
-    callers can fail open instead of suppressing an actionable row.
+    than :func:`parse_program_name`.  Its grammar is
+    ``<inventory_prefix>:<qualified_schema_table>[:...]``: only the first
+    segment (an explicitly confirmed inventory prefix) and the second segment
+    (a qualified ``schema.table``) are interpreted.  Every following segment is
+    ignored, so it can never become a step, a canonical target authority or
+    part of a stable identity.  Namespace normalization reuses the same
+    explicit legacy registry; no basename or fuzzy schema guessing is added.
+
+    A name without ``:`` is not a program-inventory declaration and yields
+    ``None``.  A confirmed prefix with a malformed target, and any unconfirmed
+    prefix, raise ``ValueError`` so callers fail open instead of classifying a
+    real internal program as ``NO_INTERNAL_PROGRAM``.
     """
 
     normalized_name = decode_code(program_name).strip()
     if not normalized_name or ":" not in normalized_name:
         return None
     parts = normalized_name.split(":")
-    if parts[0].strip().upper() != PROGRAM_NAME_LEGACY_MARKER:
-        return None
-    if len(parts) not in (3, 4):
-        raise ValueError("program inventory name must have three or four segments")
+    prefix = parts[0].strip().upper()
+    if prefix not in PROGRAM_INVENTORY_PREFIXES:
+        raise ValueError(
+            f"unsupported active program inventory prefix: {prefix or '<empty>'}"
+        )
     target_token = parts[1].strip()
     target = normalize_legacy_program_namespace(target_token)
     if target is None:
-        raise ValueError("program inventory target is not a qualified table")
+        raise ValueError(
+            f"program inventory target is not a qualified table: "
+            f"{target_token or '<empty>'}"
+        )
     return target
 
 
@@ -1162,6 +1178,7 @@ __all__ = [
     "DEFAULT_PROGRAM_NAME_TARGET_PREFIX",
     "DEFAULT_TEMPORARY_ASSET_RULES",
     "PRE_BUSINESS_ASSET_SCHEMAS",
+    "PROGRAM_INVENTORY_PREFIXES",
     "PROGRAM_NAME_DEFAULT_SUFFIX",
     "PROGRAM_NAME_LEGACY_MARKER",
     "ProgramNameDiagnostic",

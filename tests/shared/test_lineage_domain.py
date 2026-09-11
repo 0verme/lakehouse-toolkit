@@ -4,6 +4,8 @@ import unittest
 from datetime import datetime, timezone
 
 from shared.lineage.domain import (
+    PROGRAM_INVENTORY_PREFIXES,
+    PROGRAM_NAME_LEGACY_MARKER,
     IssueType,
     LineageEdge,
     LineageIssue,
@@ -108,8 +110,76 @@ class LineageDomainTests(unittest.TestCase):
             "DWM.RESULT_A",
         )
         self.assertIsNone(normalize_program_inventory_target("DEMO_PROGRAM"))
-        with self.assertRaises(ValueError):
-            normalize_program_inventory_target("005:DWM.RESULT_A:1:00:EXTRA")
+        # 后续 segment 属于 Program Inventory 不解释的部分：既不作为 step，也不影响
+        # 第二段 inventory target。
+        self.assertEqual(
+            normalize_program_inventory_target("005:DWM.RESULT_A:1:00:EXTRA"),
+            "DWM.RESULT_A",
+        )
+
+    def test_program_inventory_prefixes_are_explicit_and_narrow(self):
+        self.assertEqual(PROGRAM_INVENTORY_PREFIXES, frozenset({"001", "005"}))
+
+    def test_program_inventory_reads_confirmed_001_prefix(self):
+        self.assertEqual(
+            normalize_program_inventory_target("001:DWF.RESULT_A:anything"),
+            "DWF.RESULT_A",
+        )
+        self.assertEqual(
+            normalize_program_inventory_target("001:DWS_DWF.RESULT_A:anything"),
+            "DWF.RESULT_A",
+        )
+        self.assertEqual(
+            normalize_program_inventory_target("001:AECIF_ECIF.CUS_BAS_ENT:tail"),
+            "AECIF_ECIF.CUS_BAS_ENT",
+        )
+
+    def test_program_inventory_does_not_change_issue_44_canonical_grammar(self):
+        parsed = parse_program_name("001:DWF.RESULT_A:1:00")
+
+        self.assertEqual(PROGRAM_NAME_LEGACY_MARKER, "005")
+        self.assertEqual(parsed.legacy_marker, "001")
+        self.assertIsNone(parsed.logical_target)
+        self.assertIsNone(parsed.target_hint)
+        self.assertIsNone(parsed.step_seq)
+        self.assertEqual(
+            parsed.diagnostics,
+            (
+                ProgramNameDiagnostic.PROGRAM_NAME_MARKER_INVALID,
+                ProgramNameDiagnostic.PROGRAM_NAME_TARGET_INVALID,
+            ),
+        )
+        self.assertEqual(
+            parse_program_name("005:DWM.RESULT_A:1:00").logical_target,
+            "DWM.RESULT_A",
+        )
+
+    def test_program_inventory_malformed_supported_prefix_raises(self):
+        for program_name in (
+            "001:",
+            "005:",
+            "001:ABC",
+            "005:not-qualified",
+            "001:DWS_DWF.TMP_RESULT:1:00",
+        ):
+            with self.subTest(program_name=program_name):
+                with self.assertRaisesRegex(
+                    ValueError, "program inventory target is not a qualified table"
+                ):
+                    normalize_program_inventory_target(program_name)
+
+    def test_program_inventory_unknown_prefix_raises_instead_of_skipping(self):
+        for program_name in (
+            "002:DWF.RESULT_A:anything",
+            "003:DWS_DWF.RESULT_A:1:00",
+            "ABC:DWF.RESULT_A:anything",
+            ":DWF.RESULT_A:anything",
+        ):
+            with self.subTest(program_name=program_name):
+                with self.assertRaisesRegex(
+                    ValueError, "unsupported active program inventory prefix"
+                ):
+                    normalize_program_inventory_target(program_name)
 
     def test_program_name_target_first_parser_keeps_direct_dataset_name(self):
         parsed = parse_program_name("005:DWM.RESULT_A:1:00")

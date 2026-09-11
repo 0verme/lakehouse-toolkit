@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
 import sqlite3
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import jobs.crontab.imp_lineage_suppression as imp_lineage_suppression
+from jobs.crontab.imp_lineage_suppression import run
 from shared.lineage.domain import LineageEdge, ProgramState
 from shared.lineage.dws_timestamp import TIMESTAMPTZ_PARAM_SQL
 from shared.lineage.environment_scope import LineageEnvironmentScope
@@ -21,6 +25,7 @@ from shared.lineage.reconciliation_suppression import (
     LEGACY_SUPPRESSION_CLASSIFIER_VERSION,
     ProgramInventoryStatus,
     ReconciliationSuppression,
+    ReconciliationSuppressionError,
     ReconciliationSuppressionReason,
     SUPPRESSION_CLASSIFIER_VERSION,
     build_active_program_target_inventory,
@@ -31,7 +36,6 @@ from shared.lineage.reconciliation_suppression import (
     usable_suppressed_edge_keys,
 )
 from shared.lineage.schedule import ScheduleLineageEdge
-from jobs.crontab.imp_lineage_suppression import run
 
 ENVIRONMENT = "DEMO_DEV"
 OTHER_ENVIRONMENT = "DEMO_OTHER"
@@ -360,6 +364,88 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
                 schedule,
                 program_states=(program_state("DEMO_PROGRAM"),),
             )
+
+    def test_mixed_001_and_005_inventory_builds_one_environment_set(self):
+        active_targets = build_active_program_target_inventory(
+            inventory("005:DWS_DWF.F_A:1:00", "001:DWF.F_B:anything"),
+            environment=ENVIRONMENT,
+            active_batch_id="batch-sql-1",
+        )
+
+        self.assertEqual(active_targets, frozenset({"DWF.F_A", "DWF.F_B"}))
+
+    def test_active_001_program_prevents_no_internal_program_suppression(self):
+        sql = make_sql_snapshot(
+            sql_edge("DWF.REFERENCE_A", "DEMO_DWM.RESULT_A", batch_id="batch-sql-1")
+        )
+        schedule = make_schedule_snapshot(
+            schedule_edge("DEMO_DWF.OTHER_A", "DEMO_DWM.OTHER_RESULT")
+        )
+        result = make_result(sql, schedule)
+
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=inventory("001:DWF.REFERENCE_A:anything"),
+        )
+
+        self.assertEqual(suppressions, ())
+
+    def test_unknown_inventory_prefix_fails_open_instead_of_suppressing(self):
+        sql, schedule, result = make_no_producer_result()
+
+        with self.assertRaisesRegex(
+            ReconciliationSuppressionError,
+            "unsupported active program inventory prefix: 002",
+        ):
+            classify_reconciliation_suppressions(
+                result,
+                sql,
+                schedule,
+                program_states=inventory("002:DWF.REFERENCE_A:anything"),
+            )
+
+    def test_malformed_supported_inventory_target_fails_open_with_cause(self):
+        sql, schedule, result = make_no_producer_result()
+
+        with self.assertRaisesRegex(
+            ReconciliationSuppressionError,
+            "program inventory target is not a qualified table",
+        ):
+            classify_reconciliation_suppressions(
+                result,
+                sql,
+                schedule,
+                program_states=inventory("001:BAD_TARGET:anything"),
+            )
+
+    def test_golden_sample_keeps_internal_program_visible(self):
+        sql = make_sql_snapshot(
+            sql_edge("DWF.F_NCMS_ALS_CODE_LIBRARY", "DEMO_DWM.RESULT_A"),
+            sql_edge("DWF.PARA_CODE_MAP", "DEMO_DWM.RESULT_A"),
+            sql_edge("DWM.M_PUB_CODE_INFO_NEW", "DEMO_DWM.RESULT_A"),
+        )
+        schedule = make_schedule_snapshot(
+            schedule_edge("DEMO_DWF.OTHER_A", "DEMO_DWM.OTHER_RESULT")
+        )
+        result = make_result(sql, schedule)
+
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=inventory("005:DWS_DWF.F_NCMS_ALS_CODE_LIBRARY:00"),
+        )
+
+        self.assertEqual(
+            [item.source_table for item in suppressions],
+            ["DWF.PARA_CODE_MAP", "DWM.M_PUB_CODE_INFO_NEW"],
+        )
+        self.assertNotIn(
+            "DWF.F_NCMS_ALS_CODE_LIBRARY",
+            [item.source_table for item in suppressions],
+        )
 
     def test_match_and_schedule_only_are_never_suppressed(self):
         sql = make_sql_snapshot(
@@ -950,6 +1036,85 @@ class MaterializationCommandTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_unknown_prefix_failure_reports_root_cause_and_does_not_publish(self):
+        self.sql_factory.return_value = _FakeSQLReader(
+            (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
+            inventory(
+                "002:DEMO_DWM.RESULT_A:anything",
+                batch_id="batch-sql-command",
+            ),
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            run(
+                (self.scope,),
+                observed_at=OBSERVED_AT,
+                sql_store_factory=self.sql_factory,
+                schedule_store_factory=self.schedule_factory,
+                suppression_store_factory=self.suppression_factory,
+            )
+
+        message = str(caught.exception)
+        self.assertIn(f"{ENVIRONMENT}:ReconciliationSuppressionError", message)
+        self.assertIn("unsupported active program inventory prefix: 002", message)
+        self.suppression_factory.assert_not_called()
+
+    def test_cli_reports_real_root_cause_instead_of_only_exception_type(self):
+        bad_sql_factory = Mock(
+            return_value=_FakeSQLReader(
+                (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
+                inventory(
+                    "002:DEMO_DWM.RESULT_A:anything",
+                    batch_id="batch-sql-command",
+                ),
+            )
+        )
+
+        def failing_main(**_kwargs):
+            return run(
+                (self.scope,),
+                observed_at=OBSERVED_AT,
+                sql_store_factory=bad_sql_factory,
+                schedule_store_factory=self.schedule_factory,
+                suppression_store_factory=self.suppression_factory,
+            )
+
+        stderr = io.StringIO()
+        with (
+            patch.object(imp_lineage_suppression, "main", side_effect=failing_main),
+            redirect_stderr(stderr),
+        ):
+            code = imp_lineage_suppression.cli(["--environment", ENVIRONMENT])
+
+        self.assertEqual(code, 1)
+        text = stderr.getvalue()
+        self.assertIn("ERROR RuntimeError: ", text)
+        self.assertIn("ReconciliationSuppressionError", text)
+        self.assertIn("unsupported active program inventory prefix: 002", text)
+
+    def test_cli_error_output_does_not_leak_credentials(self):
+        def leaking_main(**_kwargs):
+            raise RuntimeError(
+                "connect failed password=secret "
+                "dsn=postgresql://demo_user:demo_pass@db.internal:5432/demo"
+            )
+
+        stderr = io.StringIO()
+        with (
+            patch.object(imp_lineage_suppression, "main", side_effect=leaking_main),
+            redirect_stderr(stderr),
+        ):
+            code = imp_lineage_suppression.cli([])
+
+        self.assertEqual(code, 1)
+        text = stderr.getvalue()
+        self.assertIn("ERROR RuntimeError: ", text)
+        self.assertIn("connect failed", text)
+        self.assertIn("password=<redacted>", text)
+        self.assertNotIn("secret", text)
+        self.assertNotIn("demo_user", text)
+        self.assertNotIn("demo_pass", text)
 
     def test_jobs_crontab_entrypoint_main_remains_independently_runnable(self):
         from jobs.crontab.imp_lineage_suppression import main
