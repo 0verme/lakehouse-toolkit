@@ -14,8 +14,9 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from shared.lineage.domain import ProgramState
 from shared.lineage.environment_scope import (
     LineageEnvironmentScope,
     LineageEnvironmentScopeError,
@@ -31,6 +32,7 @@ from shared.lineage.reconciliation import (
 from shared.lineage.reconciliation_suppression import (
     DWSReconciliationSuppressionStore,
     ReconciliationSuppression,
+    ReconciliationSuppressionError,
     classify_reconciliation_suppressions,
 )
 from shared.lineage.schedule_materialization import DWSScheduleLineageStore
@@ -103,6 +105,18 @@ def _reconcile_scope(
         environment=scope.environment,
         source_profile=scope.sql_source_profile,
     )
+    read_program_states = getattr(sql_store, "read_program_states", None)
+    if not callable(read_program_states):
+        raise ReconciliationSuppressionError(
+            "DWS SQL store does not expose active program inventory"
+        )
+    program_states = cast(
+        Iterable[ProgramState],
+        read_program_states(
+            active_only=True,
+            environment=scope.environment,
+        ),
+    )
     schedule_snapshot = read_active_schedule_snapshot(
         schedule_store,
         environment=scope.environment,
@@ -119,6 +133,7 @@ def _reconcile_scope(
         result,
         sql_snapshot,
         schedule_snapshot,
+        program_states=program_states,
         observed_at=observed_at,
     )
     return result, suppressions

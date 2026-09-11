@@ -12,15 +12,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from time import perf_counter
 from typing import Any, Protocol
 
 from shared.lineage.domain import (
     LineageEdge,
-    canonicalize_dataset_name,
-    decode_code,
     is_business_asset,
-    normalize_asset_name,
-    normalize_legacy_program_namespace,
+    normalize_lineage_comparison_table_key as _normalize_lineage_comparison_table_key,
 )
 from shared.lineage.schedule import ScheduleLineageEdge
 
@@ -66,19 +64,56 @@ class ActiveSnapshotNotFoundError(LineageReconciliationError):
         super().__init__(code)
 
 
+@dataclass(slots=True)
+class ReconciliationTiming:
+    """Operational timings for one target-scoped reconciliation batch."""
+
+    sql_target_scoped_read_ms: int = 0
+    schedule_target_scoped_read_ms: int = 0
+    reconciliation_cpu_ms: int = 0
+    suppression_lookup_ms: int = 0
+    total_ms: int = 0
+    sql_rows_read: int = 0
+    schedule_rows_read: int = 0
+    reconciliation_rows: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "sql_target_scoped_read_ms": self.sql_target_scoped_read_ms,
+            "schedule_target_scoped_read_ms": self.schedule_target_scoped_read_ms,
+            "reconciliation_cpu_ms": self.reconciliation_cpu_ms,
+            "suppression_lookup_ms": self.suppression_lookup_ms,
+            "total_ms": self.total_ms,
+            "sql_rows_read": self.sql_rows_read,
+            "schedule_rows_read": self.schedule_rows_read,
+            "reconciliation_rows": self.reconciliation_rows,
+        }
+
+
 def normalize_lineage_comparison_table_key(value: object) -> str:
-    """Normalize a table key only at the SQL-vs-schedule comparison boundary.
+    """Normalize a table key at the SQL-vs-schedule comparison boundary."""
 
-    The explicit legacy namespace registry is reused, while the physical
-    ``DatasetIdentity`` and stored DWS facts remain untouched.  Unknown
-    namespaces are canonicalized only (never guessed or matched by basename).
-    """
+    return _normalize_lineage_comparison_table_key(value)
 
-    canonical = canonicalize_dataset_name(normalize_asset_name(decode_code(value)))
-    if canonical is None:
-        raise ValueError("comparison table must be a qualified schema.table")
-    mapped = normalize_legacy_program_namespace(canonical)
-    return canonical if mapped is None else mapped
+
+def normalize_lineage_comparison_target_tables(
+    target_tables: Iterable[object] | str,
+) -> tuple[str, ...]:
+    """Normalize targets once and remove duplicates while preserving order."""
+
+    values = (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    if not values:
+        raise ValueError("target_tables must contain at least one table")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        target = normalize_lineage_comparison_table_key(value)
+        if target not in seen:
+            seen.add(target)
+            normalized.append(target)
+    if not normalized:
+        raise ValueError("target_tables must contain at least one table")
+    return tuple(normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,24 +472,32 @@ class LineageReconciliationResult:
 
 
 class SQLBusinessLineageReader(Protocol):
-    """Minimal existing DWS SQL business reader contract."""
+    """Minimal DWS SQL business reader contract with optional target pushdown."""
 
     def get_active_batch_id(self) -> str | None: ...
 
     def get_batch_metadata(self, batch_id: str) -> Any | None: ...
 
     def read_edges(
-        self, *, batch_id: str | None = None, active_only: bool = False
+        self,
+        *,
+        batch_id: str | None = None,
+        active_only: bool = False,
+        target_tables: Iterable[str] | None = None,
     ) -> Iterable[LineageEdge]: ...
 
 
 class ScheduleLineageReader(Protocol):
-    """Minimal existing DWS schedule reader contract."""
+    """Minimal DWS schedule reader contract with optional target pushdown."""
 
     def get_active_batch_id(self) -> str | None: ...
 
     def read_rows(
-        self, *, batch_id: str | None = None, active_only: bool = False
+        self,
+        *,
+        batch_id: str | None = None,
+        active_only: bool = False,
+        target_tables: Iterable[str] | None = None,
     ) -> Iterable[Any]: ...
 
 
@@ -463,10 +506,17 @@ def read_active_sql_business_snapshot(
     *,
     environment: str,
     source_profile: str,
+    target_tables: Iterable[object] | str | None = None,
 ) -> SQLBusinessLineageSnapshot:
-    """Read SQL facts through the active ``lineage_batch`` reader contract."""
+    """Read a verified active SQL snapshot, pushing target filters to DWS."""
 
     scope = _validate_scope(environment, source_profile)
+    resolved_targets = (
+        None
+        if target_tables is None
+        else normalize_lineage_comparison_target_tables(target_tables)
+    )
+    target_set = None if resolved_targets is None else frozenset(resolved_targets)
     active_batch_id = reader.get_active_batch_id()
     if not isinstance(active_batch_id, str) or not active_batch_id.strip():
         raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
@@ -491,17 +541,31 @@ def read_active_sql_business_snapshot(
         if scope not in snapshot_scope:
             raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
 
-    edges = tuple(reader.read_edges(batch_id=active_batch_id, active_only=True))
+    read_kwargs: dict[str, object] = {
+        "batch_id": active_batch_id,
+        "active_only": True,
+    }
+    if resolved_targets is not None:
+        read_kwargs["target_tables"] = resolved_targets
+    edges = tuple(reader.read_edges(**read_kwargs))  # type: ignore[arg-type]
     if any(not isinstance(edge, LineageEdge) for edge in edges):
         raise TypeError("SQL active reader must return LineageEdge values")
     if any(
-        edge.batch_id is not None and edge.batch_id != active_batch_id for edge in edges
+        not _is_true(edge.is_active)
+        or (edge.batch_id is not None and edge.batch_id != active_batch_id)
+        for edge in edges
     ):
         raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
     scoped_edges = tuple(
         edge
         for edge in edges
-        if edge.environment == scope[0] and edge.source_profile == scope[1]
+        if edge.environment == scope[0]
+        and edge.source_profile == scope[1]
+        and (
+            target_set is None
+            or _normalize_lineage_comparison_table_key(edge.target_table)
+            in target_set
+        )
     )
     return SQLBusinessLineageSnapshot(
         batch_id=active_batch_id,
@@ -516,22 +580,60 @@ def read_active_schedule_snapshot(
     *,
     environment: str,
     source_profile: str,
+    target_tables: Iterable[object] | str | None = None,
 ) -> ScheduleLineageSnapshot:
-    """Read schedule rows from the current DWS active fact snapshot.
+    """Read an active schedule snapshot with verified target pushdown.
 
-    ``lineage_schedule_edge`` has no independent control table.  Consequently
-    no active rows for the requested scope are treated as unverifiable rather
-    than as a valid empty schedule snapshot.
+    A DWS schedule store may expose compact active metadata (batch, scope and
+    observation time) separately from edge rows.  That metadata lets a target
+    with no configured edge remain a verifiable empty result without loading
+    the entire active schedule snapshot.
     """
 
     scope = _validate_scope(environment, source_profile)
-    active_batch_id = reader.get_active_batch_id()
+    resolved_targets = (
+        None
+        if target_tables is None
+        else normalize_lineage_comparison_target_tables(target_tables)
+    )
+    target_set = None if resolved_targets is None else frozenset(resolved_targets)
+
+    metadata_reader = getattr(reader, "get_active_snapshot_metadata", None)
+    metadata_available = callable(metadata_reader)
+    metadata = metadata_reader() if metadata_available else None
+    if metadata_available:
+        if metadata is None or not _is_true(getattr(metadata, "is_active", True)):
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        active_batch_id = getattr(metadata, "batch_id", None)
+        declared_observed_at = getattr(metadata, "observed_at", None)
+        raw_scope = getattr(metadata, "snapshot_scope", None)
+        if raw_scope is None:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        try:
+            snapshot_scope = _normalize_snapshot_scopes(raw_scope)
+        except (TypeError, ValueError) as exc:
+            raise ActiveSnapshotNotFoundError(
+                SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND
+            ) from exc
+        if scope not in snapshot_scope:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        if not isinstance(declared_observed_at, datetime):
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+    else:
+        active_batch_id = reader.get_active_batch_id()
+        declared_observed_at = None
+        snapshot_scope = ()
+
     if not isinstance(active_batch_id, str) or not active_batch_id.strip():
         raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
     active_batch_id = active_batch_id.strip()
-    rows = tuple(reader.read_rows(batch_id=active_batch_id, active_only=True))
-    if not rows:
-        raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+    read_kwargs: dict[str, object] = {
+        "batch_id": active_batch_id,
+        "active_only": True,
+    }
+    if resolved_targets is not None:
+        read_kwargs["target_tables"] = resolved_targets
+    rows = tuple(reader.read_rows(**read_kwargs))  # type: ignore[arg-type]
 
     scoped_rows: list[Any] = []
     observed_values: set[datetime] = set()
@@ -545,16 +647,30 @@ def read_active_schedule_snapshot(
             raise TypeError(
                 "schedule active reader rows must expose ScheduleLineageEdge"
             )
-        if edge.scope == scope:
+        observed_at = getattr(row, "observed_at", None)
+        if not isinstance(observed_at, datetime):
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        if declared_observed_at is not None and observed_at != declared_observed_at:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        if edge.scope == scope and (
+            target_set is None
+            or _normalize_lineage_comparison_table_key(edge.target_table)
+            in target_set
+        ):
             scoped_rows.append(row)
-            observed_at = getattr(row, "observed_at", None)
-            if not isinstance(observed_at, datetime):
-                raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
             observed_values.add(observed_at)
 
-    if not scoped_rows or len(observed_values) != 1:
+    if scoped_rows:
+        if len(observed_values) != 1:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        observed_at = next(iter(observed_values))
+    elif resolved_targets is not None and metadata_available:
+        # The compact metadata proved the requested scope and observation time;
+        # an absent target row is therefore a valid empty target result.
+        observed_at = declared_observed_at
+    else:
         raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-    observed_at = next(iter(observed_values))
+
     edges = tuple(row.edge for row in scoped_rows)
     return ScheduleLineageSnapshot(
         batch_id=active_batch_id,
@@ -572,32 +688,69 @@ def reconcile_active_dws_lineage(
     schedule_source_profile: str | None = None,
     source_profile: str | None = None,
     target_table: str | None = None,
+    target_tables: Iterable[object] | str | None = None,
+    timing: ReconciliationTiming | None = None,
 ) -> LineageReconciliationResult:
-    """Reconcile two existing DWS active readers without touching source systems."""
+    """Reconcile verified DWS snapshots with one batched target predicate."""
 
+    if timing is not None and not isinstance(timing, ReconciliationTiming):
+        raise TypeError("timing must be ReconciliationTiming or None")
+    if target_table is not None and target_tables is not None:
+        raise ValueError("target_table and target_tables are mutually exclusive")
+    resolved_targets = (
+        None
+        if target_tables is None and target_table is None
+        else normalize_lineage_comparison_target_tables(
+            target_tables if target_tables is not None else (target_table,)  # type: ignore[arg-type]
+        )
+    )
     sql_profile, schedule_profile = _resolve_source_profiles(
         source_profile=source_profile,
         sql_source_profile=sql_source_profile,
         schedule_source_profile=schedule_source_profile,
     )
+    started = perf_counter() if timing is not None else None
+    sql_started = perf_counter() if timing is not None else None
     sql_snapshot = read_active_sql_business_snapshot(
         sql_reader,
         environment=environment,
         source_profile=sql_profile,
+        target_tables=resolved_targets,
     )
+    if timing is not None and sql_started is not None:
+        timing.sql_target_scoped_read_ms = int(
+            (perf_counter() - sql_started) * 1000
+        )
+        timing.sql_rows_read = len(sql_snapshot.edges)
+
+    schedule_started = perf_counter() if timing is not None else None
     schedule_snapshot = read_active_schedule_snapshot(
         schedule_reader,
         environment=environment,
         source_profile=schedule_profile,
+        target_tables=resolved_targets,
     )
-    return reconcile_lineage_snapshots(
+    if timing is not None and schedule_started is not None:
+        timing.schedule_target_scoped_read_ms = int(
+            (perf_counter() - schedule_started) * 1000
+        )
+        timing.schedule_rows_read = len(schedule_snapshot.edges)
+
+    cpu_started = perf_counter() if timing is not None else None
+    result = reconcile_lineage_snapshots(
         sql_snapshot,
         schedule_snapshot,
         environment=environment,
         sql_source_profile=sql_profile,
         schedule_source_profile=schedule_profile,
-        target_table=target_table,
+        target_tables=resolved_targets,
     )
+    if timing is not None and cpu_started is not None:
+        timing.reconciliation_cpu_ms = int((perf_counter() - cpu_started) * 1000)
+        timing.reconciliation_rows = len(result.rows)
+        if started is not None:
+            timing.total_ms = int((perf_counter() - started) * 1000)
+    return result
 
 
 def reconcile_lineage_snapshots(
@@ -609,6 +762,7 @@ def reconcile_lineage_snapshots(
     schedule_source_profile: str | None = None,
     source_profile: str | None = None,
     target_table: str | None = None,
+    target_tables: Iterable[object] | str | None = None,
 ) -> LineageReconciliationResult:
     """Perform deterministic set reconciliation for one strict environment."""
 
@@ -623,13 +777,18 @@ def reconcile_lineage_snapshots(
         raise TypeError("sql_snapshot must be SQLBusinessLineageSnapshot")
     if not isinstance(schedule_snapshot, ScheduleLineageSnapshot):
         raise TypeError("schedule_snapshot must be ScheduleLineageSnapshot")
+    if target_table is not None and target_tables is not None:
+        raise ValueError("target_table and target_tables are mutually exclusive")
+    resolved_targets = (
+        None
+        if target_table is None and target_tables is None
+        else normalize_lineage_comparison_target_tables(
+            target_tables if target_tables is not None else (target_table,)  # type: ignore[arg-type]
+        )
+    )
+    target_set = None if resolved_targets is None else frozenset(resolved_targets)
     if sql_snapshot.snapshot_scope and sql_scope not in sql_snapshot.snapshot_scope:
         raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
-    resolved_target = (
-        None
-        if target_table is None
-        else normalize_lineage_comparison_table_key(target_table)
-    )
 
     sql_values: dict[tuple[str, str, str], _ComparisonAccumulator] = {}
     schedule_values: dict[tuple[str, str, str], _ComparisonAccumulator] = {}
@@ -643,7 +802,7 @@ def reconcile_lineage_snapshots(
             edge.source_table,
             edge.target_table,
         )
-        if key is None or (resolved_target is not None and key[1] != resolved_target):
+        if key is None or (target_set is not None and key[1] not in target_set):
             continue
         aggregate = sql_values.setdefault(key, _ComparisonAccumulator())
         aggregate.sql_fact_count += 1
@@ -665,7 +824,7 @@ def reconcile_lineage_snapshots(
             edge.source_table,
             edge.target_table,
         )
-        if key is None or (resolved_target is not None and key[1] != resolved_target):
+        if key is None or (target_set is not None and key[1] not in target_set):
             continue
         aggregate = schedule_values.setdefault(key, _ComparisonAccumulator())
         aggregate.schedule_fact_count += 1
@@ -700,7 +859,12 @@ def reconcile_lineage_snapshots(
         environment=sql_scope[0],
         sql_source_profile=sql_profile,
         schedule_source_profile=schedule_profile,
-        target_table=resolved_target,
+        target_table=(
+            next(iter(resolved_targets))
+            if resolved_targets is not None and len(resolved_targets) == 1
+            else None
+        ),
+        target_tables=resolved_targets,
     )
     return LineageReconciliationResult(
         environment=sql_scope[0],
@@ -747,12 +911,17 @@ def _build_target_summaries(
     sql_source_profile: str,
     schedule_source_profile: str,
     target_table: str | None,
+    target_tables: Iterable[str] | None = None,
 ) -> tuple[LineageReconciliationTargetSummary, ...]:
     values = tuple(rows)
     target_names = (
         (target_table,)
         if target_table is not None
-        else tuple(sorted({row.target_table for row in values}))
+        else (
+            tuple(target_tables)
+            if target_tables is not None
+            else tuple(sorted({row.target_table for row in values}))
+        )
     )
     summaries: list[LineageReconciliationTargetSummary] = []
     for target in target_names:
@@ -898,6 +1067,7 @@ __all__ = [
     "LineageReconciliationTargetSummary",
     "ReconciliationStatus",
     "ReconciliationTargetStatus",
+    "ReconciliationTiming",
     "SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND",
     "SQL_ACTIVE_SNAPSHOT_NOT_FOUND",
     "SQLBusinessLineageReader",

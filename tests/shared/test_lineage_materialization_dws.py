@@ -574,8 +574,18 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         self.assertEqual(metadata.observed_at, OBSERVED_AT)
         self.assertEqual(metadata.published_at, OBSERVED_AT)
 
-        states = self.store.read_program_states(batch_id=batch.batch_id)
+        states = self.store.read_program_states(
+            batch_id=batch.batch_id,
+            environment="DEV",
+        )
         self.assertEqual(len(states), 1)
+        self.assertEqual(
+            self.store.read_program_states(
+                batch_id=batch.batch_id,
+                environment="DEMO_OTHER",
+            ),
+            (),
+        )
         self.assertEqual(states[0].first_seen_at, OBSERVED_AT)
         self.assertEqual(states[0].last_seen_at, OBSERVED_AT)
         self.assertEqual(states[0].last_changed_at, OBSERVED_AT)
@@ -686,6 +696,59 @@ class DWSMaterializationStoreTests(unittest.TestCase):
                 ("batch-dws-1",),
             ).fetchone()[0],
             2,
+        )
+
+    def test_business_edge_reads_push_target_predicate_to_dws(self) -> None:
+        source_a = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_TARGET_A",
+            "INSERT INTO DWM.RESULT_A SELECT * FROM DWF.SOURCE_A;",
+            expected_target="DWM.RESULT_A",
+            source_hash="sha256:target-a",
+        )
+        source_b = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_TARGET_B",
+            "INSERT INTO DWM.RESULT_B SELECT * FROM DWF.SOURCE_B;",
+            expected_target="DWM.RESULT_B",
+            source_hash="sha256:target-b",
+        )
+        batch_a, dag_a = self.make_batch(
+            source_a,
+            batch_id="batch-dws-targets",
+            observed_at=OBSERVED_AT,
+        )
+        batch_b, dag_b = self.make_batch(
+            source_b,
+            batch_id="batch-dws-targets",
+            observed_at=OBSERVED_AT,
+        )
+        batch = MaterializationBatch(
+            batch_id="batch-dws-targets",
+            observed_at=OBSERVED_AT,
+            edges=(*batch_a.edges, *batch_b.edges),
+            issues=(*batch_a.issues, *batch_b.issues),
+            program_states=(*batch_a.program_states, *batch_b.program_states),
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag_a, dag_b),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        all_edges = self.store.read_edges(active_only=True)
+        filtered = self.store.read_edges(
+            active_only=True,
+            target_tables=("DWS_DWM.RESULT_A", "DWM.RESULT_A"),
+        )
+
+        self.assertEqual({edge.target_table for edge in all_edges}, {"DWM.RESULT_A", "DWM.RESULT_B"})
+        self.assertEqual(
+            {(edge.source_table, edge.target_table) for edge in filtered},
+            {("DWF.SOURCE_A", "DWM.RESULT_A")},
         )
 
     def test_business_boundary_keeps_technical_physical_rows_out_of_business_rows(

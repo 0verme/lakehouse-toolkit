@@ -39,6 +39,7 @@ from shared.lineage.domain import (
     is_business_asset,
     is_technical_asset,
     is_temporary_asset,
+    normalize_lineage_comparison_table_key,
 )
 from shared.lineage.dws_timestamp import (
     TIMESTAMPTZ_PARAM_SQL,
@@ -435,6 +436,35 @@ def _key_text(value: object, field_name: str) -> str:
     if KEY_SEPARATOR in text:
         raise ValueError(f"{field_name} contains the stable-key separator")
     return text
+
+
+def _normalize_target_tables(
+    target_tables: Iterable[object],
+) -> tuple[str, ...]:
+    values = (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    if not values:
+        raise ValueError("target_tables must contain at least one table")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        target = normalize_lineage_comparison_table_key(value)
+        if target not in seen:
+            seen.add(target)
+            normalized.append(target)
+    return tuple(normalized)
+
+
+def _target_table_condition(
+    alias: str,
+    target_tables: Iterable[object] | None,
+) -> tuple[str, tuple[object, ...]]:
+    if target_tables is None:
+        return "", ()
+    if alias != "e":
+        raise ValueError("target_tables are only supported for edge reads")
+    values = _normalize_target_tables(target_tables)
+    placeholders = ", ".join("?" for _ in values)
+    return f"{alias}.target_table IN ({placeholders})", values
 
 
 def _stored_required_text(value: object, field_name: str) -> str:
@@ -1552,6 +1582,8 @@ class DWSMaterializationStore:
         *,
         batch_id: str | None,
         active_only: bool,
+        environment: str | None = None,
+        target_tables: Iterable[object] | None = None,
     ) -> tuple[str, tuple[object, ...]]:
         conditions: list[str] = []
         params: list[object] = []
@@ -1571,6 +1603,15 @@ class DWSMaterializationStore:
             params.append(_required_text(batch_id, "batch_id"))
         if active_only:
             conditions.append(active_condition)
+        if environment is not None:
+            conditions.append(f"{alias}.environment = ?")
+            params.append(_required_text(environment, "environment"))
+        target_condition, target_params = _target_table_condition(
+            alias, target_tables
+        )
+        if target_condition:
+            conditions.append(target_condition)
+            params.extend(target_params)
         if not conditions:
             return "", ()
         return " WHERE " + " AND ".join(conditions), tuple(params)
@@ -1581,9 +1622,13 @@ class DWSMaterializationStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        environment: str | None = None,
     ) -> tuple[tuple[Any, ...], ...]:
         where, params = self._where_for_batch_and_active(
-            "s", batch_id=batch_id, active_only=active_only
+            "s",
+            batch_id=batch_id,
+            active_only=active_only,
+            environment=environment,
         )
         join = ACTIVE_STATE_JOIN if active_only else ""
         return self._fetch_rows(
@@ -1602,6 +1647,7 @@ class DWSMaterializationStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        environment: str | None = None,
     ) -> tuple[ProgramState, ...]:
         states: list[ProgramState] = []
         seen_row_keys: set[str] = set()
@@ -1610,6 +1656,7 @@ class DWSMaterializationStore:
             connection,
             batch_id=batch_id,
             active_only=active_only,
+            environment=environment,
         ):
             row_key = _key_text(
                 _stored_required_text(raw[0], "row_key"),
@@ -1663,9 +1710,13 @@ class DWSMaterializationStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        target_tables: Iterable[object] | None = None,
     ) -> tuple[DWSBusinessEdgeRow, ...]:
         where, params = self._where_for_batch_and_active(
-            "e", batch_id=batch_id, active_only=active_only
+            "e",
+            batch_id=batch_id,
+            active_only=active_only,
+            target_tables=target_tables,
         )
         join = ACTIVE_BATCH_JOIN if active_only else ""
         rows = self._fetch_rows(
@@ -2666,12 +2717,14 @@ class DWSMaterializationStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        environment: str | None = None,
     ) -> tuple[ProgramState, ...]:
         with self._connection_scope() as connection:
             return self._fetch_program_states(
                 connection,
                 batch_id=batch_id,
                 active_only=active_only,
+                environment=environment,
             )
 
     def read_physical_edges(
@@ -2692,12 +2745,14 @@ class DWSMaterializationStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        target_tables: Iterable[object] | None = None,
     ) -> tuple[LineageEdge, ...]:
         with self._connection_scope() as connection:
             rows = self._fetch_business_rows(
                 connection,
                 batch_id=batch_id,
                 active_only=active_only,
+                target_tables=target_tables,
             )
         return tuple(_business_to_edge(row) for row in rows)
 
