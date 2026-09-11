@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 from io import BytesIO
-from typing import cast
+from typing import Any, cast
 
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -37,6 +37,10 @@ from shared.lineage.reconciliation import (
     ReconciliationStatus,
     TargetSummaryStatus,
     normalize_lineage_comparison_table_key,
+)
+from shared.lineage.reconciliation_suppression import (
+    DWSReconciliationSuppressionStore,
+    load_usable_suppressed_edge_keys,
 )
 from tools.lineage.reconcile_sql_schedule import run as run_reconciliation
 
@@ -203,6 +207,23 @@ def sort_rows(
     )
 
 
+def filter_suppressed_rows(
+    rows: Iterable[LineageReconciliationRow],
+    suppressed_edge_keys: Iterable[tuple[str, str]],
+) -> tuple[LineageReconciliationRow, ...]:
+    """Hide only SQL_ONLY rows whose exact edge identity is usable."""
+
+    keys = frozenset(suppressed_edge_keys)
+    return tuple(
+        row
+        for row in rows
+        if not (
+            _coerce_status(row.status) is ReconciliationStatus.SQL_ONLY
+            and (row.source_table, row.target_table) in keys
+        )
+    )
+
+
 def _export_row_sort_key(row: ReconciliationExportRow) -> tuple[int, str, str]:
     return (
         _STATUS_PRIORITY[_coerce_status(row.status)],
@@ -329,6 +350,7 @@ def build_reconciliation_view_model(
     result: LineageReconciliationResult,
     *,
     target_table: str | None = None,
+    suppressed_edge_keys: Iterable[tuple[str, str]] | None = None,
 ) -> ReconciliationViewModel:
     """Convert one formal result into the target-centric UI model."""
 
@@ -351,21 +373,12 @@ def build_reconciliation_view_model(
     else:
         raise ValueError("a single target_table is required for the UI model")
 
-    rows = tuple(row for row in result.rows if row.target_table == resolved_target)
+    rows = filter_suppressed_rows(
+        (row for row in result.rows if row.target_table == resolved_target),
+        suppressed_edge_keys or (),
+    )
     summary = build_summary(sort_rows(rows))
-    target_summary = next(
-        (
-            item
-            for item in result.target_summaries
-            if item.target_table == resolved_target
-        ),
-        None,
-    )
-    target_status = (
-        target_summary.status
-        if target_summary is not None
-        else _summary_status(summary)
-    )
+    target_status = _summary_status(summary)
     row_views = tuple(
         ReconciliationRowView(
             source_table=row.source_table,
@@ -436,6 +449,7 @@ def reconcile_targets(
     target_tables: Iterable[str],
     *,
     runner: ReconciliationRunner | None = None,
+    suppression_store: Any | None = None,
 ) -> tuple[TargetReconciliationOutcome, ...]:
     """Run each target independently so one failure cannot abort the batch."""
 
@@ -446,7 +460,16 @@ def reconcile_targets(
             continue
         try:
             result = reconcile_target(scope, target, runner=runner)
-            view_model = build_reconciliation_view_model(result, target_table=target)
+            suppressed_edge_keys = (
+                load_usable_suppressed_edge_keys(result, suppression_store)
+                if suppression_store is not None
+                else frozenset()
+            )
+            view_model = build_reconciliation_view_model(
+                result,
+                target_table=target,
+                suppressed_edge_keys=suppressed_edge_keys,
+            )
         except Exception as error:  # noqa: BLE001 - isolate one user target
             outcomes.append(
                 TargetReconciliationOutcome(
@@ -572,6 +595,7 @@ def main(
     *,
     resolver: LineageEnvironmentScopeResolver | None = None,
     runner: ReconciliationRunner | None = None,
+    suppression_store: Any | None = None,
 ) -> None:
     """Collect simple UI input and render independent target results."""
 
@@ -638,8 +662,23 @@ def main(
         put_red_text(escape(str(error)))
         return
 
+    if suppression_store is None:
+        try:
+            suppression_store = DWSReconciliationSuppressionStore(
+                profile=scope.dws_profile
+            )
+        except Exception:
+            # Suppression is presentation-only; an unavailable store leaves
+            # the raw reconciliation rows visible.
+            suppression_store = None
+
     put_markdown("## SQL / 调度血缘对账结果")
-    outcomes = reconcile_targets(scope, targets, runner=runner)
+    outcomes = reconcile_targets(
+        scope,
+        targets,
+        runner=runner,
+        suppression_store=suppression_store,
+    )
     for outcome in outcomes:
         _render_outcome(outcome)
 
