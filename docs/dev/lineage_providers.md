@@ -116,6 +116,30 @@ connection_env:
 `environment` 和 `source_profile` 显式失败，不会回退到 `localhost`、demo 数据库
 或空密码。直接值不会进入 profile 的 `repr`，但仍只能放在被忽略的本地配置中。
 
+### Unified lineage deployment config
+
+`configs/lineage_providers.local.yaml` 是唯一的 lineage deployment config，同时承载
+`mysql_process_profiles`、`svn_profiles`、`production` 和可选的 `scopes`。公开模板
+`configs/lineage_providers.example.yaml` 保持同样的根结构。`scopes` 仅供
+reconciliation Web / `LineageEnvironmentScopeResolver` 使用，例如：
+
+```yaml
+scopes:
+  - name: dev
+    environment: DEV
+    sql_source_profile: mysql_dev_a
+    schedule_source_profile: mysql_dev_a
+    dws_profile: czcb
+    label: DEV
+    enabled: true
+```
+
+`dws_profile` 仍引用 `configs/database.local.yaml`（或公开 database example）中的
+数据库 profile，不把 JDBC 配置放入 lineage provider config。旧 provider 配置没有
+`scopes` 时仍可用于 ingestion、verification 和 materialization；只有 reconciliation
+scope resolver 会对缺失或非法的 `scopes` 返回配置错误。不要创建独立的
+`configs/lineage_scopes.local.yaml`。
+
 `table`、`program_name_column`、`script_code_column` 和可选的
 `expected_target_column` 都会通过 `shared.config.env.safe_identifier` 校验后才
 进入查询模板。运行时数据仍由 cursor 返回，不把用户值拼接进 SQL。

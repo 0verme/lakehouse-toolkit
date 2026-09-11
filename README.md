@@ -82,7 +82,7 @@ python -m tools.lineage.verify_svn_sources \
 | --- | --- |
 | `configs/database.example.yaml` | 可选 JDBC profile 模板 |
 | `configs/audit_datasource.example.yaml` | 本地 PostgreSQL metadata profile |
-| `configs/lineage_providers.example.yaml` | DEV 多 MySQL profile、PROD adapter 与 SVN inventory 完整模板 |
+| `configs/lineage_providers.example.yaml` | DEV 多 MySQL profile、PROD adapter、SVN inventory 与 reconciliation scope 完整模板 |
 | `configs/svn_inventory.example.yaml` | SVN working copy profile 的虚构路径专项最小模板（可选参考） |
 | `docs/dev/lineage_svn_verification.md` | Production SVN Python 清单、主结果表推导与内网验证步骤 |
 | `configs/migrate/clusters.example.json` | 两个 demo 集群的迁移模板 |
