@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from io import BytesIO
+
+from openpyxl import load_workbook
 
 from shared.lineage.domain import LineageEdge
 from shared.lineage.environment_scope import LineageEnvironmentScope
@@ -16,7 +19,15 @@ from shared.lineage.reconciliation import (
 )
 from shared.lineage.schedule import ScheduleLineageEdge
 from tools.lineage.reconcile_sql_schedule_web import (
+    EXPORT_HEADERS,
+    EXPORT_SHEET_TITLE,
+    ReconciliationErrorView,
+    TargetReconciliationOutcome,
+    _render_rows_html,
     build_environment_options,
+    build_excel_bytes,
+    build_export_filename,
+    build_export_rows,
     build_reconciliation_view_model,
     build_summary,
     map_reconciliation_error,
@@ -44,7 +55,12 @@ def make_scope() -> LineageEnvironmentScope:
     )
 
 
-def make_result(target: str = "DWM.RESULT"):
+def make_result(
+    target: str = "DWM.RESULT",
+    *,
+    sql_sources: tuple[str, ...] = ("DWF.A", "DWF.B"),
+    schedule_sources: tuple[str, ...] = ("DWF.A", "DWF.C"),
+):
     sql_edges = tuple(
         LineageEdge(
             environment=ENVIRONMENT,
@@ -55,7 +71,7 @@ def make_result(target: str = "DWM.RESULT"):
             batch_id="batch-sql",
             observed_at=OBSERVED_AT,
         )
-        for source in ("DWF.A", "DWF.B")
+        for source in sql_sources
     )
     schedule_edges = tuple(
         ScheduleLineageEdge(
@@ -68,7 +84,7 @@ def make_result(target: str = "DWM.RESULT"):
             source_table=source,
             target_table=target,
         )
-        for source in ("DWF.A", "DWF.C")
+        for source in schedule_sources
     )
     return reconcile_lineage_snapshots(
         SQLBusinessLineageSnapshot(
@@ -87,6 +103,10 @@ def make_result(target: str = "DWM.RESULT"):
         schedule_source_profile=SCHEDULE_PROFILE,
         target_table=target,
     )
+
+
+def make_empty_result(target: str = "DWM.RESULT"):
+    return make_result(target, sql_sources=(), schedule_sources=())
 
 
 class ReconcileSqlScheduleWebTests(unittest.TestCase):
@@ -166,6 +186,171 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
                 ReconciliationStatus.MATCH,
             ],
         )
+
+    def test_export_rows_keep_all_statuses_and_sort_each_status_deterministically(self):
+        result = make_result(
+            sql_sources=("DWF.Z", "DWF.A"),
+            schedule_sources=("DWF.Y", "DWF.B"),
+        )
+        view_model = build_reconciliation_view_model(result)
+        outcome = TargetReconciliationOutcome(
+            target_table=view_model.target_table,
+            view_model=view_model,
+        )
+
+        export_rows = build_export_rows((outcome,))
+
+        self.assertEqual(
+            [(row.status, row.source_table) for row in export_rows],
+            [
+                (ReconciliationStatus.SQL_ONLY, "DWF.A"),
+                (ReconciliationStatus.SQL_ONLY, "DWF.Z"),
+                (ReconciliationStatus.SCHEDULE_ONLY, "DWF.B"),
+                (ReconciliationStatus.SCHEDULE_ONLY, "DWF.Y"),
+            ],
+        )
+
+    def test_all_match_view_and_export_keep_complete_rows(self):
+        result = make_result(
+            sql_sources=("DWF.A", "DWF.B"),
+            schedule_sources=("DWF.A", "DWF.B"),
+        )
+        view_model = build_reconciliation_view_model(result)
+        outcome = TargetReconciliationOutcome(
+            target_table=view_model.target_table,
+            view_model=view_model,
+        )
+
+        self.assertEqual(len(view_model.rows), 2)
+        self.assertTrue(
+            all(row.status is ReconciliationStatus.MATCH for row in view_model.rows)
+        )
+        self.assertEqual(_render_rows_html(view_model).count("两边一致"), 2)
+        self.assertEqual(len(build_export_rows((outcome,))), 2)
+
+    def test_excel_contains_fixed_headers_all_statuses_and_chinese_values(self):
+        result = make_result()
+        view_model = build_reconciliation_view_model(result)
+        outcome = TargetReconciliationOutcome(
+            target_table=view_model.target_table,
+            view_model=view_model,
+        )
+
+        workbook = load_workbook(BytesIO(build_excel_bytes(build_export_rows((outcome,)))))
+        sheet = workbook[EXPORT_SHEET_TITLE]
+        values = list(sheet.values)
+        workbook.close()
+
+        self.assertEqual(sheet.title, EXPORT_SHEET_TITLE)
+        self.assertEqual(values[0], EXPORT_HEADERS)
+        self.assertEqual(
+            values[1:],
+            [
+                (
+                    "DWM.RESULT",
+                    "DWF.B",
+                    "是",
+                    "否",
+                    "SQL实际调用但调度未配置",
+                ),
+                (
+                    "DWM.RESULT",
+                    "DWF.C",
+                    "否",
+                    "是",
+                    "调度已配置但SQL未调用",
+                ),
+                ("DWM.RESULT", "DWF.A", "是", "是", "两边一致"),
+            ],
+        )
+
+    def test_multi_target_export_uses_one_sheet_and_excludes_failed_target(self):
+        first = build_reconciliation_view_model(make_result("DWM.RESULT_A"))
+        second = build_reconciliation_view_model(
+            make_result("DWM.RESULT_B", sql_sources=("DWF.X",), schedule_sources=("DWF.X",))
+        )
+        outcomes = (
+            TargetReconciliationOutcome(
+                target_table=first.target_table,
+                view_model=first,
+            ),
+            TargetReconciliationOutcome(
+                target_table="DWM.FAIL",
+                error=ReconciliationErrorView(
+                    error_code=SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
+                    message="失败",
+                ),
+            ),
+            TargetReconciliationOutcome(
+                target_table=second.target_table,
+                view_model=second,
+            ),
+        )
+
+        export_rows = build_export_rows(outcomes)
+        workbook = load_workbook(BytesIO(build_excel_bytes(export_rows)))
+        sheet = workbook[EXPORT_SHEET_TITLE]
+        values = list(sheet.values)
+        workbook.close()
+
+        self.assertEqual(workbook.sheetnames, [EXPORT_SHEET_TITLE])
+        target_values = [row[0] for row in values[1:]]
+        self.assertCountEqual(
+            target_values,
+            ["DWM.RESULT_A", "DWM.RESULT_A", "DWM.RESULT_A", "DWM.RESULT_B"],
+        )
+        self.assertNotIn("DWM.FAIL", target_values)
+
+    def test_no_rows_means_no_export_payload(self):
+        empty_view = build_reconciliation_view_model(make_empty_result())
+        outcomes = (
+            TargetReconciliationOutcome(
+                target_table=empty_view.target_table,
+                view_model=empty_view,
+            ),
+            TargetReconciliationOutcome(
+                target_table="DWM.FAIL",
+                error=ReconciliationErrorView(
+                    error_code=SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
+                    message="失败",
+                ),
+            ),
+        )
+
+        self.assertEqual(build_export_rows(outcomes), ())
+
+    def test_export_filename_is_safe_and_omits_profiles_and_batches(self):
+        generated_at = datetime(2026, 9, 11, 15, 5, 0)
+
+        single = build_export_filename(
+            "DEV214",
+            ("DWM.M_JJQD_LIST",),
+            generated_at=generated_at,
+        )
+        multi = build_export_filename(
+            "DEV214",
+            ("DWM.RESULT_A", "DWM.RESULT_B"),
+            generated_at=generated_at,
+        )
+        unsafe = build_export_filename(
+            "DEV:214",
+            ("DWM/M?JJQD|LIST",),
+            generated_at="2026/09/11 15:05:00",
+        )
+
+        self.assertEqual(
+            single,
+            "lineage_reconciliation_DEV214_DWM_M_JJQD_LIST_20260911_150500.xlsx",
+        )
+        self.assertEqual(
+            multi,
+            "lineage_reconciliation_DEV214_20260911_150500.xlsx",
+        )
+        self.assertEqual(
+            unsafe,
+            "lineage_reconciliation_DEV_214_DWM_M_JJQD_LIST_2026_09_11_15_05_00.xlsx",
+        )
+        self.assertFalse(any(character in unsafe for character in ':\\/*?"<>|'))
 
     def test_reconcile_target_passes_resolved_split_scope_to_formal_runner(self):
         captured = {}

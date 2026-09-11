@@ -10,7 +10,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from html import escape
+from io import BytesIO
+from typing import cast
+
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.worksheet.worksheet import Worksheet
 
 from shared.lineage.environment_scope import (
     DISABLED_LINEAGE_ENVIRONMENT,
@@ -23,16 +30,15 @@ from shared.lineage.environment_scope import (
     load_lineage_environment_scope_resolver,
 )
 from shared.lineage.reconciliation import (
+    SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
+    SQL_ACTIVE_SNAPSHOT_NOT_FOUND,
     LineageReconciliationResult,
     LineageReconciliationRow,
     ReconciliationStatus,
-    SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
-    SQL_ACTIVE_SNAPSHOT_NOT_FOUND,
     TargetSummaryStatus,
     normalize_lineage_comparison_table_key,
 )
 from tools.lineage.reconcile_sql_schedule import run as run_reconciliation
-
 
 _STATUS_LABELS = {
     ReconciliationStatus.MATCH: "两边一致",
@@ -52,6 +58,9 @@ _ERROR_MESSAGES = {
     LINEAGE_SCOPE_CONFIG_NOT_FOUND: "未找到 lineage scope 配置文件。",
     LINEAGE_SCOPE_CONFIG_INVALID: "lineage scope 配置无效。",
 }
+EXPORT_SHEET_TITLE = "血缘对账"
+EXPORT_HEADERS = ("目标表", "上游表", "SQL实际调用", "调度已配置", "对账结果")
+_EXPORT_FILENAME_PREFIX = "lineage_reconciliation"
 
 ReconciliationRunner = Callable[..., LineageReconciliationResult]
 
@@ -79,8 +88,32 @@ class ReconciliationRowView:
 
 
 @dataclass(frozen=True, slots=True)
+class ReconciliationExportRow:
+    """Business-facing row projection used by the XLSX export."""
+
+    target_table: str
+    source_table: str
+    sql_actual: bool
+    schedule_configured: bool
+    status: ReconciliationStatus
+
+    @property
+    def status_label(self) -> str:
+        return status_to_label(self.status)
+
+    def as_excel_row(self) -> tuple[str, str, str, str, str]:
+        return (
+            self.target_table,
+            self.source_table,
+            "是" if self.sql_actual else "否",
+            "是" if self.schedule_configured else "否",
+            self.status_label,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationSummary:
-    """Small target-level summary shown above the detail table."""
+    """Compatibility projection retained for callers of the presentation adapter."""
 
     sql_actual_count: int
     schedule_configured_count: int
@@ -168,6 +201,112 @@ def sort_rows(
             ),
         )
     )
+
+
+def _export_row_sort_key(row: ReconciliationExportRow) -> tuple[int, str, str]:
+    return (
+        _STATUS_PRIORITY[_coerce_status(row.status)],
+        row.target_table,
+        row.source_table,
+    )
+
+
+def build_export_rows(
+    outcomes: Iterable[TargetReconciliationOutcome],
+) -> tuple[ReconciliationExportRow, ...]:
+    """Flatten successful target view models into the business export projection."""
+
+    export_rows: list[ReconciliationExportRow] = []
+    for outcome in outcomes:
+        if not isinstance(outcome, TargetReconciliationOutcome):
+            raise TypeError("outcomes must contain TargetReconciliationOutcome values")
+        if outcome.view_model is None:
+            continue
+        view_model = outcome.view_model
+        export_rows.extend(
+            ReconciliationExportRow(
+                target_table=view_model.target_table,
+                source_table=row.source_table,
+                sql_actual=row.sql_actual,
+                schedule_configured=row.schedule_configured,
+                status=row.status,
+            )
+            for row in view_model.rows
+        )
+    return tuple(sorted(export_rows, key=_export_row_sort_key))
+
+
+def build_excel_bytes(
+    rows: Iterable[ReconciliationExportRow],
+) -> bytes:
+    """Build one in-memory XLSX workbook from already-reconciled rows."""
+
+    export_rows = tuple(rows)
+    if any(not isinstance(row, ReconciliationExportRow) for row in export_rows):
+        raise TypeError("rows must contain ReconciliationExportRow values")
+
+    workbook = Workbook()
+    sheet = cast(Worksheet, workbook.active)
+    sheet.title = EXPORT_SHEET_TITLE
+    sheet.append(list(EXPORT_HEADERS))
+    for row in sorted(export_rows, key=_export_row_sort_key):
+        sheet.append(list(row.as_excel_row()))
+
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for column, width in {
+        "A": 30,
+        "B": 42,
+        "C": 14,
+        "D": 14,
+        "E": 34,
+    }.items():
+        sheet.column_dimensions[column].width = width
+
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def sanitize_filename_fragment(value: object) -> str:
+    """Return a readable filename fragment without path or Windows separators."""
+
+    text = str(value).strip().replace(".", "_")
+    safe_text = "".join(
+        character if character.isalnum() or character in ("_", "-") else "_"
+        for character in text
+    )
+    return safe_text.strip("_") or "result"
+
+
+def build_export_filename(
+    environment: str,
+    target_tables: Iterable[str] | str,
+    *,
+    generated_at: datetime | str | None = None,
+) -> str:
+    """Build a safe single- or multi-target XLSX filename without credentials."""
+
+    if isinstance(target_tables, str):
+        targets = (target_tables.strip(),)
+    else:
+        targets = tuple(
+            str(target).strip() for target in target_tables if str(target).strip()
+        )
+    if isinstance(generated_at, datetime):
+        timestamp = generated_at.strftime("%Y%m%d_%H%M%S")
+    elif generated_at is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        timestamp = str(generated_at).strip()
+
+    parts = [_EXPORT_FILENAME_PREFIX, sanitize_filename_fragment(environment)]
+    if len(targets) == 1:
+        parts.append(sanitize_filename_fragment(targets[0]))
+    parts.append(sanitize_filename_fragment(timestamp))
+    return "_".join(parts) + ".xlsx"
 
 
 def build_summary(rows: Iterable[LineageReconciliationRow]) -> ReconciliationSummary:
@@ -410,28 +549,11 @@ def _render_rows_html(view_model: ReconciliationViewModel) -> str:
 
 
 def _render_view_model(view_model: ReconciliationViewModel) -> None:
-    from pywebio.output import put_html, put_text  # pyright: ignore[reportMissingImports]
+    from pywebio.output import put_html  # pyright: ignore[reportMissingImports]
 
-    from shared.ui.pywebio_helper import put_separator, put_table_plus
+    from shared.ui.pywebio_helper import put_separator
 
     put_html(f"<h3>目标表：{escape(view_model.target_table)}</h3>")
-    put_text(f"环境：{view_model.environment}")
-    put_text(f"SQL 血缘来源：{view_model.sql_source_profile}")
-    put_text(f"调度血缘来源：{view_model.schedule_source_profile}")
-    put_text(f"SQL batch：{view_model.sql_batch_id}")
-    put_text(f"Schedule batch：{view_model.schedule_batch_id}")
-    put_text(f"汇总状态：{view_model.status_label}")
-    summary = view_model.summary
-    put_table_plus(
-        [
-            ["汇总项", "数量"],
-            ["SQL 实际上游数", summary.sql_actual_count],
-            ["调度配置上游数", summary.schedule_configured_count],
-            ["MATCH 数", summary.match_count],
-            ["SQL_ONLY 数", summary.sql_only_count],
-            ["SCHEDULE_ONLY 数", summary.schedule_only_count],
-        ]
-    )
     put_html(_render_rows_html(view_model))
     put_separator("-")
 
@@ -459,7 +581,10 @@ def main(
         select,
         textarea,
     )
-    from pywebio.output import put_markdown  # pyright: ignore[reportMissingImports]
+    from pywebio.output import (  # pyright: ignore[reportMissingImports]
+        put_file,
+        put_markdown,
+    )
 
     from shared.ui.pywebio_helper import put_red_text
 
@@ -514,8 +639,17 @@ def main(
         return
 
     put_markdown("## SQL / 调度血缘对账结果")
-    for outcome in reconcile_targets(scope, targets, runner=runner):
+    outcomes = reconcile_targets(scope, targets, runner=runner)
+    for outcome in outcomes:
         _render_outcome(outcome)
+
+    export_rows = build_export_rows(outcomes)
+    if export_rows:
+        put_file(
+            build_export_filename(scope.environment, targets),
+            build_excel_bytes(export_rows),
+            "导出 Excel",
+        )
 
 
 if __name__ == "__main__":
