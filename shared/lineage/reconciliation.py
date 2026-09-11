@@ -896,7 +896,8 @@ def _comparison_key(
 ) -> tuple[str, str, str] | None:
     source = normalize_lineage_comparison_table_key(source_table)
     target = normalize_lineage_comparison_table_key(target_table)
-    # Business lineage never traverses/reintroduces DLO, DWO, or TMP endpoints.
+    # Business lineage never traverses/reintroduces DLO or DWO endpoints.
+    # ``TMP`` naming carries no technical semantics, so it is not filtered here.
     # Schedule facts are filtered at this comparison boundary only; ingestion
     # facts and their raw/comparison values remain unchanged in DWS.
     if not is_business_asset(source) or not is_business_asset(target):

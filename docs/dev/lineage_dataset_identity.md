@@ -102,16 +102,21 @@ namespace。
 
 ## Temporary Objects
 
-TMP / temporary table 仍然属于 `ProgramPhysicalDAG`，用于：
+`TMP` / `TEMP` / `STG` / `TEST` 命名本身不是资产语义证据：`DWP.TMP_X` 与其它
+qualified `schema.table` 完全等价，可以构造正常 `DatasetIdentity`，也不会仅因名称
+退出正式 lineage。完整契约见 [`lineage_asset_semantics.md`](lineage_asset_semantics.md)。
+
+只有显式 `CREATE TEMP` / `CREATE TEMPORARY TABLE` fact 产生的节点才属于 temporary
+physical 节点，用于：
 
 - SQL step connection；
 - internal path traversal；
 - audit；
 - orphan/cycle 诊断和 edge evidence。
 
-TMP 不会因为 DatasetIdentity Contract 自动升级为正式 Dataset asset。最终正式
-`LineageEdge` 仍然只表示 physical formal source dataset → physical formal target
-dataset；TMP collapse 继续发生在现有 materialization boundary。
+temporary physical 节点不会升级为正式 Dataset asset：最终正式 `LineageEdge` 仍然只
+表示 business source dataset → business target dataset；temporary collapse 继续发生
+在现有 materialization boundary。
 
 ## Cross-environment
 

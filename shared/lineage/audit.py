@@ -25,7 +25,6 @@ from shared.lineage.domain import (
     PhysicalNodeKind,
     is_business_asset,
     is_technical_asset,
-    is_temporary_asset,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
 
@@ -917,8 +916,8 @@ def _node_kind_value(
     node = node_map.get(node_key)
     if node is not None and node.kind is not None:
         return node.kind.value
-    if is_temporary_asset(node_key):
-        return PhysicalNodeKind.TEMPORARY_ASSET.value
+    # No explicit temporary evidence: use the neutral default instead of
+    # classifying by table name.
     return PhysicalNodeKind.FORMAL_ASSET.value
 
 

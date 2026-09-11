@@ -38,7 +38,6 @@ from shared.lineage.domain import (
     ProgramState,
     is_business_asset,
     is_technical_asset,
-    is_temporary_asset,
     normalize_lineage_comparison_table_key,
 )
 from shared.lineage.dws_timestamp import (
@@ -635,11 +634,9 @@ def _node_kind(node_key: str, node_map: Mapping[str, Any]) -> str:
     node = node_map.get(node_key)
     if node is not None and getattr(node, "kind", None) is not None:
         return PhysicalNodeKind(node.kind).value
-    return (
-        PhysicalNodeKind.TEMPORARY_ASSET.value
-        if is_temporary_asset(node_key)
-        else PhysicalNodeKind.FORMAL_ASSET.value
-    )
+    # No explicit temporary evidence: use the neutral default.  A table name
+    # never decides a PhysicalNodeKind.
+    return PhysicalNodeKind.FORMAL_ASSET.value
 
 
 def _dataset_key_for_node(
@@ -903,8 +900,6 @@ def _business_row_from_edge(
     pipeline_version: str,
     previous: DWSBusinessEdgeRow | None,
 ) -> DWSBusinessEdgeRow:
-    if is_temporary_asset(edge.source_table) or is_temporary_asset(edge.target_table):
-        raise ValueError("business lineage endpoints must be formal assets")
     if not is_business_asset(edge.source_table, environment=edge.environment) or not is_business_asset(
         edge.target_table,
         environment=edge.environment,
@@ -1171,8 +1166,6 @@ def _validate_physical_row(row: DWSPhysicalEdgeRow) -> DWSPhysicalEdgeRow:
             PhysicalNodeKind.TEMPORARY_ASSET.value,
         }:
             raise ValueError("stored physical edge node kind is invalid")
-        if is_temporary_asset(node) and kind != PhysicalNodeKind.TEMPORARY_ASSET.value:
-            raise ValueError("stored physical edge node kind is inconsistent")
         if dataset != _dataset_key_for_node(row.environment, node, kind):
             raise ValueError("stored physical edge dataset key is inconsistent")
     _decode_json(row.evidence_json)
@@ -1200,10 +1193,10 @@ def _validate_business_row(row: DWSBusinessEdgeRow) -> DWSBusinessEdgeRow:
     if (
         row.source_table != source_identity.canonical_name
         or row.target_table != target_identity.canonical_name
-        or is_temporary_asset(row.source_table)
-        or is_temporary_asset(row.target_table)
     ):
-        raise ValueError("stored business edge endpoint is not formal")
+        raise ValueError(
+            "stored business edge endpoint is not a canonical DatasetIdentity"
+        )
     if not is_business_asset(source_identity) or not is_business_asset(target_identity):
         raise ValueError("stored business edge endpoint is not a Business Asset")
     if row.source_dataset_key != dataset_key(row.environment, row.source_table):
@@ -2128,14 +2121,6 @@ class DWSMaterializationStore:
                 PhysicalNodeKind.TEMPORARY_ASSET.value,
             }:
                 raise ValueError("physical edge node kind is invalid")
-            if (
-                is_temporary_asset(row.source_table)
-                and row.source_node_kind != PhysicalNodeKind.TEMPORARY_ASSET.value
-            ) or (
-                is_temporary_asset(row.target_table)
-                and row.target_node_kind != PhysicalNodeKind.TEMPORARY_ASSET.value
-            ):
-                raise ValueError("TMP physical endpoint must be temporary_asset")
             expected_edge = physical_edge_key(
                 row.environment,
                 row.source_profile,
@@ -2208,10 +2193,6 @@ class DWSMaterializationStore:
                 raise ValueError(
                     "business edge endpoints must be Business Asset values"
                 )
-            if is_temporary_asset(row.source_table) or is_temporary_asset(
-                row.target_table
-            ):
-                raise ValueError("TMP endpoint is forbidden in business lineage")
             expected_source_key = dataset_key(row.environment, row.source_table)
             expected_target_key = dataset_key(row.environment, row.target_table)
             if (

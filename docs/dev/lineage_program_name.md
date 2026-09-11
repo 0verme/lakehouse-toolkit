@@ -44,7 +44,10 @@ DLK_DLO.<TABLE>    -> DLO.<TABLE>
 raw `program_name` 仍保留原始 namespace provenance；模型不另增一个 identity 字段。
 未知 namespace（例如 `DWS_ABC.<TABLE>`）保持原值，不根据 suffix、sink 或相似度猜测
 physical schema。这个 helper 只服务于 program-name-derived target，DatasetIdentity
-仍直接保留 SQL 中观察到的 physical schema。
+仍直接保留 SQL 中观察到的 physical schema。它只做 `schema.table` syntax validation
+与显式 namespace mapping，**不做资产命名分类**：`DWS_DWP.TMP_X -> DWP.TMP_X` 是
+合法结果，`TMP` / `TEMP` / `STG` / `TEST` 名称不会使 target 失效。完整契约见
+[`lineage_asset_semantics.md`](lineage_asset_semantics.md)。
 
 ## Conservative recovery
 
@@ -67,6 +70,8 @@ program-name target authority：
 005:DEMO_DWM.RESULT_A:1:00  -> target=DEMO_DWM.RESULT_A, step=1
 005:DEMO_DWM.RESULT_A:2:00  -> target=DEMO_DWM.RESULT_A, step=2
 005:DEMO_DWM.RESULT_A:1:ABCD -> target=DEMO_DWM.RESULT_A, step=1
+005:DWS_DWP.TMP_X:1:00      -> target=DWP.TMP_X, step=1
+005:DWS_DWP.TMP_P_REPORT_KYW_LIST:1:00 -> target=DWP.TMP_P_REPORT_KYW_LIST, step=1
 ```
 
 三段及其它非 canonical 形态（例如 `005:DWS_DWM.RESULT_A:00`、

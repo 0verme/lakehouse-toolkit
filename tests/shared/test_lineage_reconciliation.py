@@ -557,12 +557,12 @@ class ReconciliationDomainTests(unittest.TestCase):
             ],
         )
 
-    def test_technical_only_schedule_fact_is_not_reintroduced(self):
+    def test_pre_business_schedule_fact_is_not_reintroduced(self):
         result = reconcile_lineage_snapshots(
             sql_snapshot(),
             schedule_snapshot(
                 schedule_edge("DLO.TECHNICAL_ONLY", "DWF.RESULT_A"),
-                schedule_edge("DWF.TMP_1", "DWF.RESULT_A"),
+                schedule_edge("DWO.TECHNICAL_ONLY", "DWF.RESULT_A"),
             ),
             environment=ENVIRONMENT,
             source_profile=PROFILE,
@@ -571,6 +571,24 @@ class ReconciliationDomainTests(unittest.TestCase):
         self.assertEqual(result.rows, ())
         self.assertEqual(
             result.target_summaries[0].status, TargetSummaryStatus.CONSISTENT
+        )
+
+    def test_tmp_named_schedule_source_is_not_treated_as_technical(self):
+        # TMP_ 命名没有业务 / technical 语义：DWF.TMP_1 是普通 DWF 业务资产，
+        # 调度侧独有事实必须正常出现在对账结果中。
+        result = reconcile_lineage_snapshots(
+            sql_snapshot(),
+            schedule_snapshot(schedule_edge("DWF.TMP_1", "DWF.RESULT_A")),
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_table="DWF.RESULT_A",
+        )
+        self.assertEqual(
+            [
+                (row.target_table, row.source_table, row.status)
+                for row in result.rows
+            ],
+            [("DWF.RESULT_A", "DWF.TMP_1", ReconciliationStatus.SCHEDULE_ONLY)],
         )
 
     def test_snapshot_metadata_is_returned_without_freshness_policy(self):

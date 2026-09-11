@@ -63,10 +63,15 @@ LEGACY_AUDIT_POLICY_VERSION = "audit-policy-legacy"
 
 TemporaryAssetRule = Callable[[str], bool]
 
-# 现有 apps/svn_check/core/lakehouse/_sql_parser.py 负责识别 CREATE TEMP
-# TABLE 语句，ddl_rule.py 负责 TMP_ 命名检查。这里不复制 SQL 语句解析，
-# 只为 Physical DAG 提供可替换的资产名称分类边界。
-_DEFAULT_TMP_NAME_RE = re.compile(r"^TMP(?:$|[_-]|\d)")
+# 冻结语义：``TMP`` / ``TEMP`` / ``STG`` / ``TEST`` 名称本身没有资产语义，
+# 不能据此推断 temporary / formal / result / business / technical 事实。
+# 默认规则保持为空，核心流程不再依据表名产生 temporary classification。
+# ``TemporaryAssetRule`` 与 ``is_temporary_asset()`` 仅作为兼容壳保留：调用方
+# 仍可显式传入自己的证据型规则，但默认值不做任何 name-based 推断。
+# Physical DAG 中唯一的 ``TEMPORARY_ASSET`` 来源是显式 SQL fact
+# （``CREATE TEMP`` / ``CREATE TEMPORARY TABLE``），见
+# ``shared/lineage/physical_dag.py``。
+DEFAULT_TEMPORARY_ASSET_RULES: tuple[TemporaryAssetRule, ...] = ()
 
 
 def normalize_asset_name(value: str | None) -> str:
@@ -83,15 +88,6 @@ def normalize_asset_name(value: str | None) -> str:
     return re.sub(r"\s+", "", text)
 
 
-def _default_tmp_name_rule(normalized_name: str) -> bool:
-    short_name = normalized_name.rsplit(".", 1)[-1]
-    return bool(_DEFAULT_TMP_NAME_RE.match(short_name))
-
-
-DEFAULT_TEMPORARY_ASSET_RULES: tuple[TemporaryAssetRule, ...] = (
-    _default_tmp_name_rule,
-)
-
 PROGRAM_NAME_LEGACY_MARKER = "005"
 PROGRAM_NAME_DEFAULT_SUFFIX = "00"
 
@@ -99,11 +95,11 @@ PROGRAM_NAME_DEFAULT_SUFFIX = "00"
 # 也不代表可以配置多个 program-name prefix；legacy grammar 只有固定 marker。
 DEFAULT_PROGRAM_NAME_TARGET_PREFIX: str | None = None
 
-# Program Inventory 是比 canonical program-name parser 更窄的独立职责：它只回答
-# “当前 environment 是否存在一个 active 内部程序声明自己加工某张 schema.table”。
-# 这里只登记真实 active program state 已确认的 prefix；它不是 program-name
-# grammar，也不授予 target authority、step semantics 或 stable identity。
-PROGRAM_INVENTORY_PREFIXES = frozenset({"001", "005"})
+# Program Inventory 只回答“当前 environment 是否存在一个 active 内部程序声明
+# 自己加工某张 schema.table”。它不是第二套 marker registry：只有 canonical
+# legacy marker ``005`` 提供 Program Result / Program Inventory 权威证据。
+# 该常量由 PROGRAM_NAME_LEGACY_MARKER 派生，保留名称只为兼容既有 import。
+PROGRAM_INVENTORY_PREFIXES = frozenset({PROGRAM_NAME_LEGACY_MARKER})
 
 _PROGRAM_NAME_STEP_RE = re.compile(r"^[1-9]\d*$")
 _DECLARED_TARGET_RE = re.compile(
@@ -190,9 +186,11 @@ class ProgramNameSemantics:
 def normalize_legacy_program_namespace(target: object) -> str | None:
     """将 program-name-derived target 的已确认 legacy namespace 规范化。
 
-    只处理显式 contract 中的 namespace mapping；未知 schema 保持原值，
-    不通过 prefix/suffix 相似度猜测 physical schema。该 helper 只属于
-    program-name target authority 边界，DatasetIdentity 不调用它。
+    只做两件事：``schema.table`` syntax validation 与显式 contract 中的
+    namespace mapping。未知 schema 保持原值，不通过 prefix/suffix 相似度猜测
+    physical schema，也不做资产命名分类：``DWS_DWP.TMP_X`` 会正常规范化为
+    ``DWP.TMP_X``。该 helper 只属于 program-name target authority 边界，
+    DatasetIdentity 不调用它。
     """
 
     token = decode_code(target).strip().upper()
@@ -202,10 +200,7 @@ def normalize_legacy_program_namespace(target: object) -> str | None:
     schema = _LEGACY_PROGRAM_NAMESPACE_MAP.get(
         match.group("schema"), match.group("schema")
     )
-    candidate = f"{schema}.{match.group('table')}"
-    if is_temporary_asset(candidate):
-        return None
-    return candidate
+    return f"{schema}.{match.group('table')}"
 
 
 def normalize_lineage_comparison_table_key(value: object) -> str:
@@ -226,31 +221,31 @@ def normalize_lineage_comparison_table_key(value: object) -> str:
 def normalize_program_inventory_target(program_name: object) -> str | None:
     """Return the declared target used only by the program inventory contract.
 
-    Program inventory deliberately has a smaller, independent responsibility
-    than :func:`parse_program_name`.  Its grammar is
-    ``<inventory_prefix>:<qualified_schema_table>[:...]``: only the first
-    segment (an explicitly confirmed inventory prefix) and the second segment
-    (a qualified ``schema.table``) are interpreted.  Every following segment is
-    ignored, so it can never become a step, a canonical target authority or
-    part of a stable identity.  Namespace normalization reuses the same
-    explicit legacy registry; no basename or fuzzy schema guessing is added.
+    Only the canonical ``005`` marker provides Program Result authority.  Its
+    grammar is ``005:<qualified_schema_table>[:...]``: the second segment is
+    interpreted and every following segment is ignored, so no trailing token
+    can become a step, a canonical target authority or part of a stable
+    identity.  Namespace normalization reuses the same explicit legacy
+    registry, so ``DWS_DWP.TMP_X`` becomes ``DWP.TMP_X``; no basename or fuzzy
+    schema guessing is added and table names are never classified.
 
-    A name without ``:`` is not a program-inventory declaration and yields
-    ``None``.  A confirmed prefix with a malformed target, and any unconfirmed
-    prefix, raise ``ValueError`` so callers fail open instead of classifying a
-    real internal program as ``NO_INTERNAL_PROGRAM``.
+    Anything without the ``005`` marker (``001:``, ``002:``, ``ABC:`` or a
+    plain name) is simply not a Program Result declaration: it is not an error
+    and yields ``None`` so the caller skips it without fail-open.  A ``005``
+    declaration with a malformed target (``005:``, ``005:ABC``,
+    ``005:not-qualified``) is authoritative evidence that cannot be honoured;
+    it raises ``ValueError`` so callers fail open instead of hiding SQL_ONLY
+    rows.
     """
 
     normalized_name = decode_code(program_name).strip()
     if not normalized_name or ":" not in normalized_name:
         return None
     parts = normalized_name.split(":")
-    prefix = parts[0].strip().upper()
-    if prefix not in PROGRAM_INVENTORY_PREFIXES:
-        raise ValueError(
-            f"unsupported active program inventory prefix: {prefix or '<empty>'}"
-        )
-    target_token = parts[1].strip()
+    marker = parts[0].strip().upper()
+    if marker != PROGRAM_NAME_LEGACY_MARKER:
+        return None
+    target_token = parts[1].strip() if len(parts) > 1 else ""
     target = normalize_legacy_program_namespace(target_token)
     if target is None:
         raise ValueError(
@@ -394,10 +389,13 @@ def is_temporary_asset(
     *,
     rules: tuple[TemporaryAssetRule, ...] | None = None,
 ) -> bool:
-    """判断资产名称是否符合默认或调用方提供的 TMP 规则。
+    """兼容壳：默认不再从资产名称推出 temporary 事实。
 
-    规则接收已大写、去空白和去引号的完整名称，例如 ``DWM.TMP_1``。
-    ``rules=()`` 可显式关闭默认规则；不会把未知命名静默默认定为 TMP。
+    ``DEFAULT_TEMPORARY_ASSET_RULES`` 为空，因此默认调用对任何名称都返回
+    ``False``：``TMP`` / ``TEMP`` / ``STG`` / ``TEST`` 都是普通表名。只有调用方
+    显式传入自己的证据型规则时才可能返回 ``True``。核心 lineage 流程不得依赖
+    名称推断；显式 ``CREATE TEMP/TEMPORARY TABLE`` fact 仍通过
+    ``PhysicalNodeKind.TEMPORARY_ASSET`` 表达。
     """
 
     normalized = normalize_asset_name(asset_name)
@@ -410,7 +408,7 @@ def is_formal_asset(
     *,
     rules: tuple[TemporaryAssetRule, ...] | None = None,
 ) -> bool:
-    """判断名称是否为非 TMP 的候选正式资产。"""
+    """兼容壳：名称分类不再产生 temporary 语义，因此只要求名称非空。"""
 
     normalized = normalize_asset_name(asset_name)
     return bool(normalized) and not is_temporary_asset(normalized, rules=rules)
@@ -524,8 +522,10 @@ class DatasetIdentity:
 
     Identity 只有 ``environment + canonical_schema + canonical_table``；不含
     ``source_profile``、platform、catalog 或其它数据库层级。canonicalization
-    只清理格式并保留 SQL 中观察到的物理 schema，不做 namespace 推断或改写。
-    TMP 和缺失 schema 的引用不能构成此对象。
+    只清理格式并保留 SQL 中观察到的物理 schema，不做 namespace 推断或改写，
+    也不根据表名推断 temporary / formal / business 语义：``DWP.TMP_X`` 与其它
+    qualified ``schema.table`` 一样是合法 identity。缺失 schema 的引用不能构成
+    此对象。
     """
 
     environment: str
@@ -536,9 +536,6 @@ class DatasetIdentity:
         _require_text(self.environment, "environment")
         schema = canonicalize_schema(self.canonical_schema)
         table = canonicalize_table(self.canonical_table)
-        canonical_name = f"{schema}.{table}"
-        if is_temporary_asset(canonical_name):
-            raise ValueError("temporary assets cannot be DatasetIdentity values")
         object.__setattr__(self, "environment", self.environment.strip())
         object.__setattr__(self, "canonical_schema", schema)
         object.__setattr__(self, "canonical_table", table)
@@ -634,17 +631,14 @@ def is_technical_asset(
 ) -> bool:
     """Return whether a qualified asset is DLO/DWO technical-only lineage.
 
+    The boundary is decided exclusively by the explicit schema/layer registry
+    (``PRE_BUSINESS_ASSET_SCHEMAS``); table naming never participates.
     ``environment`` is optional for callers that already have a canonical
     ``schema.table`` value.  Passing it makes the check go through
     ``DatasetIdentity`` and therefore uses the same identity validation as
     ``LineageEdge``.
     """
 
-    if isinstance(asset_name, DatasetIdentity):
-        if is_temporary_asset(asset_name.canonical_name):
-            return False
-    elif is_temporary_asset(asset_name if isinstance(asset_name, str) else None):
-        return False
     schema = _asset_schema_for_boundary(asset_name, environment=environment)
     return schema in PRE_BUSINESS_ASSET_SCHEMAS
 
@@ -658,15 +652,11 @@ def is_business_asset(
 
     DLO and DWO (including their registered DWS/legacy wrappers) remain valid
     ``DatasetIdentity``/Physical DAG values but are deliberately excluded from
-    Business Lineage endpoints.  Other existing qualified formal sources keep
-    the compatibility behavior of the current table-level contract.
+    Business Lineage endpoints.  The boundary is decided exclusively by the
+    explicit schema/layer registry; ``TMP`` / ``TEMP`` / ``STG`` / ``TEST``
+    naming is not lineage evidence and never changes this answer.
     """
 
-    if isinstance(asset_name, DatasetIdentity):
-        if is_temporary_asset(asset_name.canonical_name):
-            return False
-    elif is_temporary_asset(asset_name if isinstance(asset_name, str) else None):
-        return False
     schema = _asset_schema_for_boundary(asset_name, environment=environment)
     return schema is not None and schema not in PRE_BUSINESS_ASSET_SCHEMAS
 
@@ -959,7 +949,14 @@ class ProgramState:
 
 @dataclass(frozen=True, slots=True)
 class PhysicalNode:
-    """程序内部 DAG 节点；TMP 节点必须在 Physical 层保留。"""
+    """程序内部 DAG 节点；显式 temporary 节点必须在 Physical 层保留。
+
+    ``kind=None`` 表示调用方没有提供临时表 evidence，此时使用中性的
+    ``FORMAL_ASSET`` 默认值。表名不参与分类：``TMP_*`` / ``TEMP_*`` / ``STG_*``
+    / ``TEST_*`` 不会再自动变成 ``TEMPORARY_ASSET``。唯一会得到
+    ``TEMPORARY_ASSET`` 的来源是显式 SQL fact（``CREATE TEMP`` /
+    ``CREATE TEMPORARY TABLE``）或调用方显式传入的 ``kind``。
+    """
 
     node_key: str
     asset_name: str
@@ -969,13 +966,9 @@ class PhysicalNode:
         _require_text(self.node_key, "node_key")
         _require_text(self.asset_name, "asset_name")
         resolved_kind = (
-            PhysicalNodeKind(self.kind)
-            if self.kind is not None
-            else (
-                PhysicalNodeKind.TEMPORARY_ASSET
-                if is_temporary_asset(self.asset_name)
-                else PhysicalNodeKind.FORMAL_ASSET
-            )
+            PhysicalNodeKind.FORMAL_ASSET
+            if self.kind is None
+            else PhysicalNodeKind(self.kind)
         )
         object.__setattr__(self, "kind", resolved_kind)
 
@@ -1011,10 +1004,13 @@ class LineageEdge:
     """正式资产之间的直接业务血缘事实。
 
     一条 ``LineageEdge`` 表示某环境下，一个 Business Asset 上游到一个 Business Asset
-    下游的直接业务血缘事实。它不是全量递归祖先关系；TMP、DLO、DWO 只在 Physical
-    DAG/collapse evidence 阶段保留，不能作为 Business endpoint 进入此对象。source/target 必须是
-    可解析的 ``schema.table`` DatasetIdentity；``evidence`` 可携带不含完整源码
-    的结构化 provenance，供 materialization adapter 序列化。
+    下游的直接业务血缘事实。它不是全量递归祖先关系；DLO、DWO 只在 Physical
+    DAG/collapse evidence 阶段保留，不能作为 Business endpoint 进入此对象。
+    ``TMP`` / ``TEMP`` / ``STG`` / ``TEST`` 命名没有任何核心血缘语义，因此名字本身
+    不会拒绝一个 endpoint；能否成为正式 edge 只由 business boundary / Program
+    Result / schema boundary 规则决定。source/target 必须是可解析的
+    ``schema.table`` DatasetIdentity；``evidence`` 可携带不含完整源码的结构化
+    provenance，供 materialization adapter 序列化。
     """
 
     environment: str
@@ -1039,12 +1035,6 @@ class LineageEdge:
             "target_table",
         ):
             _require_text(getattr(self, field_name), field_name)
-        if is_temporary_asset(self.source_table) or is_temporary_asset(
-            self.target_table
-        ):
-            raise ValueError(
-                "LineageEdge endpoints must be formal assets; keep TMP in Physical DAG"
-            )
         source_identity = DatasetIdentity.from_name(self.environment, self.source_table)
         target_identity = DatasetIdentity.from_name(self.environment, self.target_table)
         if source_identity is None or target_identity is None:

@@ -142,7 +142,9 @@ class DatasetIdentityContractTests(unittest.TestCase):
                 target_table="DWM.TABLE_B",
             )
 
-    def test_tmp_stays_in_physical_dag_and_is_not_a_dataset(self):
+    def test_tmp_name_is_not_dataset_identity_evidence(self):
+        # ``CREATE TEMP`` 事实仍让 TMP_STAGE 保持 temporary；但 TMP 名称本身不再
+        # 阻止 DatasetIdentity 构造。
         source = ProgramSource(
             environment="DEV200",
             source_profile="fixture",
@@ -161,7 +163,10 @@ class DatasetIdentityContractTests(unittest.TestCase):
         )
 
         self.assertTrue(dag.node_map["TMP_STAGE"].is_temporary)
-        self.assertIsNone(DatasetIdentity.from_name("DEV200", "DWM.TMP_STAGE"))
+        tmp_stage_identity = DatasetIdentity.from_name("DEV200", "DWM.TMP_STAGE")
+        self.assertIsNotNone(tmp_stage_identity)
+        assert tmp_stage_identity is not None
+        self.assertEqual(tmp_stage_identity.canonical_name, "DWM.TMP_STAGE")
         self.assertEqual(len(result.edges), 1)
         self.assertEqual(
             result.edges[0].source_dataset_identity.canonical_table, "TABLE_A"
@@ -175,6 +180,39 @@ class DatasetIdentityContractTests(unittest.TestCase):
                 result.edges[0].source_table,
                 result.edges[0].target_table,
             },
+        )
+
+    def test_tmp_named_table_without_create_temp_fact_is_a_normal_dataset(self):
+        source = ProgramSource(
+            environment="DEV200",
+            source_profile="fixture",
+            program_name="PROGRAM_TMP_NAMED_TABLE",
+            script_code=(
+                "INSERT INTO DWM.TMP_X SELECT * FROM DWP.TMP_P_REPORT_KYW_LIST"
+            ),
+            expected_target="DWM.TMP_X",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            batch_id="batch-tmp-named-table",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertFalse(dag.node_map["DWM.TMP_X"].is_temporary)
+        self.assertFalse(dag.node_map["DWP.TMP_P_REPORT_KYW_LIST"].is_temporary)
+        self.assertEqual(
+            {(edge.source, edge.target) for edge in dag.edges},
+            {("DWP.TMP_P_REPORT_KYW_LIST", "DWM.TMP_X")},
+        )
+        self.assertEqual(len(result.edges), 1)
+        self.assertEqual(
+            result.edges[0].source_dataset_identity,
+            DatasetIdentity("DEV200", "DWP", "TMP_P_REPORT_KYW_LIST"),
+        )
+        self.assertEqual(
+            result.edges[0].target_dataset_identity,
+            DatasetIdentity("DEV200", "DWM", "TMP_X"),
         )
 
     def test_same_named_edges_from_multiple_environments_are_not_collapsed(self):

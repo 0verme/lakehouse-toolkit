@@ -1037,6 +1037,8 @@ def _classify_statement(sanitized_sql: str) -> _StatementTarget:
     create_table_match = _CREATE_TABLE_PATTERN.search(sanitized_sql)
     if create_table_match:
         modifiers = create_table_match.group("modifiers").upper()
+        # 显式 DDL fact：这是 Core lineage 中唯一可以产生
+        # ``PhysicalNodeKind.TEMPORARY_ASSET`` 的来源，不由表名推断。
         return _matched_target(
             "create_table",
             create_table_match,
@@ -1246,6 +1248,9 @@ def build_program_physical_dag(
     written_targets: list[str] = []
 
     def add_node(asset_name: str, *, temporary: bool = False) -> None:
+        # ``temporary`` 只来自显式 SQL fact（``CREATE TEMP``/``CREATE TEMPORARY
+        # TABLE``）。表名永远不参与分类：没有 evidence 时 ``kind=None``，由
+        # ``PhysicalNode`` 使用中性的 ``FORMAL_ASSET`` 默认值。
         current = nodes.get(asset_name)
         if current is None:
             nodes[asset_name] = PhysicalNode(
