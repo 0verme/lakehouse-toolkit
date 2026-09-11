@@ -128,7 +128,8 @@ class LineageReconciliationRow:
     """One deduplicated business ``source_table -> target_table`` comparison."""
 
     environment: str
-    source_profile: str
+    sql_source_profile: str
+    schedule_source_profile: str
     source_table: str
     target_table: str
     sql_present: bool
@@ -141,11 +142,17 @@ class LineageReconciliationRow:
 
     def __post_init__(self) -> None:
         _required_text(self.environment, "environment")
-        _required_text(self.source_profile, "source_profile")
+        _required_text(self.sql_source_profile, "sql_source_profile")
+        _required_text(self.schedule_source_profile, "schedule_source_profile")
         source = normalize_lineage_comparison_table_key(self.source_table)
         target = normalize_lineage_comparison_table_key(self.target_table)
         object.__setattr__(self, "environment", self.environment.strip())
-        object.__setattr__(self, "source_profile", self.source_profile.strip())
+        object.__setattr__(self, "sql_source_profile", self.sql_source_profile.strip())
+        object.__setattr__(
+            self,
+            "schedule_source_profile",
+            self.schedule_source_profile.strip(),
+        )
         object.__setattr__(self, "source_table", source)
         object.__setattr__(self, "target_table", target)
         if not isinstance(self.sql_present, bool) or not isinstance(
@@ -172,10 +179,21 @@ class LineageReconciliationRow:
         if self.schedule_present != (self.schedule_fact_count > 0):
             raise ValueError("schedule_present does not match schedule_fact_count")
 
+    @property
+    def source_profile(self) -> str | None:
+        """Return the legacy profile only when both sides use the same value."""
+
+        return (
+            self.sql_source_profile
+            if self.sql_source_profile == self.schedule_source_profile
+            else None
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "environment": self.environment,
-            "source_profile": self.source_profile,
+            "sql_source_profile": self.sql_source_profile,
+            "schedule_source_profile": self.schedule_source_profile,
             "source_table": self.source_table,
             "target_table": self.target_table,
             "sql_present": self.sql_present,
@@ -193,7 +211,8 @@ class LineageReconciliationTargetSummary:
     """Target-centric projection of row-level reconciliation results."""
 
     environment: str
-    source_profile: str
+    sql_source_profile: str
+    schedule_source_profile: str
     target_table: str
     sql_source_count: int
     schedule_source_count: int
@@ -204,9 +223,15 @@ class LineageReconciliationTargetSummary:
 
     def __post_init__(self) -> None:
         _required_text(self.environment, "environment")
-        _required_text(self.source_profile, "source_profile")
+        _required_text(self.sql_source_profile, "sql_source_profile")
+        _required_text(self.schedule_source_profile, "schedule_source_profile")
         object.__setattr__(self, "environment", self.environment.strip())
-        object.__setattr__(self, "source_profile", self.source_profile.strip())
+        object.__setattr__(self, "sql_source_profile", self.sql_source_profile.strip())
+        object.__setattr__(
+            self,
+            "schedule_source_profile",
+            self.schedule_source_profile.strip(),
+        )
         object.__setattr__(
             self,
             "target_table",
@@ -233,10 +258,21 @@ class LineageReconciliationTargetSummary:
         if self.status is not expected:
             raise ValueError("target summary status does not match row counts")
 
+    @property
+    def source_profile(self) -> str | None:
+        """Return the legacy profile only when both sides use the same value."""
+
+        return (
+            self.sql_source_profile
+            if self.sql_source_profile == self.schedule_source_profile
+            else None
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "environment": self.environment,
-            "source_profile": self.source_profile,
+            "sql_source_profile": self.sql_source_profile,
+            "schedule_source_profile": self.schedule_source_profile,
             "target_table": self.target_table,
             "sql_source_count": self.sql_source_count,
             "schedule_source_count": self.schedule_source_count,
@@ -252,7 +288,8 @@ class LineageReconciliationResult:
     """Deterministic row and target summary result for two active snapshots."""
 
     environment: str
-    source_profile: str
+    sql_source_profile: str
+    schedule_source_profile: str
     rows: tuple[LineageReconciliationRow, ...]
     target_summaries: tuple[LineageReconciliationTargetSummary, ...]
     sql_batch_id: str
@@ -264,11 +301,17 @@ class LineageReconciliationResult:
 
     def __post_init__(self) -> None:
         _required_text(self.environment, "environment")
-        _required_text(self.source_profile, "source_profile")
+        _required_text(self.sql_source_profile, "sql_source_profile")
+        _required_text(self.schedule_source_profile, "schedule_source_profile")
         _required_text(self.sql_batch_id, "sql_batch_id")
         _required_text(self.schedule_batch_id, "schedule_batch_id")
         object.__setattr__(self, "environment", self.environment.strip())
-        object.__setattr__(self, "source_profile", self.source_profile.strip())
+        object.__setattr__(self, "sql_source_profile", self.sql_source_profile.strip())
+        object.__setattr__(
+            self,
+            "schedule_source_profile",
+            self.schedule_source_profile.strip(),
+        )
         rows = tuple(self.rows)
         summaries = tuple(self.target_summaries)
         if any(not isinstance(row, LineageReconciliationRow) for row in rows):
@@ -288,13 +331,15 @@ class LineageReconciliationResult:
             raise ValueError("target summaries contain duplicate target tables")
         if any(
             row.environment != self.environment
-            or row.source_profile != self.source_profile
+            or row.sql_source_profile != self.sql_source_profile
+            or row.schedule_source_profile != self.schedule_source_profile
             for row in rows
         ):
             raise ValueError("reconciliation row is outside the requested scope")
         if any(
             summary.environment != self.environment
-            or summary.source_profile != self.source_profile
+            or summary.sql_source_profile != self.sql_source_profile
+            or summary.schedule_source_profile != self.schedule_source_profile
             for summary in summaries
         ):
             raise ValueError("target summary is outside the requested scope")
@@ -322,6 +367,16 @@ class LineageReconciliationResult:
             raise ValueError("sql_edge_count does not match reconciliation rows")
         if self.schedule_edge_count != sum(row.schedule_fact_count for row in rows):
             raise ValueError("schedule_edge_count does not match reconciliation rows")
+
+    @property
+    def source_profile(self) -> str | None:
+        """Return the legacy profile only when both sides use the same value."""
+
+        return (
+            self.sql_source_profile
+            if self.sql_source_profile == self.schedule_source_profile
+            else None
+        )
 
     @property
     def match_count(self) -> int:
@@ -354,7 +409,8 @@ class LineageReconciliationResult:
     def aggregate_dict(self) -> dict[str, object]:
         return {
             "environment": self.environment,
-            "source_profile": self.source_profile,
+            "sql_source_profile": self.sql_source_profile,
+            "schedule_source_profile": self.schedule_source_profile,
             "sql_edges": self.sql_edge_count,
             "schedule_edges": self.schedule_edge_count,
             "reconciliation_rows": len(self.rows),
@@ -416,7 +472,7 @@ def read_active_sql_business_snapshot(
         raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
     active_batch_id = active_batch_id.strip()
     metadata = reader.get_batch_metadata(active_batch_id)
-    if metadata is None or getattr(metadata, "is_active", None) is not True:
+    if metadata is None or not _is_true(getattr(metadata, "is_active", None)):
         raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
     observed_at = getattr(metadata, "observed_at", None)
     if not isinstance(observed_at, datetime):
@@ -442,9 +498,14 @@ def read_active_sql_business_snapshot(
         edge.batch_id is not None and edge.batch_id != active_batch_id for edge in edges
     ):
         raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+    scoped_edges = tuple(
+        edge
+        for edge in edges
+        if edge.environment == scope[0] and edge.source_profile == scope[1]
+    )
     return SQLBusinessLineageSnapshot(
         batch_id=active_batch_id,
-        edges=edges,
+        edges=scoped_edges,
         observed_at=observed_at,
         snapshot_scope=snapshot_scope,
     )
@@ -477,7 +538,7 @@ def read_active_schedule_snapshot(
     for row in rows:
         if getattr(row, "batch_id", None) != active_batch_id:
             raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-        if getattr(row, "is_active", None) is not True:
+        if not _is_true(getattr(row, "is_active", None)):
             raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
         edge = getattr(row, "edge", None)
         if not isinstance(edge, ScheduleLineageEdge):
@@ -507,26 +568,34 @@ def reconcile_active_dws_lineage(
     schedule_reader: ScheduleLineageReader,
     *,
     environment: str,
-    source_profile: str,
+    sql_source_profile: str | None = None,
+    schedule_source_profile: str | None = None,
+    source_profile: str | None = None,
     target_table: str | None = None,
 ) -> LineageReconciliationResult:
     """Reconcile two existing DWS active readers without touching source systems."""
 
+    sql_profile, schedule_profile = _resolve_source_profiles(
+        source_profile=source_profile,
+        sql_source_profile=sql_source_profile,
+        schedule_source_profile=schedule_source_profile,
+    )
     sql_snapshot = read_active_sql_business_snapshot(
         sql_reader,
         environment=environment,
-        source_profile=source_profile,
+        source_profile=sql_profile,
     )
     schedule_snapshot = read_active_schedule_snapshot(
         schedule_reader,
         environment=environment,
-        source_profile=source_profile,
+        source_profile=schedule_profile,
     )
     return reconcile_lineage_snapshots(
         sql_snapshot,
         schedule_snapshot,
         environment=environment,
-        source_profile=source_profile,
+        sql_source_profile=sql_profile,
+        schedule_source_profile=schedule_profile,
         target_table=target_table,
     )
 
@@ -536,17 +605,25 @@ def reconcile_lineage_snapshots(
     schedule_snapshot: ScheduleLineageSnapshot,
     *,
     environment: str,
-    source_profile: str,
+    sql_source_profile: str | None = None,
+    schedule_source_profile: str | None = None,
+    source_profile: str | None = None,
     target_table: str | None = None,
 ) -> LineageReconciliationResult:
-    """Perform deterministic set reconciliation for one strict scope."""
+    """Perform deterministic set reconciliation for one strict environment."""
 
-    scope = _validate_scope(environment, source_profile)
+    sql_profile, schedule_profile = _resolve_source_profiles(
+        source_profile=source_profile,
+        sql_source_profile=sql_source_profile,
+        schedule_source_profile=schedule_source_profile,
+    )
+    sql_scope = _validate_scope(environment, sql_profile)
+    schedule_scope = _validate_scope(environment, schedule_profile)
     if not isinstance(sql_snapshot, SQLBusinessLineageSnapshot):
         raise TypeError("sql_snapshot must be SQLBusinessLineageSnapshot")
     if not isinstance(schedule_snapshot, ScheduleLineageSnapshot):
         raise TypeError("schedule_snapshot must be ScheduleLineageSnapshot")
-    if sql_snapshot.snapshot_scope and scope not in sql_snapshot.snapshot_scope:
+    if sql_snapshot.snapshot_scope and sql_scope not in sql_snapshot.snapshot_scope:
         raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
     resolved_target = (
         None
@@ -554,20 +631,19 @@ def reconcile_lineage_snapshots(
         else normalize_lineage_comparison_table_key(target_table)
     )
 
-    sql_values: dict[tuple[str, str, str, str], _ComparisonAccumulator] = {}
-    schedule_values: dict[tuple[str, str, str, str], _ComparisonAccumulator] = {}
+    sql_values: dict[tuple[str, str, str], _ComparisonAccumulator] = {}
+    schedule_values: dict[tuple[str, str, str], _ComparisonAccumulator] = {}
     for edge in sql_snapshot.edges:
         if not isinstance(edge, LineageEdge):
             raise TypeError("SQL snapshot edges must contain LineageEdge values")
-        if edge.environment != scope[0] or edge.source_profile != scope[1]:
+        if edge.environment != sql_scope[0] or edge.source_profile != sql_scope[1]:
             continue
         key = _comparison_key(
             edge.environment,
-            edge.source_profile,
             edge.source_table,
             edge.target_table,
         )
-        if key is None or (resolved_target is not None and key[2] != resolved_target):
+        if key is None or (resolved_target is not None and key[1] != resolved_target):
             continue
         aggregate = sql_values.setdefault(key, _ComparisonAccumulator())
         aggregate.sql_fact_count += 1
@@ -579,15 +655,17 @@ def reconcile_lineage_snapshots(
             raise TypeError(
                 "schedule snapshot edges must contain ScheduleLineageEdge values"
             )
-        if edge.environment != scope[0] or edge.source_profile != scope[1]:
+        if (
+            edge.environment != schedule_scope[0]
+            or edge.source_profile != schedule_scope[1]
+        ):
             continue
         key = _comparison_key(
             edge.environment,
-            edge.source_profile,
             edge.source_table,
             edge.target_table,
         )
-        if key is None or (resolved_target is not None and key[2] != resolved_target):
+        if key is None or (resolved_target is not None and key[1] != resolved_target):
             continue
         aggregate = schedule_values.setdefault(key, _ComparisonAccumulator())
         aggregate.schedule_fact_count += 1
@@ -603,9 +681,10 @@ def reconcile_lineage_snapshots(
         rows.append(
             LineageReconciliationRow(
                 environment=key[0],
-                source_profile=key[1],
-                source_table=key[3],
-                target_table=key[2],
+                sql_source_profile=sql_profile,
+                schedule_source_profile=schedule_profile,
+                source_table=key[2],
+                target_table=key[1],
                 sql_present=sql_present,
                 schedule_present=schedule_present,
                 status=_resolve_status(sql_present, schedule_present),
@@ -618,13 +697,15 @@ def reconcile_lineage_snapshots(
 
     summaries = _build_target_summaries(
         rows,
-        environment=scope[0],
-        source_profile=scope[1],
+        environment=sql_scope[0],
+        sql_source_profile=sql_profile,
+        schedule_source_profile=schedule_profile,
         target_table=resolved_target,
     )
     return LineageReconciliationResult(
-        environment=scope[0],
-        source_profile=scope[1],
+        environment=sql_scope[0],
+        sql_source_profile=sql_profile,
+        schedule_source_profile=schedule_profile,
         rows=tuple(rows),
         target_summaries=summaries,
         sql_batch_id=sql_snapshot.batch_id,
@@ -646,10 +727,9 @@ class _ComparisonAccumulator:
 
 def _comparison_key(
     environment: str,
-    source_profile: str,
     source_table: str,
     target_table: str,
-) -> tuple[str, str, str, str] | None:
+) -> tuple[str, str, str] | None:
     source = normalize_lineage_comparison_table_key(source_table)
     target = normalize_lineage_comparison_table_key(target_table)
     # Business lineage never traverses/reintroduces DLO, DWO, or TMP endpoints.
@@ -657,14 +737,15 @@ def _comparison_key(
     # facts and their raw/comparison values remain unchanged in DWS.
     if not is_business_asset(source) or not is_business_asset(target):
         return None
-    return (environment, source_profile, target, source)
+    return (environment, target, source)
 
 
 def _build_target_summaries(
     rows: Iterable[LineageReconciliationRow],
     *,
     environment: str,
-    source_profile: str,
+    sql_source_profile: str,
+    schedule_source_profile: str,
     target_table: str | None,
 ) -> tuple[LineageReconciliationTargetSummary, ...]:
     values = tuple(rows)
@@ -697,7 +778,8 @@ def _build_target_summaries(
         summaries.append(
             LineageReconciliationTargetSummary(
                 environment=environment,
-                source_profile=source_profile,
+                sql_source_profile=sql_source_profile,
+                schedule_source_profile=schedule_source_profile,
                 target_table=target,
                 sql_source_count=len(sql_sources),
                 schedule_source_count=len(schedule_sources),
@@ -721,16 +803,51 @@ def _resolve_status(sql_present: bool, schedule_present: bool) -> Reconciliation
 def _row_sort_key(row: LineageReconciliationRow) -> tuple[str, ...]:
     return (
         row.environment,
-        row.source_profile,
         row.target_table,
         row.source_table,
         row.status.value,
     )
 
 
-def _key_sort_key(key: tuple[str, str, str, str]) -> tuple[str, ...]:
-    environment, source_profile, target, source = key
-    return (environment, source_profile, target, source)
+def _key_sort_key(key: tuple[str, str, str]) -> tuple[str, ...]:
+    environment, target, source = key
+    return (environment, target, source)
+
+
+def _resolve_source_profiles(
+    *,
+    source_profile: str | None,
+    sql_source_profile: str | None,
+    schedule_source_profile: str | None,
+) -> tuple[str, str]:
+    """Resolve the split profile contract and reject ambiguous shorthand."""
+
+    if source_profile is not None:
+        legacy_profile = _required_text(source_profile, "source_profile")
+        resolved_sql = legacy_profile
+        resolved_schedule = legacy_profile
+        if sql_source_profile is not None:
+            resolved_sql = _required_text(sql_source_profile, "sql_source_profile")
+            if resolved_sql != legacy_profile:
+                raise ValueError("source_profile conflicts with sql_source_profile")
+        if schedule_source_profile is not None:
+            resolved_schedule = _required_text(
+                schedule_source_profile, "schedule_source_profile"
+            )
+            if resolved_schedule != legacy_profile:
+                raise ValueError(
+                    "source_profile conflicts with schedule_source_profile"
+                )
+        return resolved_sql, resolved_schedule
+
+    if sql_source_profile is None or schedule_source_profile is None:
+        raise ValueError(
+            "sql_source_profile and schedule_source_profile must both be provided"
+        )
+    return (
+        _required_text(sql_source_profile, "sql_source_profile"),
+        _required_text(schedule_source_profile, "schedule_source_profile"),
+    )
 
 
 def _validate_scope(environment: str, source_profile: str) -> tuple[str, str]:
@@ -763,6 +880,10 @@ def _required_text(value: object, field_name: str) -> str:
 def _non_negative_int(value: object, field_name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer")
+
+
+def _is_true(value: object) -> bool:
+    return isinstance(value, bool) and value
 
 
 def _timestamp_value(value: datetime | None) -> str | None:
