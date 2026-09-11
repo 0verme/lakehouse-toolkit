@@ -9,6 +9,7 @@ classifier error never retires an existing scope's active suppression rows.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -62,6 +63,39 @@ class SuppressionMaterializationSummary:
 
 
 ScopeStoreFactory = Callable[[LineageEnvironmentScope], Any]
+
+# Diagnostics must stay bounded and must never print a credential even when a
+# driver error embeds a connection string.  Only secrets are masked; host/port
+# survive so an operator can still see which endpoint failed.
+_ERROR_MESSAGE_LIMIT = 400
+_REDACTED = "<redacted>"
+_URL_CREDENTIAL_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/@\s]*@")
+_SECRET_PAIR_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key"
+    r"|private[_-]?key|credential)\b\s*[=:]\s*[^\s,;]+"
+)
+
+
+def _sanitize_log_message(message: object) -> str:
+    """Collapse a message into one bounded, credential-free log line."""
+
+    text = re.sub(r"\s+", " ", str(message or "")).strip()
+    text = _URL_CREDENTIAL_RE.sub(rf"\1{_REDACTED}@", text)
+    text = _SECRET_PAIR_RE.sub(rf"\1={_REDACTED}", text)
+    if len(text) > _ERROR_MESSAGE_LIMIT:
+        text = text[: _ERROR_MESSAGE_LIMIT - 3].rstrip() + "..."
+    return text
+
+
+def _describe_failure(error: Exception) -> str:
+    """Return ``ExceptionType: root cause`` for fail-open diagnostics.
+
+    The exception type alone is not diagnosable: an environment-wide fail-open
+    used to report only ``RuntimeError`` and lost the real cause.
+    """
+
+    detail = _sanitize_log_message(str(error))
+    return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
 
 
 def _default_sql_store(scope: LineageEnvironmentScope) -> DWSMaterializationStore:
@@ -172,6 +206,7 @@ def run(
 
     summaries: list[SuppressionMaterializationSummary] = []
     failures: list[str] = []
+    first_failure: Exception | None = None
     for scope in resolved_scopes:
         try:
             result, suppressions = _reconcile_scope(
@@ -189,8 +224,10 @@ def run(
                     observed_at=effective_observed_at,
                 )
         except Exception as error:  # noqa: BLE001 - preserve fail-open per scope
-            error_name = type(error).__name__
-            failures.append(f"{scope.environment}:{error_name}")
+            failure = _describe_failure(error)
+            failures.append(f"{scope.environment}:{failure}")
+            if first_failure is None:
+                first_failure = error
             summaries.append(
                 SuppressionMaterializationSummary(
                     environment=scope.environment,
@@ -200,7 +237,7 @@ def run(
                     suppressed_count=0,
                     actionable_sql_only_count=0,
                     dry_run=dry_run,
-                    error=error_name,
+                    error=failure,
                 )
             )
             continue
@@ -220,7 +257,7 @@ def run(
     if failures:
         raise RuntimeError(
             "suppression materialization failed for scope(s): " + ", ".join(failures)
-        )
+        ) from first_failure
     return tuple(summaries)
 
 
@@ -300,7 +337,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
         )
     except (LineageEnvironmentScopeError, ValueError, RuntimeError) as error:
-        print(f"ERROR {type(error).__name__}", file=sys.stderr)
+        print(f"ERROR {_describe_failure(error)}", file=sys.stderr)
         return 1
 
 

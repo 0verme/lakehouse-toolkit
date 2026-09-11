@@ -262,6 +262,48 @@ reconciliation boundary 负责，classifier 不重新引入它们。
 `MATCH` 与 `SCHEDULE_ONLY` 永不 suppression；有内部 SQL/Schedule producer 的
 `SQL_ONLY` 仍然是 actionable SQL_ONLY。
 
+### Program Inventory 契约
+
+「当前 environment 是否存在声明加工某张表的 active 内部程序」的唯一正式事实源是
+`dwp.lineage_program_state`，而不是最近的 SQL / Schedule edge。Program Inventory 是
+比 canonical program-name parser 更窄的独立职责，grammar 固定为：
+
+```text
+<inventory_prefix>:<qualified_schema_table>[:...]
+```
+
+- 只解释第 1 段 prefix 与第 2 段 qualified target；
+- 第 3 段起的后续 segment 一律不解释：不作为 step、不授予 canonical target authority、
+  不进入 stable identity；
+- 复用显式 registry 的 legacy namespace normalization（如 `DWS_DWF.X -> DWF.X`），
+  不新增 basename / fuzzy schema guessing；
+- prefix 白名单只有真实 active program state 已确认的取值：
+
+```python
+PROGRAM_INVENTORY_PREFIXES = frozenset({"001", "005"})
+```
+
+它与 Issue #44 的 canonical grammar 是两个独立契约：`PROGRAM_NAME_LEGACY_MARKER` 仍为
+`"005"`，`parse_program_name()` 的 target authority、step sequencing 与 opaque suffix
+语义均不因 Program Inventory 扩大。`001` 只能是 inventory prefix，不能成为 canonical
+program。
+
+失败语义全部是 **uncertain => fail open-to-visible**：
+
+- 已支持 prefix 但第二段无法规范化为 qualified `schema.table` => 抛错，scope fail-open；
+- 未确认 prefix（例如 `002:`、`ABC:`）=> 抛错，scope fail-open，禁止静默当作
+  `NO_INTERNAL_PROGRAM`；
+- 错误发生时不得 publish 新 suppression，也不得 retire 旧 active suppression。
+
+```text
+ReconciliationSuppressionError
+        => scope fail-open
+        => 不 publish 新 suppression
+        => 不 retire 旧 suppression
+```
+
+没有 `:` 的 program name 不是 inventory declaration，不提供 inventory 证据。
+
 ## Suppression Audit 与生命周期
 
 纯函数 `classify_reconciliation_suppressions()` 消费

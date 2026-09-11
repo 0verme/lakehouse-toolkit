@@ -347,8 +347,12 @@ def build_active_program_target_inventory(
         try:
             target = normalize_program_inventory_target(state.program_name)
         except (TypeError, ValueError) as exc:
+            # The domain message already names the offending prefix / target, so
+            # surface it verbatim: a swallowed cause makes an environment-wide
+            # fail-open undiagnosable.
+            reason = str(exc).strip()
             raise ReconciliationSuppressionError(
-                "active program inventory target normalization failed"
+                reason or "active program inventory target normalization failed"
             ) from exc
         if target is None:
             raise ReconciliationSuppressionError(
