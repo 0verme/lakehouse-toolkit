@@ -1,0 +1,11 @@
+# 公开示例只使用脱敏占位值；真实部署请使用被 gitignore 的
+# configs/lineage_scopes.local.yaml，不要把内网 profile 或凭据提交到仓库。
+# dws_profile 对应 configs/database.local.yaml（或 database.yaml）中的 profile 名。
+scopes:
+  - name: demo_dev
+    environment: DEMO_DEV
+    sql_source_profile: DEMO_SQL_PROFILE
+    schedule_source_profile: DEMO_SCHEDULE_PROFILE
+    dws_profile: demo
+    label: 示例开发环境（DEMO_DEV）
+    enabled: true

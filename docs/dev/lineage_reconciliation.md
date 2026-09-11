@@ -202,6 +202,27 @@ identity 打到日志；`json` 和 `csv` 可用于显式本地 report/artifact�
 row/target summary 都使用 `sql_source_profile` 和 `schedule_source_profile`；CSV
 每行也同时输出这两个字段，不再输出单一 `SOURCE_PROFILE`。
 
+## PyWebIO 页面
+
+统一页面入口为：
+
+```text
+tools/lineage/reconcile_sql_schedule_web.py
+```
+
+页面只让用户选择 environment，并以 textarea 接收每行一个目标表；SQL / Schedule
+source profile 与 DWS profile 由 `LineageEnvironmentScopeResolver` 从
+`configs/lineage_scopes.local.yaml`（缺失时使用公开的
+`configs/lineage_scopes.example.yaml`）解析。公开 example 只包含 `DEMO_*` 占位值，
+真实配置不得提交仓库。
+
+每个目标表独立调用 `tools.lineage.reconcile_sql_schedule.run()`，该函数继续进入
+`reconcile_active_dws_lineage()`。页面不读取源 metadata、不解析 SQL、不读取旧调度
+relation 表，也不通过 subprocess 调用 CLI。结果保留正式 `MATCH`、`SQL_ONLY`、
+`SCHEDULE_ONLY` status，并将差异行优先展示；缺少任一 active snapshot 时保留正式错误码
+并 fail closed。旧 `tools/integrations/schedule_diff.py` 不作为公开工具入口，文件保留
+用于 rollback。
+
 ## Non-Goals
 
 - 不新增 `lineage_reconciliation`、`lineage_compare`、`lineage_diff_result` 或

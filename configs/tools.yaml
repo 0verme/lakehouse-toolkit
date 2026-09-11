@@ -120,3 +120,16 @@ tools:
     python: python
     enable: false
     auto_restart: false
+
+  - name: lineage_reconciliation
+    title: SQL / 调度血缘对账
+    group: lineage
+    type: python
+    workdir: tools/lineage
+    script: reconcile_sql_schedule_web.py
+    host: 127.0.0.1
+    port: 8614
+    log: logs/lineage_reconciliation.log
+    python: python
+    enable: true
+    auto_restart: false
