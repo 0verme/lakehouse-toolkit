@@ -39,9 +39,25 @@ _SQL_LEADING_RE = re.compile(
 )
 _SELECT_RE = re.compile(r"\bSELECT\b", re.IGNORECASE)
 _SOURCE_PATTERN = re.compile(
-    rf"\b(?:FROM|JOIN|USING)\s+(?:ONLY\s+)?(?P<table>{_QUALIFIED_IDENTIFIER})",
+    rf"\b(?P<keyword>FROM|JOIN|USING)\s+(?:ONLY\s+)?"
+    rf"(?P<table>{_QUALIFIED_IDENTIFIER})",
     re.IGNORECASE,
 )
+_RELATION_CONTEXT_PAREN_PRECEDERS = frozenset(
+    {
+        "AS",
+        "FROM",
+        "JOIN",
+        "LATERAL",
+        "ON",
+        "SELECT",
+        "USING",
+        "VALUES",
+        "WHERE",
+        "WITH",
+    }
+)
+_SQL_QUERY_KEYWORDS = frozenset({"SELECT", "WITH"})
 _INSERT_TARGET_PATTERN = re.compile(
     rf"\bINSERT\s+(?P<mode>OVERWRITE|INTO)\s+"
     rf"(?:INTO\s+)?(?:LOCAL\s+)?(?:TABLE\s+)?"
@@ -869,6 +885,105 @@ def _cte_names(sanitized_sql: str) -> set[str]:
     return result
 
 
+def _skip_sql_quoted_identifier(sql_text: str, index: int) -> int:
+    quote = sql_text[index]
+    closing = "]" if quote == "[" else quote
+    index += 1
+    while index < len(sql_text):
+        if sql_text[index] != closing:
+            index += 1
+            continue
+        if index + 1 < len(sql_text) and sql_text[index + 1] == closing:
+            index += 2
+            continue
+        return index + 1
+    return len(sql_text)
+
+
+def _enclosing_parenthesis_start(sql_text: str, position: int) -> int | None:
+    stack: list[int] = []
+    index = 0
+    while index < position:
+        char = sql_text[index]
+        if char in '`"[':
+            index = _skip_sql_quoted_identifier(sql_text, index)
+            continue
+        if char == "(":
+            stack.append(index)
+        elif char == ")" and stack:
+            stack.pop()
+        index += 1
+    return stack[-1] if stack else None
+
+
+def _has_top_level_query_keyword(
+    sql_text: str,
+    start: int,
+    end: int,
+) -> bool:
+    depth = 0
+    index = start
+    while index < end:
+        char = sql_text[index]
+        if char in '`"[':
+            index = _skip_sql_quoted_identifier(sql_text, index)
+            continue
+        if char == "(":
+            depth += 1
+            index += 1
+            continue
+        if char == ")":
+            depth = max(depth - 1, 0)
+            index += 1
+            continue
+        if char.isalpha() or char in "_$#":
+            token_start = index
+            index += 1
+            while index < end and (
+                sql_text[index].isalnum() or sql_text[index] in "_$#"
+            ):
+                index += 1
+            if (
+                depth == 0
+                and sql_text[token_start:index].upper() in _SQL_QUERY_KEYWORDS
+            ):
+                return True
+            continue
+        index += 1
+    return False
+
+
+def _is_expression_level_source(
+    sanitized_sql: str,
+    match: re.Match[str],
+) -> bool:
+    """Only reject candidates clearly inside a function-call expression.
+
+    A relation inside a parenthesized query remains valid because its local
+    context contains a top-level ``SELECT``/``WITH``. Candidates without a
+    clear function-call context are retained, including unknown schemas.
+    """
+
+    opening = _enclosing_parenthesis_start(sanitized_sql, match.start())
+    if opening is None:
+        return False
+
+    function_match = re.search(
+        r"(?P<name>[A-Za-z_$#][\w$#]*)\s*\Z",
+        sanitized_sql[:opening],
+    )
+    if function_match is None:
+        return False
+    function_name = function_match.group("name").upper()
+    if function_name in _RELATION_CONTEXT_PAREN_PRECEDERS:
+        return False
+    return not _has_top_level_query_keyword(
+        sanitized_sql,
+        opening + 1,
+        match.start(),
+    )
+
+
 def _find_sources(
     sanitized_sql: str,
     cte_names: set[str],
@@ -877,7 +992,9 @@ def _find_sources(
     seen: set[str] = set()
     for match in _SOURCE_PATTERN.finditer(sanitized_sql):
         following_text = sanitized_sql[match.end() :].lstrip()
-        if following_text.startswith("("):
+        if following_text.startswith("(") or _is_expression_level_source(
+            sanitized_sql, match
+        ):
             continue
         normalized = _normalize_asset(match.group("table"))
         if not normalized or normalized in cte_names or normalized in seen:

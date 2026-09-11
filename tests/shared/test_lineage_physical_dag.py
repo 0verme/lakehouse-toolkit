@@ -250,6 +250,120 @@ class PhysicalDAGTests(unittest.TestCase):
             },
         )
 
+    def test_expression_level_from_is_not_a_physical_source(self):
+        cases = (
+            (
+                """INSERT INTO dwd.target_table
+                SELECT EXTRACT(DAY FROM a.pm_end_time)
+                FROM dwd.source_table a""",
+                "DWD.TARGET_TABLE",
+                "dwd.source_table",
+                "A.PM_END_TIME",
+            ),
+            (
+                """CREATE TABLE dwd.tmp_a AS
+                SELECT EXTRACT(YEAR FROM a.next_repay_dt)
+                FROM dwd.source_a a""",
+                "DWD.TMP_A",
+                "dwd.source_a",
+                "A.NEXT_REPAY_DT",
+            ),
+            (
+                """INSERT INTO dwp.result_table
+                SELECT SUBSTRING(b.inputdate FROM 1 FOR 8)
+                FROM dwf.input_table b""",
+                "DWP.RESULT_TABLE",
+                "dwf.input_table",
+                "B.INPUTDATE",
+            ),
+            (
+                """INSERT INTO dwm.result_table
+                SELECT TRIM(BOTH ' ' FROM t.endtime)
+                FROM dwd.event_table t""",
+                "DWM.RESULT_TABLE",
+                "dwd.event_table",
+                "T.ENDTIME",
+            ),
+        )
+
+        for sql, target, raw_source, forbidden_source in cases:
+            with self.subTest(target=target):
+                dag = build_program_physical_dag(
+                    program(f'execute("""{sql}""")', expected_target=None)
+                )
+                normalized_source = normalize_table_name(raw_source)
+
+                self.assertEqual(len(dag.steps), 1)
+                self.assertEqual(dag.steps[0].sources, (normalized_source,))
+                self.assertEqual(dag.steps[0].raw_sources, (raw_source,))
+                self.assertEqual(
+                    edge_pairs(dag),
+                    {(normalized_source, normalize_table_name(target))},
+                )
+                self.assertNotIn(forbidden_source, node_names(dag))
+
+                evidence = cast(dict[str, object], dag.edges[0].evidence)
+                self.assertEqual(evidence["raw_source"], raw_source)
+                self.assertEqual(evidence["normalized_source"], normalized_source)
+
+    def test_relation_context_preserves_join_using_known_and_unknown_sources(self):
+        cases = (
+            (
+                """INSERT INTO dwf.result
+                SELECT EXTRACT(DAY FROM a.created_at), b.id
+                FROM dwd.a a
+                JOIN dwm.b b ON a.id = b.id""",
+                "DWF.RESULT",
+                ("dwd.a", "dwm.b"),
+                ("A.CREATED_AT", "B.ID"),
+            ),
+            (
+                "INSERT INTO dwa.result SELECT * FROM (SELECT * FROM dwd.derived_source) q",
+                "DWA.RESULT",
+                ("dwd.derived_source",),
+                (),
+            ),
+            (
+                "MERGE INTO dwa.result t USING dwp.table_c c ON t.id = c.id",
+                "DWA.RESULT",
+                ("dwp.table_c",),
+                (),
+            ),
+            (
+                "INSERT INTO dwa.result SELECT * FROM dwuprr.ncms_table",
+                "DWA.RESULT",
+                ("dwuprr.ncms_table",),
+                (),
+            ),
+            (
+                "INSERT INTO dwa.result SELECT * FROM dwssds.some_table",
+                "DWA.RESULT",
+                ("dwssds.some_table",),
+                (),
+            ),
+        )
+
+        for sql, target, raw_sources, forbidden_sources in cases:
+            with self.subTest(target=target):
+                dag = build_program_physical_dag(
+                    program(f'execute("""{sql}""")', expected_target=None)
+                )
+                normalized_sources = tuple(
+                    normalize_table_name(raw_source) for raw_source in raw_sources
+                )
+
+                self.assertEqual(dag.steps[0].sources, normalized_sources)
+                self.assertEqual(dag.steps[0].raw_sources, raw_sources)
+                self.assertEqual(
+                    edge_pairs(dag),
+                    {
+                        (source, normalize_table_name(target))
+                        for source in normalized_sources
+                    },
+                )
+                for forbidden_source in forbidden_sources:
+                    self.assertNotIn(forbidden_source, node_names(dag))
+
     def test_comments_and_sql_literals_are_ignored(self):
         dag = build_program_physical_dag(
             program(

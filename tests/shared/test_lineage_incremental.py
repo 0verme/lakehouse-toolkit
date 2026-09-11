@@ -179,6 +179,25 @@ class IncrementalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.unchanged, ())
         self.assertEqual(plan.changed, (current,))
 
+    def test_sql_relation_context_version_bump_rebuilds_v9_state(self):
+        current = source("PROGRAM_DEMO_SQL_RELATION_CONTEXT")
+        previous = (
+            replace(
+                ProgramState.from_source(
+                    current,
+                    observed_at=OBSERVED_AT,
+                    batch_id="batch-old",
+                ),
+                pipeline_version="lineage-pipeline-v9-business-asset-boundary",
+            ),
+        )
+
+        plan = plan_incremental([current], previous)
+
+        self.assertEqual(current.source_hash, previous[0].source_hash)
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
+
     def test_audit_target_semantics_version_bump_rebuilds_v5_state(self):
         current = source("PROGRAM_DEMO_AUDIT_VERSION_CHANGED")
         previous = (

@@ -51,7 +51,7 @@ Protocol 的语义化别名，不维护第二套接口。backend 必须提供：
 ```json
 {
   "backend": "legacy",
-  "backend_version": "legacy-parser-v1",
+  "backend_version": "legacy-parser-v2-relation-context",
   "parse_status": "success",
   "confidence": "high",
   "extraction_reason": "CANDIDATE_FOUND",
@@ -118,11 +118,14 @@ Audit → Materialization 链路，比较 sources、target、statement type、pa
 edge 和 issue 结果。
 
 `LINEAGE_PIPELINE_VERSION` 当前为
-`lineage-pipeline-v9-business-asset-boundary`。就本节 parser adapter 而言仍只是
-adapter layer：默认输入到下游的事实没有变化，`legacy-parser-v1` backend metadata
-不会单独改变 pipeline cache identity；v9 是后续 Business Asset Boundary/materialization
-语义变更带来的版本升级。将来若 production backend 的事实语义改变，必须同时说明并
-bump pipeline version；shadow backend 的结果不应写入 production facts 或 cache。
+`lineage-pipeline-v10-sql-relation-context`。本次仍保持 `ParserBackend` abstraction、
+production default 和 downstream adapter 边界不变，但 legacy source extraction 的
+Physical facts 已修正：函数调用表达式中的 `FROM/JOIN/USING` 不再被当成 relation。
+因此同一 source hash 的 v9 facts 必须 coherent rebuild，不能复用旧的 Physical/Business
+projection。`legacy-parser-v2-relation-context` 只标识该 backend 的修正后 parser
+contract；真正控制持久化事实 cache invalidation 的仍是 pipeline version。未知但语法
+有效的 relation 不因 schema 未登记而删除。shadow backend 的结果不应写入 production
+facts 或 cache。
 
 adapter 只增加一次轻量 `SqlAnalysis` 对象和 metadata，不进行第二次 SQL parse，也
 不保存源码。默认 backend 不引入 SQLGlot/SQLLineage；因此预期性能影响为微小的
