@@ -16,7 +16,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from shared.lineage.environment_scope import (
+try:
+    from _bootstrap import ensure_project_root_on_path
+except ModuleNotFoundError:
+    from jobs.crontab._bootstrap import ensure_project_root_on_path
+
+# Direct script execution needs the bootstrap before project-local imports.
+# ruff: noqa: E402, I001
+ensure_project_root_on_path()
+
+from shared.lineage.environment_scope import (  # noqa: E402
     LineageEnvironmentScope,
     LineageEnvironmentScopeError,
     load_lineage_environment_scopes,

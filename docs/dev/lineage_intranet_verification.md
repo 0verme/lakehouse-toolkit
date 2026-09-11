@@ -90,7 +90,7 @@ reconciliation Web，只需在同一文件增加 `scopes`，其中
 默认 JSON 会写入被 Git 忽略的 `artifacts/lineage_verification/report.json`：
 
 ```bash
-python -m tools.lineage.verify_sources \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_sources \
   --config configs/lineage_providers.local.yaml \
   --output artifacts/lineage_verification/report.json
 ```
@@ -99,18 +99,18 @@ python -m tools.lineage.verify_sources \
 
 ```bash
 # 只读 bounded sample；结果必须为 PARTIAL，不能用于 DELETED 判断
-python -m tools.lineage.verify_sources \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_sources \
   --config configs/lineage_providers.local.yaml \
   --sample-only \
   --sample-limit 20
 
 # 额外显式调用 legacy production metadata loader
-python -m tools.lineage.verify_sources \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_sources \
   --config configs/lineage_providers.local.yaml \
   --include-production
 
 # 额外生成脱敏 Markdown 摘要
-python -m tools.lineage.verify_sources \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_sources \
   --config configs/lineage_providers.local.yaml \
   --markdown-output artifacts/lineage_verification/report.md
 ```

@@ -66,13 +66,23 @@ streamlit run apps/svn_check/app.py --server.address 127.0.0.1 --server.port 850
 Production SVN working copy 的严格 Python inventory / primary target 验证使用独立命令：
 
 ```bash
-python -m tools.lineage.verify_svn_sources \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_svn_sources \
   --config configs/lineage_providers.local.yaml \
   --sample-only \
   --sample-limit 20
 ```
 
 完整路径规则和 Windows 内网执行顺序见 [`docs/dev/lineage_svn_verification.md`](docs/dev/lineage_svn_verification.md)。
+
+生产 lineage 日批统一入口（内网）：
+
+```text
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_daily
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_daily --environment DEV214
+```
+
+SQL、Schedule 和 Suppression 的单步补跑命令及 dependency contract 见
+[`docs/dev/lineage_reconciliation.md`](docs/dev/lineage_reconciliation.md)。
 
 ## 配置方式
 
@@ -82,7 +92,7 @@ python -m tools.lineage.verify_svn_sources \
 | --- | --- |
 | `configs/database.example.yaml` | 可选 JDBC profile 模板 |
 | `configs/audit_datasource.example.yaml` | 本地 PostgreSQL metadata profile |
-| `configs/lineage_providers.example.yaml` | DEV 多 MySQL profile、PROD adapter、SVN inventory 与 reconciliation scope 完整模板 |
+| `configs/lineage_providers.example.yaml` | DEV 多 MySQL profile、PROD adapter、SVN inventory 与 reconciliation/daily scope 完整模板 |
 | `configs/svn_inventory.example.yaml` | SVN working copy profile 的虚构路径专项最小模板（可选参考） |
 | `docs/dev/lineage_svn_verification.md` | Production SVN Python 清单、主结果表推导与内网验证步骤 |
 | `configs/migrate/clusters.example.json` | 两个 demo 集群的迁移模板 |

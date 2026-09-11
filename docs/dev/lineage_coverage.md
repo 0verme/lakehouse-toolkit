@@ -36,7 +36,7 @@ DAG count 重复相加。
 程序重新进入既有 parser：
 
 ```bash
-python -B -m jobs.crontab.imp_lineage_edge \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -B -m jobs.crontab.imp_lineage_edge \
   --force-rebuild \
   --coverage-report artifacts/lineage_coverage/replay.json
 ```

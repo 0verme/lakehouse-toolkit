@@ -323,7 +323,8 @@ ProgramSource provider
 ```
 
 它支持注入公开 fixture/mock provider，直接执行时从 local/example provider 配置读取，
-不会写入真实连接参数，也不会自动替换旧的 cron 或生产 lineage 入口。
+不会写入真实连接参数。生产 SQL / Schedule / Suppression 日批由
+`jobs/crontab/imp_lineage_daily.py` 统一入口负责；本文件中的 SQL job 仍保留为独立补跑入口。
 
 ### 定时任务可观测性
 
@@ -346,13 +347,13 @@ SQL、表名或 connection settings。
 直接运行（默认 SQLite）：
 
 ```bash
-python jobs/crontab/imp_lineage_edge.py --store sqlite
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --store sqlite
 ```
 
 DWS 必须显式选择 profile；示例 profile 只使用 placeholder 和环境变量密码：
 
 ```bash
-python jobs/crontab/imp_lineage_edge.py --store dws --dws-profile <DATABASE_PROFILE>
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --store dws --dws-profile <DATABASE_PROFILE>
 ```
 
 本轮只 rebuild 小规模 sample 时，`build total` 只会是本轮 rebuild 数；日志不会为每个
@@ -370,7 +371,7 @@ python jobs/crontab/imp_lineage_edge.py --store dws --dws-profile <DATABASE_PROF
 例如第一阶梯可运行：
 
 ```bash
-python jobs/crontab/imp_lineage_edge.py \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge \
   --store sqlite --profile DEMO_PROFILE --limit 100 \
   --force-rebuild --progress-every 10 --slow-threshold-ms 5000
 ```

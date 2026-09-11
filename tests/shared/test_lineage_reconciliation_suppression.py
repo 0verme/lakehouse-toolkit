@@ -27,7 +27,7 @@ from shared.lineage.reconciliation_suppression import (
     usable_suppressed_edge_keys,
 )
 from shared.lineage.schedule import ScheduleLineageEdge
-from tools.lineage.materialize_reconciliation_suppressions import run
+from jobs.crontab.imp_lineage_suppression import run
 
 ENVIRONMENT = "DEMO_DEV"
 OTHER_ENVIRONMENT = "DEMO_OTHER"
@@ -653,6 +653,19 @@ class MaterializationCommandTests(unittest.TestCase):
         self.suppression_store.publish.assert_called_once()
         self.sql_factory.assert_called_once_with(self.scope)
         self.schedule_factory.assert_called_once_with(self.scope)
+
+    def test_jobs_crontab_entrypoint_main_remains_independently_runnable(self):
+        from jobs.crontab.imp_lineage_suppression import main
+
+        result = main(
+            scopes=(self.scope,),
+            observed_at=OBSERVED_AT,
+            sql_store_factory=self.sql_factory,
+            schedule_store_factory=self.schedule_factory,
+            suppression_store_factory=self.suppression_factory,
+        )
+
+        self.assertEqual(result, 0)
 
 
 if __name__ == "__main__":

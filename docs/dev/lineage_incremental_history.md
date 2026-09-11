@@ -246,10 +246,11 @@ lookup/兼容匹配层扩大候选，不改写 Dataset Identity。
 
 ## 正常增量运行
 
-日常运行直接执行 cron 入口，不传 controlled replay 参数：
+SQL lineage 的单步补跑直接执行该 cron 入口，不传 controlled replay 参数；生产正式日批
+应使用 `jobs/crontab/imp_lineage_daily.py`，避免分别维护三条系统级定时任务：
 
 ```bash
-python jobs/crontab/imp_lineage_edge.py
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge
 ```
 
 它扫描所有配置的 provider，在 active `ProgramState` 上同时比较
@@ -264,7 +265,7 @@ parser/DAG/audit，并把 `UNCHANGED` facts 合并进新的完整 snapshot。所
 `complete_snapshot` 的生产行为。需要验证新 parser 时，使用 controlled replay：
 
 ```bash
-python jobs/crontab/imp_lineage_edge.py \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge \
   --profile mysql_dev_a_data \
   --limit 100 \
   --force-rebuild \

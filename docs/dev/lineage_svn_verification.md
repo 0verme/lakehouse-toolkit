@@ -215,7 +215,7 @@ classification，只保留当前 profile 的 candidate，再取前 `sample_limit
 逐一处理。
 
 ```bash
-python -m tools.lineage.verify_svn_sources \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_svn_sources \
   --config configs/lineage_providers.local.yaml \
   --sample-only \
   --sample-limit 20
@@ -224,7 +224,7 @@ python -m tools.lineage.verify_svn_sources \
 Windows PowerShell：
 
 ```powershell
-python -m tools.lineage.verify_svn_sources `
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_svn_sources `
   --config configs/lineage_providers.local.yaml `
   --sample-only `
   --sample-limit 20
@@ -233,7 +233,7 @@ python -m tools.lineage.verify_svn_sources `
 Full scan：
 
 ```bash
-python -m tools.lineage.verify_svn_sources \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_svn_sources \
   --config configs/lineage_providers.local.yaml \
   --output artifacts/lineage_verification/svn_report.json
 ```
@@ -269,7 +269,7 @@ Get-Item -LiteralPath $root | Select-Object FullName, Attributes
 先在 `configs/lineage_providers.local.yaml` 填入上面的两个 profile，然后运行：
 
 ```powershell
-python -m tools.lineage.verify_svn_sources `
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_svn_sources `
   --config configs/lineage_providers.local.yaml `
   --sample-only `
   --sample-limit 20 `
@@ -316,7 +316,7 @@ profile 的 `layer_counts` 使用 `DWF` 单独统计。
 sample 通过后再执行 full scan，并保留本地被忽略的 JSON：
 
 ```powershell
-python -m tools.lineage.verify_svn_sources `
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.verify_svn_sources `
   --config configs/lineage_providers.local.yaml `
   --output artifacts/lineage_verification/svn_report.json
 ```
