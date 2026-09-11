@@ -229,13 +229,103 @@ relation 表，也不通过 subprocess 调用 CLI。结果保留正式 `MATCH`�
 并 fail closed。旧 `tools/integrations/schedule_diff.py` 不作为公开工具入口，文件保留
 用于 rollback。
 
+## Raw Status 与 Presentation Suppression
+
+Raw reconciliation 的事实三态保持不变：
+
+- `MATCH`：SQL 与 Schedule 都存在；
+- `SQL_ONLY`：SQL 实际存在、Schedule 未配置；
+- `SCHEDULE_ONLY`：Schedule 存在、SQL 未观察到。
+
+`NO_INTERNAL_PRODUCER` 不是第四个 `ReconciliationStatus`，而是只附着在原始
+`SQL_ONLY` 之上的 Presentation Suppression classification。它只能表示：在本次
+`environment + sql_source_profile + schedule_source_profile` reconciliation scope
+的已验证 active snapshots 中，没有观察到任何生产该 source 的内部 business edge：
+
+```text
+raw_status == SQL_ONLY
+AND
+not exists SQL edge       X -> SOURCE
+AND
+not exists Schedule edge  Y -> SOURCE
+=> suppression_reason = NO_INTERNAL_PRODUCER
+```
+
+producer 不要求与当前 target 关联；只要 scope 内存在 `X -> SOURCE`，就不能 suppression。
+判断继续复用 `normalize_lineage_comparison_table_key()` 的 qualified
+`schema.table` identity；不使用 basename、suffix、LIKE、schema guessing、表名关键字
+或人工 whitelist。`TMP`、`DLO`、`DWO` technical-only endpoint 仍由既有 business
+reconciliation boundary 负责，classifier 不重新引入它们。
+
+**absence of producer != proof of manual table**。该 classification 不声称 source
+是手工维护表、码值表或参考表，只记录当前 scope 内没有观察到内部 producer。
+`MATCH` 与 `SCHEDULE_ONLY` 永不 suppression；有内部 SQL/Schedule producer 的
+`SQL_ONLY` 仍然是 actionable SQL_ONLY。
+
+## Suppression Audit 与生命周期
+
+纯函数 `classify_reconciliation_suppressions()` 消费
+`LineageReconciliationResult`、已验证 SQL active business snapshot 和 Schedule active
+snapshot，返回不可变 suppression candidates。它不连接 DWS、不加载 YAML、不调用
+PyWebIO，也不修改 raw result。`DWSReconciliationSuppressionStore` 位于明确的
+materialization/repository boundary，写入：
+
+```text
+dwp.lineage_reconciliation_suppression
+```
+
+其中 `suppression_key` 稳定依赖 environment、双侧 profile、source、target 和 reason，
+不依赖 batch id；`row_key` 区分一次 SQL/Schedule snapshot observation。audit row 保存
+`raw_status`、`suppression_reason`、`classifier_version`、双侧 batch provenance、
+`first_seen_at` / `last_seen_at` / `is_active` 等字段。
+
+每次 materialization 以一个 scope 为边界：当前仍成立的 suppression 更新 provenance
+并保持 `first_seen_at`，新候选新增，旧 active candidate 设置 `is_active = FALSE`。
+错误 scope、reader error、normalization error、metadata ambiguity、snapshot batch
+不一致或 stale suppression 均遵循 **uncertain => DO NOT SUPPRESS**；失败时不退休
+旧 active row，前台必须继续展示原始 SQL_ONLY。
+
+显式 materialization command：
+
+```bash
+python -B -m tools.lineage.materialize_reconciliation_suppressions --dry-run
+python -B -m tools.lineage.materialize_reconciliation_suppressions --environment DEV214
+```
+
+`--dry-run` 只输出每个 scope 的 bounded summary：`environment`、两侧 batch、raw
+`SQL_ONLY` 数、suppressed 数和 actionable `SQL_ONLY` 数，不输出大量真实表名。PyWebIO
+presentation adapter 使用 audit row 前必须同时校验 scope、`raw_status`、reason、
+`classifier_version` 以及 `sql_batch_id == 当前 SQL batch`、
+`schedule_batch_id == 当前 Schedule batch`。任何无法验证的情况都 fail-open-to-visible。
+UI renderer 不能执行 DWS `INSERT`。
+
+审计查询示例：
+
+```sql
+SELECT
+    environment,
+    source_table,
+    target_table,
+    raw_status,
+    suppression_reason,
+    sql_batch_id,
+    schedule_batch_id,
+    classifier_version,
+    is_active
+FROM dwp.lineage_reconciliation_suppression
+WHERE is_active = TRUE
+  AND environment = 'DEV214'
+ORDER BY target_table, source_table;
+```
+
 ## Non-Goals
 
 - 不新增 `lineage_reconciliation`、`lineage_compare`、`lineage_diff_result` 或
-  `reconciliation_batch` 表；
+  `reconciliation_batch` 表；suppression audit 使用明确的
+  `lineage_reconciliation_suppression` projection；
 - 不改变 SQL parser、Physical DAG、TMP collapse、Business Asset Boundary、
   Schedule ingestion、SQL/schedule DWS fact schema、DatasetIdentity 或 global
   `normalize_table_name()`；
 - 不实现 Production Scheduler lineage；
 - 不修改 lineage-viewer、data-asset-portal、Streamlit 或其它 UI；
-- 不实现 freshness policy、告警、SLA、趋势或 reconciliation history persistence。
+- 不实现 freshness policy、告警、SLA、趋势或 raw reconciliation 三态改写。

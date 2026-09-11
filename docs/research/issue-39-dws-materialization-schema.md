@@ -10,7 +10,8 @@
 
 ## 1. 范围与边界
 
-Issue #39 收口为五张 DWS 表：
+Issue #39 收口为五张 SQL lineage DWS 表；Issue #85 schedule 与 Issue #111
+reconciliation suppression 是独立的事实扩展：
 
 ```text
 dwp.lineage_batch
@@ -18,6 +19,9 @@ dwp.lineage_batch
     ├─ dwp.lineage_edge              # raw physical direct edge
     ├─ dwp.lineage_business_edge     # existing Phase 5 formal projection
     └─ dwp.lineage_issue
+
+dwp.lineage_schedule_edge             # Issue #85 independent schedule snapshot
+dwp.lineage_reconciliation_suppression # Issue #111 presentation audit
 ```
 
 - `ProgramPhysicalDAG` 是同一 pipeline 产生的 physical projection，保留 TMP、cycle、
@@ -60,12 +64,13 @@ stable key 不使用 Python `hash()`、数据库自增 id、`repr()`、时间或
 | physical edge | program identity + source/target + node kinds | `row + lineage_edge + batch_id + edge_key` |
 | business edge | program identity + formal source/target | `row + lineage_business_edge + batch_id + business_edge_key` |
 | issue | Issue #36 `stable_issue_key` | `row + lineage_issue + batch_id + stable_issue_key` |
+| suppression | scope + qualified source/target + reason | `row + suppression_key + sql_batch_id + schedule_batch_id` |
 
 `source_profile` 是 program/provenance boundary，`environment` 是 hard boundary。
 `DatasetIdentity` 只接受明确的 `environment + schema.table`；TMP 或 unresolved
 physical node 的 dataset key 为 `NULL`，但 business row 的两端必须都有 dataset key。
 
-## 3. 五张表
+## 3. 五张基线表与扩展表
 
 ### 3.1 `dwp.lineage_batch`
 
@@ -120,6 +125,18 @@ control table 记录一次 candidate snapshot：
 为 DWS enum；manual disposition 通过新 batch/history projection 记录，不原地更新
 旧 row。materialization failure 会 rollback，不留下半批 issue。
 
+### 3.6 `dwp.lineage_reconciliation_suppression`
+
+该表只审计 Presentation Suppression，不替换或删除 raw reconciliation 三态。V1
+只允许 `raw_status = SQL_ONLY` 与 `suppression_reason = NO_INTERNAL_PRODUCER`，其中
+后者只能表示当前 `environment + sql_source_profile + schedule_source_profile`
+scope 内没有观察到内部 producer，并不证明来源表是手工表、码值表或参考表。
+
+`suppression_key` 由 scope、qualified comparison identity 和 reason 组成，**不包含**
+`sql_batch_id` / `schedule_batch_id`；`row_key` 则区分一次双侧 snapshot observation。
+writer 在 application boundary 中维护同一 scope 的 active rows、first/last seen、
+新 snapshot provenance 和 stale retirement。PyWebIO renderer 不执行 INSERT。
+
 ## 4. Physical design
 
 DDL 对所有对象使用显式 `dwp.<table>`，不使用 `SET search_path`、默认 schema 或
@@ -130,12 +147,15 @@ DDL 对所有对象使用显式 `dwp.<table>`，不使用 `SET search_path`、�
 | 表 | orientation | distribution |
 | --- | --- | --- |
 | `lineage_batch` | ROW | HASH(`batch_id`) |
+| `lineage_schedule_edge` | COLUMN | HASH(`schedule_edge_key`) |
+| `lineage_reconciliation_suppression` | ROW | HASH(`suppression_key`) |
 | `lineage_program_state` | ROW | HASH(`program_key`) |
 | `lineage_edge` | COLUMN | HASH(`edge_key`) |
 | `lineage_business_edge` | COLUMN | HASH(`business_edge_key`) |
 | `lineage_issue` | ROW | HASH(`stable_issue_key`) |
 
-DDL 中对应为 `DISTRIBUTE BY HASH(batch_id)`、`DISTRIBUTE BY HASH(program_key)`、
+DDL 中对应为 `DISTRIBUTE BY HASH(batch_id)`、`DISTRIBUTE BY HASH(schedule_edge_key)`、
+`DISTRIBUTE BY HASH(suppression_key)`、`DISTRIBUTE BY HASH(program_key)`、
 `DISTRIBUTE BY HASH(edge_key)`、`DISTRIBUTE BY HASH(business_edge_key)` 和
 `DISTRIBUTE BY HASH(stable_issue_key)`。
 
@@ -216,6 +236,7 @@ projection；未来 N-hop closure 由 Issue #40 另行定义。
 | physical edge | 无持久化 raw DAG projection | `lineage_edge`，允许 TMP endpoint，保存 direct evidence |
 | business edge | formal `LineageEdge` 由 reference pipeline 产生 | `lineage_business_edge`，只接收既有 formal projection |
 | issue | Issue #36 fact/policy compatible fields | `lineage_issue`，同批 lifecycle reconcile 与 active join |
+| suppression | raw reconciliation 三态上的 classification observation | `lineage_reconciliation_suppression`，按 scope 独立 materialize/lifecycle |
 | closure | 无 | Issue #40 future；本 Issue 不创建 |
 
 SQLite 默认行为和既有调用方保持兼容；DWS backend 是显式选择，不会因为环境变量
