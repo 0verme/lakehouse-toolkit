@@ -9,19 +9,27 @@ from openpyxl import load_workbook
 from shared.lineage.domain import LineageEdge
 from shared.lineage.environment_scope import LineageEnvironmentScope
 from shared.lineage.reconciliation import (
-    ActiveSnapshotNotFoundError,
-    ReconciliationStatus,
     SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
-    SQLBusinessLineageSnapshot,
+    ActiveSnapshotNotFoundError,
+    LineageReconciliationResult,
+    ReconciliationStatus,
     ScheduleLineageSnapshot,
+    SQLBusinessLineageSnapshot,
     TargetSummaryStatus,
     reconcile_lineage_snapshots,
+)
+from shared.lineage.reconciliation_suppression import (
+    SUPPRESSION_CLASSIFIER_VERSION,
+    DWSReconciliationSuppressionRow,
+    ReconciliationSuppression,
+    ReconciliationSuppressionReason,
 )
 from shared.lineage.schedule import ScheduleLineageEdge
 from tools.lineage.reconcile_sql_schedule_web import (
     EXPORT_HEADERS,
     EXPORT_SHEET_TITLE,
     ReconciliationErrorView,
+    ReconciliationViewModel,
     TargetReconciliationOutcome,
     _render_rows_html,
     build_environment_options,
@@ -109,6 +117,98 @@ def make_empty_result(target: str = "DWM.RESULT"):
     return make_result(target, sql_sources=(), schedule_sources=())
 
 
+def make_suppression_row(
+    result: LineageReconciliationResult,
+    *,
+    source_table: str = "DWF.B",
+    target_table: str | None = None,
+    environment: str | None = None,
+    sql_source_profile: str | None = None,
+    schedule_source_profile: str | None = None,
+    sql_batch_id: str | None = None,
+    schedule_batch_id: str | None = None,
+    classifier_version: str = SUPPRESSION_CLASSIFIER_VERSION,
+    is_active: bool = True,
+) -> DWSReconciliationSuppressionRow:
+    observed_at = result.sql_observed_at or OBSERVED_AT
+    candidate = ReconciliationSuppression(
+        environment=environment or result.environment,
+        sql_source_profile=sql_source_profile or result.sql_source_profile,
+        schedule_source_profile=schedule_source_profile
+        or result.schedule_source_profile,
+        source_table=source_table,
+        target_table=target_table or result.target_summaries[0].target_table,
+        raw_status=ReconciliationStatus.SQL_ONLY,
+        suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+        sql_batch_id=sql_batch_id or result.sql_batch_id,
+        schedule_batch_id=schedule_batch_id or result.schedule_batch_id,
+        classifier_version=classifier_version,
+        observed_at=observed_at,
+    )
+    return DWSReconciliationSuppressionRow(
+        row_key=candidate.row_key,
+        suppression_key=candidate.suppression_key,
+        environment=candidate.environment,
+        sql_source_profile=candidate.sql_source_profile,
+        schedule_source_profile=candidate.schedule_source_profile,
+        source_table=candidate.source_table,
+        target_table=candidate.target_table,
+        raw_status=candidate.raw_status,
+        suppression_reason=candidate.suppression_reason,
+        sql_batch_id=candidate.sql_batch_id,
+        schedule_batch_id=candidate.schedule_batch_id,
+        classifier_version=candidate.classifier_version,
+        observed_at=observed_at,
+        first_seen_at=observed_at,
+        last_seen_at=observed_at,
+        is_active=is_active,
+        created_at=observed_at,
+        updated_at=observed_at,
+    )
+
+
+class _SuppressionReader:
+    def __init__(self, rows=(), error: Exception | None = None) -> None:
+        self.rows = tuple(rows)
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+        self.publish_calls = 0
+
+    def read_rows(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.rows
+
+    def publish(self, *args, **kwargs):
+        self.publish_calls += 1
+        raise AssertionError("UI must not publish suppression rows")
+
+
+def run_with_suppression(
+    result: LineageReconciliationResult,
+    rows=(),
+    *,
+    reader_error: Exception | None = None,
+):
+    reader = _SuppressionReader(rows, error=reader_error)
+    outcomes = reconcile_targets(
+        make_scope(),
+        (result.target_summaries[0].target_table,),
+        runner=lambda **kwargs: result,
+        suppression_store=reader,
+    )
+    return outcomes[0], reader
+
+
+def require_view_model(
+    outcome: TargetReconciliationOutcome,
+) -> ReconciliationViewModel:
+    if outcome.view_model is None:
+        raise AssertionError("expected a successful reconciliation outcome")
+    return outcome.view_model
+
+
 class ReconcileSqlScheduleWebTests(unittest.TestCase):
     def test_environment_options_expose_only_enabled_environment_values(self):
         scope = make_scope()
@@ -173,6 +273,256 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         self.assertEqual(view_model.summary.sql_only_count, 1)
         self.assertEqual(view_model.summary.schedule_only_count, 1)
 
+    def test_current_active_sql_only_suppression_is_hidden_from_view(self):
+        result = make_result()
+        suppression = make_suppression_row(result)
+
+        outcome, reader = run_with_suppression(result, (suppression,))
+
+        view_model = require_view_model(outcome)
+        self.assertEqual(
+            [row.source_table for row in view_model.rows],
+            ["DWF.C", "DWF.A"],
+        )
+        self.assertEqual(view_model.summary.sql_only_count, 0)
+        self.assertEqual(view_model.status, TargetSummaryStatus.DIFFERENT)
+        self.assertEqual(
+            reader.calls,
+            [
+                {
+                    "environment": ENVIRONMENT,
+                    "sql_source_profile": SQL_PROFILE,
+                    "schedule_source_profile": SCHEDULE_PROFILE,
+                    "sql_batch_id": "batch-sql",
+                    "schedule_batch_id": "batch-schedule",
+                    "active_only": True,
+                }
+            ],
+        )
+
+    def test_match_is_not_hidden_by_a_suppression_identity(self):
+        result = make_result()
+
+        view_model = build_reconciliation_view_model(
+            result,
+            suppressed_edge_keys={("DWF.A", "DWM.RESULT")},
+        )
+
+        self.assertIn("DWF.A", [row.source_table for row in view_model.rows])
+        self.assertEqual(view_model.summary.match_count, 1)
+
+    def test_actionable_sql_only_is_not_hidden_by_another_identity(self):
+        result = make_result()
+
+        view_model = build_reconciliation_view_model(
+            result,
+            suppressed_edge_keys={("DWF.A", "DWM.RESULT")},
+        )
+
+        self.assertIn("DWF.B", [row.source_table for row in view_model.rows])
+        self.assertEqual(view_model.summary.sql_only_count, 1)
+
+    def test_schedule_only_is_not_hidden_by_a_suppression_identity(self):
+        result = make_result()
+
+        view_model = build_reconciliation_view_model(
+            result,
+            suppressed_edge_keys={("DWF.C", "DWM.RESULT")},
+        )
+
+        self.assertIn("DWF.C", [row.source_table for row in view_model.rows])
+        self.assertEqual(view_model.summary.schedule_only_count, 1)
+
+    def test_stale_sql_batch_does_not_hide_sql_only(self):
+        result = make_result()
+        suppression = make_suppression_row(result, sql_batch_id="batch-sql-old")
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_stale_schedule_batch_does_not_hide_sql_only(self):
+        result = make_result()
+        suppression = make_suppression_row(
+            result,
+            schedule_batch_id="batch-schedule-old",
+        )
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_environment_mismatch_does_not_hide_sql_only(self):
+        result = make_result()
+        suppression = make_suppression_row(result, environment="DEMO_OTHER")
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_sql_profile_mismatch_does_not_hide_sql_only(self):
+        result = make_result()
+        suppression = make_suppression_row(
+            result,
+            sql_source_profile="DEMO_SQL_OTHER",
+        )
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_schedule_profile_mismatch_does_not_hide_sql_only(self):
+        result = make_result()
+        suppression = make_suppression_row(
+            result,
+            schedule_source_profile="DEMO_SCHEDULE_OTHER",
+        )
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_inactive_suppression_does_not_hide_sql_only(self):
+        result = make_result()
+        suppression = make_suppression_row(result, is_active=False)
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_unsupported_classifier_version_does_not_hide_sql_only(self):
+        result = make_result()
+        suppression = make_suppression_row(
+            result,
+            classifier_version="reconciliation-suppression-v0",
+        )
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_suppression_reader_exception_keeps_raw_sql_only_visible(self):
+        result = make_result()
+
+        outcome, _ = run_with_suppression(
+            result,
+            reader_error=RuntimeError("audit table unavailable"),
+        )
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_malformed_suppression_row_keeps_raw_sql_only_visible(self):
+        result = make_result()
+
+        outcome, _ = run_with_suppression(result, ("malformed-row",))
+
+        self.assertIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_excel_excludes_current_suppression_and_keeps_other_statuses(self):
+        result = make_result()
+        suppression = make_suppression_row(result)
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        export_rows = build_export_rows((outcome,))
+
+        self.assertNotIn("DWF.B", [row.source_table for row in export_rows])
+        self.assertIn(
+            (ReconciliationStatus.MATCH, "DWF.A"),
+            [(row.status, row.source_table) for row in export_rows],
+        )
+        self.assertIn(
+            (ReconciliationStatus.SCHEDULE_ONLY, "DWF.C"),
+            [(row.status, row.source_table) for row in export_rows],
+        )
+
+    def test_excel_keeps_actionable_sql_only_when_match_identity_is_supplied(self):
+        result = make_result()
+        view_model = build_reconciliation_view_model(
+            result,
+            suppressed_edge_keys={("DWF.A", "DWM.RESULT")},
+        )
+        outcome = TargetReconciliationOutcome(
+            target_table=view_model.target_table,
+            view_model=view_model,
+        )
+
+        export_rows = build_export_rows((outcome,))
+
+        self.assertIn(
+            (ReconciliationStatus.SQL_ONLY, "DWF.B"),
+            [(row.status, row.source_table) for row in export_rows],
+        )
+
+    def test_raw_result_is_not_mutated_by_presentation_filter(self):
+        result = make_result()
+        original_rows = result.rows
+        suppression = make_suppression_row(result)
+
+        outcome, _ = run_with_suppression(result, (suppression,))
+
+        self.assertEqual(result.rows, original_rows)
+        self.assertEqual(result.sql_only_count, 1)
+        self.assertNotIn(
+            "DWF.B", [row.source_table for row in require_view_model(outcome).rows]
+        )
+
+    def test_multi_target_suppression_is_independent_by_target(self):
+        first = make_result("DWM.RESULT_A")
+        second = make_result("DWM.RESULT_B")
+        reader = _SuppressionReader((make_suppression_row(first),))
+
+        outcomes = reconcile_targets(
+            make_scope(),
+            ("DWM.RESULT_A", "DWM.RESULT_B"),
+            runner=lambda **kwargs: (
+                first if kwargs["target_table"] == "DWM.RESULT_A" else second
+            ),
+            suppression_store=reader,
+        )
+
+        self.assertEqual(len(outcomes), 2)
+        self.assertNotIn(
+            "DWF.B",
+            [row.source_table for row in require_view_model(outcomes[0]).rows],
+        )
+        self.assertIn(
+            "DWF.B",
+            [row.source_table for row in require_view_model(outcomes[1]).rows],
+        )
+
+    def test_ui_suppression_reader_is_read_only(self):
+        result = make_result()
+        reader = _SuppressionReader((make_suppression_row(result),))
+
+        outcomes = reconcile_targets(
+            make_scope(),
+            ("DWM.RESULT",),
+            runner=lambda **kwargs: result,
+            suppression_store=reader,
+        )
+
+        self.assertTrue(outcomes[0].succeeded)
+        self.assertEqual(reader.publish_calls, 0)
+        self.assertEqual(len(reader.calls), 1)
+
     def test_sort_rows_prioritizes_sql_only_schedule_only_then_match(self):
         rows = make_result().rows
 
@@ -236,7 +586,9 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             view_model=view_model,
         )
 
-        workbook = load_workbook(BytesIO(build_excel_bytes(build_export_rows((outcome,)))))
+        workbook = load_workbook(
+            BytesIO(build_excel_bytes(build_export_rows((outcome,))))
+        )
         sheet = workbook[EXPORT_SHEET_TITLE]
         values = list(sheet.values)
         workbook.close()
@@ -267,7 +619,9 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
     def test_multi_target_export_uses_one_sheet_and_excludes_failed_target(self):
         first = build_reconciliation_view_model(make_result("DWM.RESULT_A"))
         second = build_reconciliation_view_model(
-            make_result("DWM.RESULT_B", sql_sources=("DWF.X",), schedule_sources=("DWF.X",))
+            make_result(
+                "DWM.RESULT_B", sql_sources=("DWF.X",), schedule_sources=("DWF.X",)
+            )
         )
         outcomes = (
             TargetReconciliationOutcome(

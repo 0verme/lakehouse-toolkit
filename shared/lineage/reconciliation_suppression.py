@@ -15,14 +15,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
-from shared.lineage.dws_timestamp import (
-    TIMESTAMPTZ_PARAM_SQL,
-    dws_timestamp_param,
-    dws_timestamp_projection,
-    parse_dws_timestamp,
-)
+from shared.lineage.domain import LineageEdge
+from shared.lineage.dws_timestamp import dws_timestamp_param, parse_dws_timestamp
 from shared.lineage.materialization_dws import (
     DWSMaterializationStore,
     _begin_transaction,
@@ -36,7 +32,6 @@ from shared.lineage.reconciliation import (
     SQLBusinessLineageSnapshot,
     normalize_lineage_comparison_table_key,
 )
-from shared.lineage.domain import LineageEdge
 from shared.lineage.schedule import ScheduleLineageEdge
 
 SUPPRESSION_TABLE_NAME = "lineage_reconciliation_suppression"
@@ -474,52 +469,93 @@ def usable_suppressed_edge_keys(
     return frozenset(keys)
 
 
-INSERT_SUPPRESSION_SQL = f"""
-    INSERT INTO dwp.{SUPPRESSION_TABLE_NAME}(
+def load_usable_suppressed_edge_keys(
+    result: LineageReconciliationResult,
+    store: Any | None,
+) -> frozenset[tuple[str, str]]:
+    """Read current suppression keys without ever hiding on reader failure.
+
+    The UI calls this helper after it has obtained a raw reconciliation result.
+    The store is expected to expose the existing read-only ``read_rows`` API;
+    the exact scope and both batch IDs are passed to the query boundary.  Any
+    connection, missing-table, malformed-row, or unexpected reader error
+    returns an empty key set, which is the fail-open-to-visible behavior.
+    """
+
+    if not isinstance(result, LineageReconciliationResult):
+        raise TypeError("result must be a LineageReconciliationResult")
+    if store is None:
+        return frozenset()
+    read_rows = getattr(store, "read_rows", None)
+    if not callable(read_rows):
+        return frozenset()
+    try:
+        rows = read_rows(
+            environment=result.environment,
+            sql_source_profile=result.sql_source_profile,
+            schedule_source_profile=result.schedule_source_profile,
+            sql_batch_id=result.sql_batch_id,
+            schedule_batch_id=result.schedule_batch_id,
+            active_only=True,
+        )
+        return usable_suppressed_edge_keys(
+            result,
+            cast(Iterable[DWSReconciliationSuppressionRow], rows),
+        )
+    except Exception:
+        # Suppression is presentation-only.  An unavailable or malformed audit
+        # projection must leave the raw SQL_ONLY row visible.
+        return frozenset()
+
+
+INSERT_SUPPRESSION_SQL = """
+    INSERT INTO dwp.lineage_reconciliation_suppression(
         row_key, suppression_key, environment, sql_source_profile,
         schedule_source_profile, source_table, target_table, raw_status,
         suppression_reason, sql_batch_id, schedule_batch_id, classifier_version,
         observed_at, first_seen_at, last_seen_at, is_active, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              {TIMESTAMPTZ_PARAM_SQL}, {TIMESTAMPTZ_PARAM_SQL},
-              {TIMESTAMPTZ_PARAM_SQL}, ?, {TIMESTAMPTZ_PARAM_SQL},
-              {TIMESTAMPTZ_PARAM_SQL})
+              CAST(? AS TIMESTAMP WITH TIME ZONE),
+              CAST(? AS TIMESTAMP WITH TIME ZONE),
+              CAST(? AS TIMESTAMP WITH TIME ZONE), ?,
+              CAST(? AS TIMESTAMP WITH TIME ZONE),
+              CAST(? AS TIMESTAMP WITH TIME ZONE))
 """
-UPDATE_SUPPRESSION_SQL = f"""
-    UPDATE dwp.{SUPPRESSION_TABLE_NAME}
+UPDATE_SUPPRESSION_SQL = """
+    UPDATE dwp.lineage_reconciliation_suppression
     SET suppression_key = ?, environment = ?, sql_source_profile = ?,
         schedule_source_profile = ?, source_table = ?, target_table = ?,
         raw_status = ?, suppression_reason = ?, sql_batch_id = ?,
         schedule_batch_id = ?, classifier_version = ?,
-        observed_at = {TIMESTAMPTZ_PARAM_SQL},
-        first_seen_at = {TIMESTAMPTZ_PARAM_SQL},
-        last_seen_at = {TIMESTAMPTZ_PARAM_SQL}, is_active = ?,
-        created_at = {TIMESTAMPTZ_PARAM_SQL},
-        updated_at = {TIMESTAMPTZ_PARAM_SQL}
+        observed_at = CAST(? AS TIMESTAMP WITH TIME ZONE),
+        first_seen_at = CAST(? AS TIMESTAMP WITH TIME ZONE),
+        last_seen_at = CAST(? AS TIMESTAMP WITH TIME ZONE), is_active = ?,
+        created_at = CAST(? AS TIMESTAMP WITH TIME ZONE),
+        updated_at = CAST(? AS TIMESTAMP WITH TIME ZONE)
     WHERE row_key = ?
 """
-SELECT_SUPPRESSION_SQL = f"""
+SELECT_SUPPRESSION_SQL = """
     SELECT row_key, suppression_key, environment, sql_source_profile,
            schedule_source_profile, source_table, target_table, raw_status,
            suppression_reason, sql_batch_id, schedule_batch_id,
            classifier_version,
-           {dws_timestamp_projection("observed_at")},
-           {dws_timestamp_projection("first_seen_at")},
-           {dws_timestamp_projection("last_seen_at")}, is_active,
-           {dws_timestamp_projection("created_at")},
-           {dws_timestamp_projection("updated_at")}
-    FROM dwp.{SUPPRESSION_TABLE_NAME}
+           CAST(observed_at AS VARCHAR(128)) AS observed_at,
+           CAST(first_seen_at AS VARCHAR(128)) AS first_seen_at,
+           CAST(last_seen_at AS VARCHAR(128)) AS last_seen_at, is_active,
+           CAST(created_at AS VARCHAR(128)) AS created_at,
+           CAST(updated_at AS VARCHAR(128)) AS updated_at
+    FROM dwp.lineage_reconciliation_suppression
 """
-RETIRE_SCOPE_SQL = f"""
-    UPDATE dwp.{SUPPRESSION_TABLE_NAME}
-    SET is_active = FALSE, updated_at = {TIMESTAMPTZ_PARAM_SQL}
+RETIRE_SCOPE_SQL = """
+    UPDATE dwp.lineage_reconciliation_suppression
+    SET is_active = FALSE, updated_at = CAST(? AS TIMESTAMP WITH TIME ZONE)
     WHERE is_active = TRUE
       AND environment = ?
       AND sql_source_profile = ?
       AND schedule_source_profile = ?
 """
-ACTIVATE_SUPPRESSION_SQL = f"""
-    UPDATE dwp.{SUPPRESSION_TABLE_NAME}
+ACTIVATE_SUPPRESSION_SQL = """
+    UPDATE dwp.lineage_reconciliation_suppression
     SET is_active = TRUE
     WHERE row_key = ?
       AND environment = ?
@@ -725,7 +761,7 @@ class DWSReconciliationSuppressionStore:
         sql_source_profile: str,
         schedule_source_profile: str,
         observed_at: datetime,
-    ) -> "DWSSuppressionPublishResult":
+    ) -> DWSSuppressionPublishResult:
         """Publish one scope's candidates and retire stale active rows atomically."""
 
         scope = self._scope_values(
@@ -844,6 +880,10 @@ class DWSSuppressionPublishResult:
     previous_active_count: int
 
 
+class _StoredSuppressionColumnCountError(ValueError):
+    """Preserve the specific error for a malformed stored row shape."""
+
+
 def _parse_optional_timestamp(value: object, field_name: str) -> datetime:
     if value is None:
         raise ValueError(f"{field_name} must not be NULL")
@@ -854,7 +894,9 @@ def _stored_suppression_row(raw: object) -> DWSReconciliationSuppressionRow:
     try:
         values = tuple(raw)  # type: ignore[arg-type]
         if len(values) != 18:
-            raise ValueError("stored suppression row has an unexpected column count")
+            raise _StoredSuppressionColumnCountError(
+                "stored suppression row has an unexpected column count"
+            )
         return DWSReconciliationSuppressionRow(
             row_key=_key_text(values[0], "row_key"),
             suppression_key=_key_text(values[1], "suppression_key"),
@@ -885,11 +927,9 @@ def _stored_suppression_row(raw: object) -> DWSReconciliationSuppressionRow:
             created_at=_parse_optional_timestamp(values[16], "created_at"),
             updated_at=_parse_optional_timestamp(values[17], "updated_at"),
         )
+    except _StoredSuppressionColumnCountError:
+        raise
     except (IndexError, TypeError, ValueError) as exc:
-        if isinstance(exc, ValueError) and str(exc).startswith(
-            "stored suppression row has"
-        ):
-            raise
         raise ValueError("stored DWS suppression row is invalid") from exc
 
 
