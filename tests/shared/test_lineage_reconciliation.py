@@ -30,6 +30,8 @@ from tools.lineage.reconcile_sql_schedule import (
 
 ENVIRONMENT = "DEMO_DEV"
 PROFILE = "DEMO_PROFILE"
+SQL_PROFILE = "DEMO_SQL_PROFILE"
+SCHEDULE_PROFILE = "DEMO_SCHEDULE_PROFILE"
 OBSERVED_AT = datetime(2026, 9, 10, 8, 9, 10, tzinfo=timezone.utc)
 
 
@@ -132,14 +134,18 @@ def schedule_edge(
     )
 
 
-def sql_snapshot(*edges: LineageEdge, batch_id: str = "batch-sql"):
+def sql_snapshot(
+    *edges: LineageEdge,
+    batch_id: str = "batch-sql",
+    profile: str = PROFILE,
+):
     from shared.lineage.reconciliation import SQLBusinessLineageSnapshot
 
     return SQLBusinessLineageSnapshot(
         batch_id=batch_id,
         edges=edges,
         observed_at=OBSERVED_AT,
-        snapshot_scope=((ENVIRONMENT, PROFILE),),
+        snapshot_scope=((ENVIRONMENT, profile),),
     )
 
 
@@ -226,6 +232,96 @@ class ReconciliationDomainTests(unittest.TestCase):
         self.assertEqual(summary.schedule_only_count, 1)
         self.assertEqual(summary.status, TargetSummaryStatus.DIFFERENT)
 
+    def test_different_source_profiles_keep_three_state_edge_reconciliation(self):
+        result = reconcile_lineage_snapshots(
+            sql_snapshot(
+                sql_edge(
+                    "DEMO_DWF.A",
+                    "DEMO_DWM.RESULT",
+                    profile=SQL_PROFILE,
+                ),
+                sql_edge(
+                    "DEMO_DWF.B",
+                    "DEMO_DWM.RESULT",
+                    profile=SQL_PROFILE,
+                    program="DEMO_PROGRAM_B",
+                ),
+                profile=SQL_PROFILE,
+            ),
+            schedule_snapshot(
+                schedule_edge(
+                    "DEMO_DWF.A",
+                    "DEMO_DWM.RESULT",
+                    profile=SCHEDULE_PROFILE,
+                ),
+                schedule_edge(
+                    "DEMO_DWF.C",
+                    "DEMO_DWM.RESULT",
+                    profile=SCHEDULE_PROFILE,
+                    process="DEMO_PROCESS_C",
+                ),
+            ),
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+            target_table="DEMO_DWM.RESULT",
+        )
+
+        self.assertNotEqual(SQL_PROFILE, SCHEDULE_PROFILE)
+        self.assertEqual(
+            [(row.source_table, row.status) for row in result.rows],
+            [
+                ("DEMO_DWF.A", ReconciliationStatus.MATCH),
+                ("DEMO_DWF.B", ReconciliationStatus.SQL_ONLY),
+                ("DEMO_DWF.C", ReconciliationStatus.SCHEDULE_ONLY),
+            ],
+        )
+        self.assertEqual(result.sql_source_profile, SQL_PROFILE)
+        self.assertEqual(result.schedule_source_profile, SCHEDULE_PROFILE)
+        self.assertIsNone(result.source_profile)
+        self.assertIsNone(result.rows[0].source_profile)
+        summary = result.target_summaries[0]
+        self.assertEqual(summary.sql_source_profile, SQL_PROFILE)
+        self.assertEqual(summary.schedule_source_profile, SCHEDULE_PROFILE)
+        self.assertEqual(summary.status, TargetSummaryStatus.DIFFERENT)
+        self.assertEqual(summary.sql_only_count, 1)
+        self.assertEqual(summary.schedule_only_count, 1)
+
+        payload = result.to_dict()
+        self.assertEqual(payload["sql_source_profile"], SQL_PROFILE)
+        self.assertEqual(payload["schedule_source_profile"], SCHEDULE_PROFILE)
+        self.assertNotIn("source_profile", payload)
+        rows = payload["rows"]
+        assert isinstance(rows, list)
+        first_row = rows[0]
+        assert isinstance(first_row, dict)
+        self.assertNotIn("source_profile", first_row)
+        self.assertEqual(first_row["sql_source_profile"], SQL_PROFILE)
+        self.assertEqual(first_row["schedule_source_profile"], SCHEDULE_PROFILE)
+
+    def test_profile_is_not_part_of_business_edge_identity(self):
+        result = reconcile_lineage_snapshots(
+            sql_snapshot(
+                sql_edge("DEMO_DWF.A", "DEMO_DWM.RESULT", profile=SQL_PROFILE),
+                profile=SQL_PROFILE,
+            ),
+            schedule_snapshot(
+                schedule_edge(
+                    "DEMO_DWF.A",
+                    "DEMO_DWM.RESULT",
+                    profile=SCHEDULE_PROFILE,
+                )
+            ),
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+        )
+
+        self.assertEqual(len(result.rows), 1)
+        self.assertEqual(result.rows[0].status, ReconciliationStatus.MATCH)
+        self.assertEqual(result.rows[0].source_table, "DEMO_DWF.A")
+        self.assertEqual(result.rows[0].target_table, "DEMO_DWM.RESULT")
+
     def test_all_match_has_consistent_target_summary(self):
         edge = sql_edge("DEMO_DWF.A", "DEMO_DWM.RESULT_A")
         result = reconcile_lineage_snapshots(
@@ -241,6 +337,45 @@ class ReconciliationDomainTests(unittest.TestCase):
         )
         self.assertEqual(result.sql_only_count, 0)
         self.assertEqual(result.schedule_only_count, 0)
+        self.assertEqual(result.sql_source_profile, PROFILE)
+        self.assertEqual(result.schedule_source_profile, PROFILE)
+        self.assertEqual(result.source_profile, PROFILE)
+
+    def test_new_profile_arguments_require_both_sides(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "sql_source_profile and schedule_source_profile must both be provided",
+        ):
+            reconcile_lineage_snapshots(
+                sql_snapshot(),
+                schedule_snapshot(),
+                environment=ENVIRONMENT,
+                sql_source_profile=SQL_PROFILE,
+            )
+
+    def test_legacy_and_new_profile_conflict_fails_fast(self):
+        with self.assertRaisesRegex(
+            ValueError, "source_profile conflicts with sql_source_profile"
+        ):
+            reconcile_lineage_snapshots(
+                sql_snapshot(),
+                schedule_snapshot(),
+                environment=ENVIRONMENT,
+                source_profile=PROFILE,
+                sql_source_profile=SQL_PROFILE,
+                schedule_source_profile=PROFILE,
+            )
+
+    def test_legacy_profile_shorthand_resolves_both_sides(self):
+        result = reconcile_lineage_snapshots(
+            sql_snapshot(sql_edge("DWF.A", "DWM.RESULT_A")),
+            schedule_snapshot(schedule_edge("DWF.A", "DWM.RESULT_A")),
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+        )
+        self.assertEqual(result.sql_source_profile, PROFILE)
+        self.assertEqual(result.schedule_source_profile, PROFILE)
+        self.assertEqual(result.source_profile, PROFILE)
 
     def test_legacy_dws_wrapper_matches_unwrapped_identity_in_both_directions(self):
         first = reconcile_lineage_snapshots(
@@ -448,12 +583,47 @@ class ActiveReaderContractTests(unittest.TestCase):
             )
         self.assertEqual(context.exception.code, SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
 
+    def test_active_sql_reader_returns_only_requested_profile_scope(self):
+        selected = sql_edge(
+            "DWF.A",
+            "DWM.RESULT_A",
+            profile=SQL_PROFILE,
+            batch_id="batch-sql",
+        )
+        ignored = sql_edge(
+            "DWF.B",
+            "DWM.RESULT_A",
+            profile=SCHEDULE_PROFILE,
+            batch_id="batch-sql",
+        )
+        reader = FakeSQLReader(
+            (ignored, selected),
+            scopes=((ENVIRONMENT, SQL_PROFILE), (ENVIRONMENT, SCHEDULE_PROFILE)),
+        )
+
+        snapshot = read_active_sql_business_snapshot(
+            reader,
+            environment=ENVIRONMENT,
+            source_profile=SQL_PROFILE,
+        )
+
+        self.assertEqual(snapshot.edges, (selected,))
+
     def test_missing_sql_active_snapshot_fails_closed(self):
         with self.assertRaises(ActiveSnapshotNotFoundError) as context:
             read_active_sql_business_snapshot(
                 FakeSQLReader(batch_id=None),
                 environment=ENVIRONMENT,
                 source_profile=PROFILE,
+            )
+        self.assertEqual(context.exception.code, SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+
+    def test_missing_sql_profile_scope_fails_closed(self):
+        with self.assertRaises(ActiveSnapshotNotFoundError) as context:
+            read_active_sql_business_snapshot(
+                FakeSQLReader(scopes=((ENVIRONMENT, SCHEDULE_PROFILE),)),
+                environment=ENVIRONMENT,
+                source_profile=SQL_PROFILE,
             )
         self.assertEqual(context.exception.code, SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
 
@@ -468,6 +638,29 @@ class ActiveReaderContractTests(unittest.TestCase):
         self.assertEqual(snapshot.batch_id, "batch-schedule")
         self.assertEqual(snapshot.edges, (edge,))
         self.assertEqual(reader.calls, [("batch-schedule", True)])
+
+    def test_active_schedule_reader_returns_only_requested_profile_scope(self):
+        selected = schedule_edge(
+            "DWF.A",
+            "DWM.RESULT_A",
+            profile=SCHEDULE_PROFILE,
+        )
+        ignored = schedule_edge(
+            "DWF.B",
+            "DWM.RESULT_A",
+            profile=SQL_PROFILE,
+        )
+        snapshot = read_active_schedule_snapshot(
+            FakeScheduleReader(
+                (
+                    FakeScheduleRow(ignored, "batch-schedule"),
+                    FakeScheduleRow(selected, "batch-schedule"),
+                )
+            ),
+            environment=ENVIRONMENT,
+            source_profile=SCHEDULE_PROFILE,
+        )
+        self.assertEqual(snapshot.edges, (selected,))
 
     def test_schedule_rows_from_other_scope_fail_closed(self):
         other = schedule_edge(
@@ -493,6 +686,20 @@ class ActiveReaderContractTests(unittest.TestCase):
             )
         self.assertEqual(context.exception.code, SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
 
+    def test_missing_schedule_profile_scope_fails_closed(self):
+        other = schedule_edge(
+            "DWF.A",
+            "DWM.RESULT_A",
+            profile=SQL_PROFILE,
+        )
+        with self.assertRaises(ActiveSnapshotNotFoundError) as context:
+            read_active_schedule_snapshot(
+                FakeScheduleReader((FakeScheduleRow(other, "batch-schedule"),)),
+                environment=ENVIRONMENT,
+                source_profile=SCHEDULE_PROFILE,
+            )
+        self.assertEqual(context.exception.code, SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+
     def test_combined_active_reader_reconciliation_returns_both_snapshot_ids(self):
         sql = sql_edge("DWF.A", "DWM.RESULT_A", batch_id="batch-sql")
         schedule = schedule_edge("DWF.A", "DWM.RESULT_A")
@@ -506,14 +713,54 @@ class ActiveReaderContractTests(unittest.TestCase):
         self.assertEqual(result.schedule_batch_id, "batch-schedule")
         self.assertEqual(result.rows[0].status, ReconciliationStatus.MATCH)
 
+    def test_combined_active_reader_uses_independent_profile_scopes(self):
+        sql = sql_edge(
+            "DWF.A",
+            "DWM.RESULT_A",
+            profile=SQL_PROFILE,
+            batch_id="batch-sql",
+        )
+        schedule = schedule_edge(
+            "DWF.A",
+            "DWM.RESULT_A",
+            profile=SCHEDULE_PROFILE,
+        )
+        result = reconcile_active_dws_lineage(
+            FakeSQLReader(
+                (sql,),
+                scopes=((ENVIRONMENT, SQL_PROFILE),),
+            ),
+            FakeScheduleReader((FakeScheduleRow(schedule, "batch-schedule"),)),
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+        )
+        self.assertEqual(result.rows[0].status, ReconciliationStatus.MATCH)
+        self.assertEqual(result.sql_source_profile, SQL_PROFILE)
+        self.assertEqual(result.schedule_source_profile, SCHEDULE_PROFILE)
+
 
 class CliReportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.result = reconcile_lineage_snapshots(
-            sql_snapshot(sql_edge("DWF.A", "DWM.RESULT_A")),
-            schedule_snapshot(schedule_edge("DWF.A", "DWM.RESULT_A")),
+            sql_snapshot(
+                sql_edge(
+                    "DWF.A",
+                    "DWM.RESULT_A",
+                    profile=SQL_PROFILE,
+                ),
+                profile=SQL_PROFILE,
+            ),
+            schedule_snapshot(
+                schedule_edge(
+                    "DWF.A",
+                    "DWM.RESULT_A",
+                    profile=SCHEDULE_PROFILE,
+                )
+            ),
             environment=ENVIRONMENT,
-            source_profile=PROFILE,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
         )
 
     def test_cli_parser_supports_scope_target_and_formats(self):
@@ -533,7 +780,59 @@ class CliReportTests(unittest.TestCase):
         )
         self.assertEqual(args.dws_profile, "DEMO_DWS_PROFILE")
         self.assertEqual(args.source_profile, PROFILE)
+        self.assertEqual(args.sql_source_profile, PROFILE)
+        self.assertEqual(args.schedule_source_profile, PROFILE)
         self.assertEqual(args.output_format, "json")
+
+    def test_cli_parser_supports_different_side_profiles(self):
+        args = build_parser().parse_args(
+            [
+                "--environment",
+                ENVIRONMENT,
+                "--sql-profile",
+                SQL_PROFILE,
+                "--schedule-profile",
+                SCHEDULE_PROFILE,
+            ]
+        )
+        self.assertIsNone(args.source_profile)
+        self.assertEqual(args.sql_source_profile, SQL_PROFILE)
+        self.assertEqual(args.schedule_source_profile, SCHEDULE_PROFILE)
+
+    def test_cli_parser_rejects_missing_profile_scope(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["--environment", ENVIRONMENT])
+
+    def test_cli_parser_rejects_conflicting_legacy_profile(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "--environment",
+                    ENVIRONMENT,
+                    "--profile",
+                    PROFILE,
+                    "--sql-profile",
+                    SQL_PROFILE,
+                    "--schedule-profile",
+                    PROFILE,
+                ]
+            )
+
+    def test_cli_parser_allows_matching_legacy_and_explicit_profiles(self):
+        args = build_parser().parse_args(
+            [
+                "--environment",
+                ENVIRONMENT,
+                "--profile",
+                PROFILE,
+                "--sql-profile",
+                PROFILE,
+                "--schedule-profile",
+                PROFILE,
+            ]
+        )
+        self.assertEqual(args.sql_source_profile, PROFILE)
+        self.assertEqual(args.schedule_source_profile, PROFILE)
 
     def test_target_table_output_matches_requested_shape(self):
         output = render_table(
@@ -543,22 +842,35 @@ class CliReportTests(unittest.TestCase):
         )
         self.assertIn("Target: DWM.RESULT_A", output)
         self.assertIn("Status: CONSISTENT", output)
+        self.assertIn(f"SQL profile: {SQL_PROFILE}", output)
+        self.assertIn(f"Schedule profile: {SCHEDULE_PROFILE}", output)
         self.assertIn("DWF.A", output)
         self.assertIn("MATCH", output)
 
     def test_full_scope_table_is_aggregate_and_json_is_machine_readable(self):
         table = render_table(self.result, elapsed_ms=3)
         self.assertIn("reconciliation_rows=1", table)
+        self.assertIn(f"sql_profile={SQL_PROFILE}", table)
+        self.assertIn(f"schedule_profile={SCHEDULE_PROFILE}", table)
+        self.assertNotIn("\nprofile=", table)
         self.assertNotIn("DWF.A", table)
         payload = json.loads(render_json(self.result, elapsed_ms=3))
         self.assertEqual(payload["elapsed_ms"], 3)
         self.assertEqual(payload["sql_batch_id"], "batch-sql")
+        self.assertEqual(payload["sql_source_profile"], SQL_PROFILE)
+        self.assertEqual(payload["schedule_source_profile"], SCHEDULE_PROFILE)
+        self.assertNotIn("source_profile", payload)
         self.assertEqual(len(payload["rows"]), 1)
 
     def test_csv_contains_deterministic_row_contract(self):
         output = render_csv(self.result)
-        self.assertTrue(output.startswith("ENVIRONMENT,SOURCE_PROFILE,TARGET_TABLE"))
-        self.assertIn("DWF.A", output)
+        self.assertTrue(
+            output.startswith(
+                "ENVIRONMENT,SQL_SOURCE_PROFILE,SCHEDULE_SOURCE_PROFILE,TARGET_TABLE"
+            )
+        )
+        self.assertNotIn("SOURCE_PROFILE", output.splitlines()[0].split(","))
+        self.assertIn(f"{SQL_PROFILE},{SCHEDULE_PROFILE},DWM.RESULT_A,DWF.A", output)
         self.assertIn(",MATCH,", output)
 
 

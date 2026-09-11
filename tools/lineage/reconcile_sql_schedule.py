@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from collections.abc import Iterable
 import io
 import json
 import os
@@ -11,12 +12,13 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from shared.lineage.materialization_dws import DWSMaterializationStore
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
     LineageReconciliationResult,
+    _resolve_source_profiles,
     normalize_lineage_comparison_table_key,
     reconcile_active_dws_lineage,
 )
@@ -25,10 +27,38 @@ from shared.lineage.schedule_materialization import DWSScheduleLineageStore
 _SAFE_BATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
+class _ReconciliationArgumentParser(argparse.ArgumentParser):
+    """Argument parser that validates the split/legacy profile contract."""
+
+    def parse_args(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+        args: Iterable[str] | None = None,
+        namespace: object = None,
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(
+            args=args,
+            namespace=cast(argparse.Namespace | None, namespace),
+        )
+        if parsed is None:
+            self.error("argument parser returned no namespace")
+        parsed_namespace = cast(argparse.Namespace, parsed)
+        try:
+            sql_profile, schedule_profile = _resolve_source_profiles(
+                source_profile=parsed_namespace.source_profile,
+                sql_source_profile=parsed_namespace.sql_source_profile,
+                schedule_source_profile=parsed_namespace.schedule_source_profile,
+            )
+        except ValueError as error:
+            self.error(str(error))
+        parsed_namespace.sql_source_profile = sql_profile
+        parsed_namespace.schedule_source_profile = schedule_profile
+        return cast(argparse.Namespace, parsed)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the safe, read-only reconciliation CLI parser."""
 
-    parser = argparse.ArgumentParser(
+    parser = _ReconciliationArgumentParser(
         description="Reconcile DWS SQL business lineage with configured schedule lineage."
     )
     parser.add_argument(
@@ -45,10 +75,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--profile",
-        required=True,
+        default=None,
         dest="source_profile",
-        metavar="SOURCE_PROFILE",
-        help="strict source profile scope",
+        metavar="PROFILE",
+        help=(
+            "legacy shorthand for using one profile on both sides; conflicts "
+            "with different explicit profiles"
+        ),
+    )
+    parser.add_argument(
+        "--sql-profile",
+        default=None,
+        dest="sql_source_profile",
+        metavar="SQL_SOURCE_PROFILE",
+        help="SQL lineage fact read scope/profile",
+    )
+    parser.add_argument(
+        "--schedule-profile",
+        default=None,
+        dest="schedule_source_profile",
+        metavar="SCHEDULE_SOURCE_PROFILE",
+        help="configured schedule fact read scope/profile",
     )
     parser.add_argument(
         "--target",
@@ -77,7 +124,9 @@ def run(
     *,
     dws_profile: str | None,
     environment: str,
-    source_profile: str,
+    sql_source_profile: str | None = None,
+    schedule_source_profile: str | None = None,
+    source_profile: str | None = None,
     target_table: str | None = None,
     sql_store: Any | None = None,
     schedule_store: Any | None = None,
@@ -99,6 +148,8 @@ def run(
         resolved_sql_store,
         resolved_schedule_store,
         environment=environment,
+        sql_source_profile=sql_source_profile,
+        schedule_source_profile=schedule_source_profile,
         source_profile=source_profile,
         target_table=target_table,
     )
@@ -118,7 +169,8 @@ def render_table(
             values["elapsed_ms"] = elapsed_ms
         lines = [
             f"environment={values['environment']}",
-            f"profile={values['source_profile']}",
+            f"sql_profile={values['sql_source_profile']}",
+            f"schedule_profile={values['schedule_source_profile']}",
             f"sql_edges={values['sql_edges']}",
             f"schedule_edges={values['schedule_edges']}",
             f"reconciliation_rows={values['reconciliation_rows']}",
@@ -150,6 +202,8 @@ def render_table(
     lines = [
         f"Target: {normalized_target}",
         f"Status: {status}",
+        f"SQL profile: {result.sql_source_profile}",
+        f"Schedule profile: {result.schedule_source_profile}",
         f"SQL batch: {_safe_batch_id(result.sql_batch_id)}",
         f"Schedule batch: {_safe_batch_id(result.schedule_batch_id)}",
         "",
@@ -186,7 +240,8 @@ def render_csv(result: LineageReconciliationResult) -> str:
     writer.writerow(
         (
             "ENVIRONMENT",
-            "SOURCE_PROFILE",
+            "SQL_SOURCE_PROFILE",
+            "SCHEDULE_SOURCE_PROFILE",
             "TARGET_TABLE",
             "SOURCE_TABLE",
             "SQL_ACTUAL",
@@ -202,7 +257,8 @@ def render_csv(result: LineageReconciliationResult) -> str:
         writer.writerow(
             (
                 row.environment,
-                row.source_profile,
+                row.sql_source_profile,
+                row.schedule_source_profile,
                 row.target_table,
                 row.source_table,
                 "YES" if row.sql_present else "NO",
@@ -280,6 +336,8 @@ def cli(argv: list[str] | None = None) -> int:
         result = run(
             dws_profile=args.dws_profile,
             environment=args.environment,
+            sql_source_profile=args.sql_source_profile,
+            schedule_source_profile=args.schedule_source_profile,
             source_profile=args.source_profile,
             target_table=args.target,
         )
