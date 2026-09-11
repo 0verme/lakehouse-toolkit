@@ -23,7 +23,6 @@ from .domain import (
     ProgramSource,
     is_business_asset,
     is_technical_asset,
-    is_temporary_asset,
 )
 from .physical_dag import ProgramPhysicalDAG
 
@@ -507,8 +506,10 @@ def _is_business_boundary_only(result: object) -> bool:
     }
     if not technical_nodes or len(business_nodes) > 1:
         return False
-    # Only hide the intentional DLO/DWO boundary.  Unknown references or a
-    # TMP-only graph must remain a real NO_LINEAGE_EDGE coverage candidate.
+    # Only hide the intentional DLO/DWO boundary and explicitly temporary
+    # physical nodes.  Unknown references, name-only TMP references and a
+    # TMP-only graph must remain real NO_LINEAGE_EDGE coverage candidates; a
+    # table name never decides this classification.
     non_business_nodes = graph_nodes - business_nodes
     return all(
         node_key in technical_nodes
@@ -516,7 +517,6 @@ def _is_business_boundary_only(result: object) -> bool:
             node_map.get(node_key) is not None
             and node_map[node_key].is_temporary
         )
-        or is_temporary_asset(node_key)
         for node_key in non_business_nodes
     )
 

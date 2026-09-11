@@ -2,15 +2,19 @@
 
 ## Contract
 
-Issue #95 冻结 SQL Lineage 的双轨语义：
+Issue #95 冻结 SQL Lineage 的双轨语义，Issue #121 收口命名与 Program Result 语义：
 
-- **Physical Lineage** 保留 SQL/程序真实产生的全部节点和边，包括 TMP、DLO、DWO、cycle
-  和 orphan branch。
+- **Physical Lineage** 保留 SQL/程序真实产生的全部节点和边，包括临时节点、DLO、DWO、
+  cycle 和 orphan branch。
 - **Business Lineage** 只投影 Business Asset 之间的 direct edge。
 - DLO、DWO 是 technical / pre-business ingestion、staging 层；它们可以作为
   collapse traversal 的中间节点，但不能成为 Business Lineage 的 `source_table` 或
   `target_table`。
 - DWF 是最低内部业务数仓层；DWF 及以上正式资产仍可作为 Business Lineage endpoint。
+- **命名不是资产事实**：`TMP` / `TEMP` / `STG` / `TEST` 名称既不能证明 technical /
+  temporary，也不能证明 formal；Business / Technical 边界只依据显式 schema registry。
+- 是否成为正式 Program Result 只由 active `005` program_name 决定；完整契约见
+  [`lineage_asset_semantics.md`](lineage_asset_semantics.md)。
 - 本版本复用 `DatasetIdentity` 的 qualified `schema.table` 校验和现有 explicit
   legacy/DWS namespace registry。`DWS_DLO`、`DWS_DWO`、`DLK_DLO` 在 boundary
   classification 中分别按 DLO/DWO 处理；Physical DatasetIdentity 仍保留 SQL 中观察到的

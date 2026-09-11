@@ -126,10 +126,13 @@ INSERT INTO DWM.C SELECT * FROM joined;
 ## TMP、sink 与 expected target
 
 节点分类复用 Phase 1 的 `PhysicalNode`、`PhysicalNodeKind` 和
-`is_temporary_asset()`。名称符合 TMP 规则的节点自动为
-`TEMPORARY_ASSET`；`CREATE TEMP/TEMPORARY TABLE` 即使名称不是 TMP，也会将
-该 target 标为临时资产。Phase 3 不删除 TMP、不折叠正式资产中间层，也不做
-递归祖先展开。
+`is_temporary_asset()`。**表名不参与分类**：`TMP` / `TEMP` / `STG` / `TEST` 名称本身
+没有资产语义。只有显式 SQL fact（`CREATE TEMP` / `CREATE TEMPORARY TABLE`）或调用方
+显式传入的 `kind` 才会产生 `TEMPORARY_ASSET`；没有 evidence 时使用中性默认值
+`FORMAL_ASSET`。
+
+完整契约见 [`lineage_asset_semantics.md`](lineage_asset_semantics.md)。Phase 3 不删除
+节点、不折叠正式资产中间层，也不做递归祖先展开。
 
 例如：
 
@@ -139,7 +142,7 @@ TMP1 + DWM.C → TMP2
 TMP2 + DWA.D → DWA.F
 ```
 
-Physical 图完整保留：
+无论 `TMP1` / `TMP2` 是否由 `CREATE TEMP` 声明，Physical 图都完整保留：
 
 ```text
 ODS.A → TMP1

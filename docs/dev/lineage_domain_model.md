@@ -12,16 +12,17 @@
 | `ProgramIdentity` | static Program / Job definition 的稳定 identity | `environment/source_profile/program_name` 三元组；字段只 trim surrounding whitespace；不把没有稳定来源的 `job_key` 猜测加入。完整语义见 [`lineage_program_identity.md`](lineage_program_identity.md)。 |
 | `ProgramSource` | Parser 的统一程序输入 | `expected_target=None` 表示没有 explicit/provider target；`logical_target` 仅可由严格四段的固定 `005` program_name grammar 恢复，三段只暴露 non-authoritative `target_hint`；`source_hash=None` 表示尚未提供 hash。 |
 | `ProgramState` | Phase 7 当前/历史程序状态 | 保存 hash、`pipeline_version`、first/last seen、last changed、batch 与 active 标记；旧 state 缺少版本时按需 rebuild，不保存完整源码。 |
-| `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时按可替换 TMP 名称规则推导。 |
-| `PhysicalEdge` | 程序内部有向边 | `source` 是上游，`target` 是下游；允许指向 TMP，也不在此阶段吞掉自引用。 |
+| `PhysicalNode` | 程序内部 DAG 的节点 | `kind` 可显式指定；省略时使用中性默认值 `FORMAL_ASSET`，不按表名推导。 |
+| `PhysicalEdge` | 程序内部有向边 | `source` 是上游，`target` 是下游；允许指向临时节点，也不在此阶段吞掉自引用。 |
 | `LineageEdge` | 正式业务血缘的 direct fact | `program_name`/`job_key`、`source_hash`、`batch_id`、时间字段和不含源码的结构化 `evidence` 可由后续采集/发布阶段补齐。 |
 | `LineageIssue` | Physical DAG 审计事实 | `node_key`、`branch_sink` 与 `stable_key` 可按 issue 类型选择；生命周期时间字段可在首次发现时补齐。 |
 
-Dataset Identity 的完整 V1 contract、canonicalization、missing schema 和 TMP 边界见
+Dataset Identity 的完整 V1 contract、canonicalization、missing schema 和命名语义见
 [`lineage_dataset_identity.md`](lineage_dataset_identity.md)；ProgramIdentity、ProgramState
 和 static Job / Batch 边界见 [`lineage_program_identity.md`](lineage_program_identity.md)。
 固定 legacy `program_name` 的 target/step/suffix 语义见
-[`lineage_program_name.md`](lineage_program_name.md)。
+[`lineage_program_name.md`](lineage_program_name.md)，Program Result / 命名 / DLO-DWO
+总契约见 [`lineage_asset_semantics.md`](lineage_asset_semantics.md)。
 
 ### `ProgramSource`
 
@@ -59,14 +60,16 @@ FORMAL_ASSET
 TEMPORARY_ASSET
 ```
 
-Physical 层必须保留 TMP，例如：
+Physical 层必须保留全部节点，包括显式 temporary 节点，例如：
 
 ```text
 ODS.DEMO_A → TMP1 → DWM.DEMO_B
 ```
 
-`PhysicalEdge` 不把 TMP 折叠，也不把 `A → B` 递归扩展成祖先关系。后续 Audit
-需要 Physical 图中的可达性、孤儿分支、多 sink、cycle 和 self-reference 信息。
+`TEMPORARY_ASSET` 只能由显式 `CREATE TEMP/TEMPORARY TABLE` fact 或调用方显式传入的
+`kind` 产生；`TMP` / `TEMP` / `STG` / `TEST` 名称本身不是资产语义。`PhysicalEdge` 不折叠
+节点，也不把 `A → B` 递归扩展成祖先关系。后续 Audit 需要 Physical 图中的可达性、
+孤儿分支、多 sink、cycle 和 self-reference 信息。
 
 ### 正式业务血缘
 
@@ -90,9 +93,11 @@ A → DWM.DEMO_B
 DWM.DEMO_B → DWA.DEMO_C
 ```
 
-禁止在 Phase 1 以方便查询为由提前存成 `A → DWA.DEMO_C`。`LineageEdge` 默认
-拒绝名称规则识别出的 TMP endpoint；可选 `evidence` 只保存轻量 provenance，完整
-collapse 留给 Phase 5。
+禁止在 Phase 1 以方便查询为由提前存成 `A → DWA.DEMO_C`。`LineageEdge` 不再按名称
+拒绝 endpoint；能否成为正式 edge 由 business boundary / Program Result / schema
+boundary 规则决定（见
+[`lineage_asset_semantics.md`](lineage_asset_semantics.md)）。可选 `evidence` 只保存
+轻量 provenance，完整 collapse 留给 Phase 5。
 
 ### `LineageIssue`
 
@@ -135,23 +140,23 @@ Phase 6 查询继续消费这一定义：`environment` 是 graph boundary，
 内不同 profile 的正式 edge 可以连接同一张业务图。查询、depth、Viewer contract 和
 Blast Radius 的完整语义见 [`lineage_query.md`](lineage_query.md)。
 
-## TMP 判定边界
+## 命名与临时节点边界
 
-仓库已有两类 TMP 逻辑，本模型不覆盖它们：
+`TMP` / `TEMP` / `STG` / `TEST` 名称本身不提供任何资产语义。本模型的边界是：
 
 - `apps/svn_check/core/lakehouse/_sql_parser.py::is_temp_table_statement` 识别
-  `CREATE TEMP/TEMPORARY/GLOBAL TEMP/LOCAL TEMP TABLE` 语句；
+  `CREATE TEMP/TEMPORARY/GLOBAL TEMP/LOCAL TEMP TABLE` 语句，这是显式 DDL fact；
 - `apps/svn_check/core/lakehouse/ddl_rule.py` 使用 `DWS_TEMP_TABLE_PREFIXES`
-  （当前为 `TMP_`）执行命名检查，并识别 `TMP` schema。
+  （当前为 `TMP_`）执行 **legacy review 命名检查**；它是审查规则，不是 core
+  lineage 事实，core domain 不引用它。
 
-`domain.py::is_temporary_asset` 只负责 Physical 节点的资产名称分类。默认规则
-识别 `TMP`、`TMP_1`、`TMP1`、`TMP_STAGE_X` 及其带 schema 的形式，但不会把
-`TMPORARY_BUSINESS` 或 `DEMO_TMP_1` 猜成 TMP。调用方可以传入可测试的规则元组，
-并用 `rules=()` 显式关闭默认规则。真实生产 schema、库名和业务表名不写入默认
-规则。
+`domain.py::is_temporary_asset` 现在是兼容壳：`DEFAULT_TEMPORARY_ASSET_RULES` 为空，
+默认对任何名称都返回 `False`。调用方可以传入可测试的证据型规则元组，但 core
+pipeline 不再依赖它。Physical 节点的 `TEMPORARY_ASSET` 只来自显式 DDL fact 或显式
+`kind` 参数。
 
-名称分类不是 SQL Parser：后续 Parser 仍需结合 `CREATE TEMP TABLE` 语句、表名、
-别名和上下文决定 Physical 节点；不能仅凭一个正则删除节点。
+名称分类不是 SQL Parser，也永远不能代替它：不能仅凭一个正则把一个节点判为 temporary
+或从血缘中删除。
 
 ## Phase 1 兼容边界
 

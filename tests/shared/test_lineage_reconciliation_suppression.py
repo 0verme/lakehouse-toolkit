@@ -357,24 +357,31 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
 
         with self.assertRaisesRegex(Exception, "inventory"):
             classify_reconciliation_suppressions(result, sql, schedule)
-        with self.assertRaisesRegex(Exception, "inventory"):
+        with self.assertRaisesRegex(Exception, "program inventory target"):
             classify_reconciliation_suppressions(
                 result,
                 sql,
                 schedule,
-                program_states=(program_state("DEMO_PROGRAM"),),
+                program_states=(program_state("005:NOT_QUALIFIED"),),
             )
 
-    def test_mixed_001_and_005_inventory_builds_one_environment_set(self):
+    def test_mixed_005_and_non_005_inventory_keeps_only_005_targets(self):
         active_targets = build_active_program_target_inventory(
-            inventory("005:DWS_DWF.F_A:1:00", "001:DWF.F_B:anything"),
+            inventory(
+                "005:DWS_DWF.F_A:1:00",
+                "001:DWF.F_B:anything",
+                "002:DWF.F_C:anything",
+                "ABC:DWF.F_D:anything",
+                "DEMO_PROGRAM",
+            ),
             environment=ENVIRONMENT,
             active_batch_id="batch-sql-1",
         )
 
-        self.assertEqual(active_targets, frozenset({"DWF.F_A", "DWF.F_B"}))
+        # 只有 005 提供 Program Result authority；其余 prefix 直接忽略，不报错。
+        self.assertEqual(active_targets, frozenset({"DWF.F_A"}))
 
-    def test_active_001_program_prevents_no_internal_program_suppression(self):
+    def test_active_001_program_does_not_prevent_suppression(self):
         sql = make_sql_snapshot(
             sql_edge("DWF.REFERENCE_A", "DEMO_DWM.RESULT_A", batch_id="batch-sql-1")
         )
@@ -390,23 +397,32 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
             program_states=inventory("001:DWF.REFERENCE_A:anything"),
         )
 
-        self.assertEqual(suppressions, ())
+        # 001 不是 Program Result 协议，既不提供 HAS_INTERNAL_PROGRAM evidence，
+        # 也不阻止 suppression materialization。
+        self.assertEqual(
+            [item.source_table for item in suppressions], ["DWF.REFERENCE_A"]
+        )
 
-    def test_unknown_inventory_prefix_fails_open_instead_of_suppressing(self):
+    def test_non_005_inventory_prefix_does_not_block_suppression(self):
         sql, schedule, result = make_no_producer_result()
 
-        with self.assertRaisesRegex(
-            ReconciliationSuppressionError,
-            "unsupported active program inventory prefix: 002",
-        ):
-            classify_reconciliation_suppressions(
-                result,
-                sql,
-                schedule,
-                program_states=inventory("002:DWF.REFERENCE_A:anything"),
-            )
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=inventory(
+                "002:DWF.REFERENCE_A:anything",
+                "003:DWS_DWF.REFERENCE_A:1:00",
+                "ABC:DWF.REFERENCE_A:anything",
+                "REFERENCE_A",
+            ),
+        )
 
-    def test_malformed_supported_inventory_target_fails_open_with_cause(self):
+        self.assertEqual(
+            [item.source_table for item in suppressions], ["DEMO_DWF.REFERENCE_A"]
+        )
+
+    def test_malformed_005_inventory_target_fails_open_with_cause(self):
         sql, schedule, result = make_no_producer_result()
 
         with self.assertRaisesRegex(
@@ -417,8 +433,75 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
                 result,
                 sql,
                 schedule,
-                program_states=inventory("001:BAD_TARGET:anything"),
+                program_states=inventory("005:BAD_TARGET:anything"),
             )
+
+    def test_tmp_named_source_with_active_005_program_is_not_suppressed(self):
+        # DEV214 黄金样本：DWP.TMP_P_REPORT_KYW_LIST 有 005 Program Result 支撑，
+        # 名字含 TMP 不得让它变成 NO_INTERNAL_PROGRAM。
+        sql = make_sql_snapshot(
+            sql_edge("DWP.TMP_P_REPORT_KYW_LIST", "DEMO_DWM.RESULT_A"),
+            sql_edge("DWP.TMP_X", "DEMO_DWM.RESULT_A"),
+        )
+        schedule = make_schedule_snapshot(
+            schedule_edge("DEMO_DWF.OTHER_A", "DEMO_DWM.OTHER_RESULT")
+        )
+        result = make_result(sql, schedule)
+
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=inventory(
+                "005:DWS_DWP.TMP_P_REPORT_KYW_LIST:1:00",
+                "005:DWS_DWP.TMP_X:1:00",
+            ),
+        )
+
+        self.assertEqual(suppressions, ())
+
+    def test_tmp_named_source_without_005_program_follows_normal_rule(self):
+        # 没有 005 支撑时，DWM.TMP_X 不是 Program Result；但它也不因 TMP 名称
+        # 被特殊对待：按普通 Program Inventory 规则生成 suppression。
+        sql = make_sql_snapshot(
+            sql_edge("DWM.TMP_X", "DEMO_DWM.RESULT_A"),
+        )
+        schedule = make_schedule_snapshot(
+            schedule_edge("DEMO_DWF.OTHER_A", "DEMO_DWM.OTHER_RESULT")
+        )
+        result = make_result(sql, schedule)
+
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=inventory("005:DEMO_DWM.OTHER_RESULT:1:00"),
+        )
+
+        self.assertEqual([item.source_table for item in suppressions], ["DWM.TMP_X"])
+        self.assertEqual(
+            suppressions[0].suppression_reason,
+            ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
+        )
+
+    def test_traversed_tmp_table_is_not_a_program_result_by_reference(self):
+        # program = 005:DWM.RESULT_A:1:00 且 SQL 经过 DWM.TMP_X 不能证明
+        # DWM.TMP_X 是 Program Result；只有 005:DWM.TMP_X:... 才授予该身份。
+        active_targets = build_active_program_target_inventory(
+            inventory("005:DWM.RESULT_A:1:00"),
+            environment=ENVIRONMENT,
+            active_batch_id="batch-sql-1",
+        )
+
+        self.assertEqual(active_targets, frozenset({"DWM.RESULT_A"}))
+        self.assertEqual(
+            classify_program_inventory_status("DWM.TMP_X", active_targets),
+            ProgramInventoryStatus.NO_INTERNAL_PROGRAM,
+        )
+        self.assertEqual(
+            classify_program_inventory_status("DWM.RESULT_A", active_targets),
+            ProgramInventoryStatus.HAS_INTERNAL_PROGRAM,
+        )
 
     def test_golden_sample_keeps_internal_program_visible(self):
         sql = make_sql_snapshot(
@@ -993,7 +1076,7 @@ class MaterializationCommandTests(unittest.TestCase):
                 (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
                 (
                     program_state(
-                        "DEMO_PROGRAM",
+                        "005:NOT_QUALIFIED",
                         batch_id="batch-sql-command",
                     ),
                 ),
@@ -1037,11 +1120,11 @@ class MaterializationCommandTests(unittest.TestCase):
             ],
         )
 
-    def test_unknown_prefix_failure_reports_root_cause_and_does_not_publish(self):
+    def test_malformed_005_failure_reports_root_cause_and_does_not_publish(self):
         self.sql_factory.return_value = _FakeSQLReader(
             (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
             inventory(
-                "002:DEMO_DWM.RESULT_A:anything",
+                "005:NOT_QUALIFIED",
                 batch_id="batch-sql-command",
             ),
         )
@@ -1057,7 +1140,7 @@ class MaterializationCommandTests(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn(f"{ENVIRONMENT}:ReconciliationSuppressionError", message)
-        self.assertIn("unsupported active program inventory prefix: 002", message)
+        self.assertIn("program inventory target is not a qualified table", message)
         self.suppression_factory.assert_not_called()
 
     def test_cli_reports_real_root_cause_instead_of_only_exception_type(self):
@@ -1065,7 +1148,7 @@ class MaterializationCommandTests(unittest.TestCase):
             return_value=_FakeSQLReader(
                 (sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
                 inventory(
-                    "002:DEMO_DWM.RESULT_A:anything",
+                    "005:NOT_QUALIFIED",
                     batch_id="batch-sql-command",
                 ),
             )
@@ -1091,7 +1174,7 @@ class MaterializationCommandTests(unittest.TestCase):
         text = stderr.getvalue()
         self.assertIn("ERROR RuntimeError: ", text)
         self.assertIn("ReconciliationSuppressionError", text)
-        self.assertIn("unsupported active program inventory prefix: 002", text)
+        self.assertIn("program inventory target is not a qualified table", text)
 
     def test_cli_error_output_does_not_leak_credentials(self):
         def leaking_main(**_kwargs):

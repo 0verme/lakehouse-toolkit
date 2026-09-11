@@ -1,10 +1,12 @@
-# Lineage Phase 5：Business Asset Boundary、TMP/技术节点折叠与血缘落库
+# Lineage Phase 5：Business Asset Boundary、临时节点/技术节点折叠与血缘落库
 
 Phase 5 消费 Phase 3 的 `ProgramPhysicalDAG` 和 Phase 4 的
-`LineageAuditResult`，完成纯的 Business Asset projection、TMP/DLO/DWO collapse、
-正式 direct lineage materialization、issue 落库和完整批次发布。它不重新解析程序、
-不修改 Physical DAG，也不替换现有生产入口。Business Asset Boundary 的独立 contract
-见 [`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
+`LineageAuditResult`，完成纯的 Business Asset projection、显式临时节点/DLO/DWO
+collapse、正式 direct lineage materialization、issue 落库和完整批次发布。它不重新解析
+程序、不修改 Physical DAG，也不替换现有生产入口。Business Asset Boundary 的独立
+contract 见 [`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)；
+Program Result、命名语义与业务边界的总契约见
+[`lineage_asset_semantics.md`](lineage_asset_semantics.md)。
 
 正式 `LineageEdge` 的 endpoint 遵循
 [`lineage_dataset_identity.md`](lineage_dataset_identity.md)：只有
@@ -16,16 +18,17 @@ Phase 5 消费 Phase 3 的 `ProgramPhysicalDAG` 和 Phase 4 的
 
 > **Issue #39 DWS Materialization Writer:** 本文的 Phase 5 Business direct
 > `LineageEdge` 仍由既有 materialization 产生；DWS writer 将同一 pipeline 的
-> `ProgramPhysicalDAG` direct `PhysicalEdge` 写入 `dwp.lineage_edge`（TMP/DLO/DWO
-> endpoint 允许），并将 Business `LineageEdge` 写入 `dwp.lineage_business_edge`（TMP/DLO/DWO endpoint
-> 禁止）。writer 不重新解析 SQL 或复制 TMP/DLO/DWO collapse。五张表共用 batch/lifecycle，
+> `ProgramPhysicalDAG` direct `PhysicalEdge` 写入 `dwp.lineage_edge`（包含显式
+> temporary 节点与 DLO/DWO endpoint），并将 Business `LineageEdge` 写入
+> `dwp.lineage_business_edge`（DLO/DWO endpoint 禁止）。writer 不重新解析 SQL 或复制
+> collapse。五张表共用 batch/lifecycle，
 > `edge_count` 统计 physical `lineage_edge` rows；跨 program/global N-hop closure
 > 属于 Issue #40。详见
 > [`issue-39-dws-materialization-schema.md`](../research/issue-39-dws-materialization-schema.md)。
 
 ## Physical DAG 与 Business Lineage
 
-Physical DAG 记录程序内部真实执行关系，TMP 节点必须保留：
+Physical DAG 记录程序内部真实执行关系，所有物理节点都必须保留：
 
 ```text
 ODS.A ─────→ TMP1 ─────→ TMP2 ─────→ DWA.F
@@ -44,15 +47,18 @@ DWM.C → DWA.F
 DWA.D → DWA.F
 ```
 
-TMP、DLO、DWO 都不能作为 Business endpoint；TMP/DLO/DWO 可作为 physical
-`lineage_edge` endpoint 落库，并在 business `lineage_business_edge` 中由既有 collapse
-结果隐藏。DLO/DWO 的 boundary 规则与 normalization 见
-[`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
+DLO / DWO 不能作为 Business endpoint。`TMP` / `TEMP` / `STG` / `TEST` 名称本身没有
+资产语义：名称不会让一个节点变成 temporary，也不会让它退出 Business Lineage。
+只有显式 `CREATE TEMP` / `CREATE TEMPORARY TABLE` fact 产生的 temporary 节点才能
+被 collapse；DLO/DWO 可作为 physical `lineage_edge` endpoint 落库，并在 business
+`lineage_business_edge` 中由既有 collapse 结果隐藏。DLO/DWO 的 boundary 规则与
+normalization 见 [`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
 
-## TMP/DLO/DWO Collapse 与 Business Asset 边界
+## 临时节点/DLO/DWO Collapse 与 Business Asset 边界
 
-Collapse 从每个 Business Asset 节点的 outgoing edge 开始：遇到 TMP、DLO 或 DWO
-就继续沿路径走，第一次遇到下一个 Business Asset 便生成一条 `U → V` 并停止该路径。
+Collapse 从每个 Business Asset 节点的 outgoing edge 开始：遇到显式 temporary 节点、
+DLO 或 DWO 就继续沿路径走，第一次遇到下一个 Business Asset 便生成一条 `U → V` 并
+停止该路径。临时节点判定只来自 `PhysicalNodeKind.TEMPORARY_ASSET`（即显式 DDL fact）。
 DLO/DWO 不会因为 `PhysicalNodeKind.FORMAL_ASSET` 而变成 Business boundary；该算法
 也不是 transitive closure。
 
@@ -80,7 +86,7 @@ DWF.A → DWM.B
 DWM.B → DWA.C
 ```
 
-`DWM.B` 是 Business Asset 边界，不能被 TMP/DLO/DWO collapse 越过。若路径为
+`DWM.B` 是 Business Asset 边界，不能被临时节点/DLO/DWO collapse 越过。若路径为
 `DLO.A → DWO.B → DWF.C`，Physical rows 仍保留，但不会伪造 DLO/DWO endpoint 的
 Business edge。
 
@@ -109,7 +115,7 @@ statement evidence summary 不因 sample 截断而丢失。
 `lineage_business_edge` 才接收 Business direct `LineageEdge`。两个 projection 使用同
 一批次和同一 program pipeline。
 
-Materialization 对无环 TMP/DLO/DWO 可折叠子图使用 deterministic DAG dynamic
+Materialization 对无环临时节点/DLO/DWO 可折叠子图使用 deterministic DAG dynamic
 programming：Business boundary 的 exact `path_count`、能参与该 boundary 的 physical
 edge/node summary 都由 reachability 和拓扑计数得到，不显式保存或遍历全部 collapsed
 path；随后只用 bounded
@@ -117,7 +123,7 @@ representative traversal 生成最多 `100` 条 sample path。每个 Business ed
 `_EdgeEvidenceAccumulator` 和一次最终 `LineageEdge`，不会执行
 `path → temporary LineageEdge → merge`。
 
-含 TMP/DLO/DWO 可折叠节点 cycle 的图无法直接把 simple-path 数量替换为普通 DAG DP，
+含临时节点/DLO/DWO 可折叠节点 cycle 的图无法直接把 simple-path 数量替换为普通 DAG DP，
 因此保留 explicit simple-path fallback。只有该 fallback 受 `MAX_COLLAPSED_PATHS=100000` 和
 `MAX_COLLAPSED_TRAVERSAL_STATES=1000000` 限制，超限抛出 `LineagePathEnumerationError`
 并由 job 记录为 `PATHOLOGICAL`；无环 dense graph 不通过降低上限处理，而是保留 exact
@@ -139,7 +145,7 @@ CI timing gate。
 
 公开 benchmark 只使用 fictional `DEMO` nodes、edges 和 profiles，不记录真实
 program id、源码尺寸、内部地址、driver error 或连接信息。它覆盖 small dense、high
-fan-in、high fan-out、TMP cycle、bounded evidence 和 deterministic JSON，重点验证
+fan-in、high fan-out、临时节点 cycle、bounded evidence 和 deterministic JSON，重点验证
 full path count 不驱动无限 path object/evidence/LineageEdge 数量；耗时只用于观察，
 不作为机器相关的 CI threshold。
 

@@ -4,8 +4,10 @@ import unittest
 from datetime import datetime, timezone
 
 from shared.lineage.domain import (
+    DEFAULT_TEMPORARY_ASSET_RULES,
     PROGRAM_INVENTORY_PREFIXES,
     PROGRAM_NAME_LEGACY_MARKER,
+    DatasetIdentity,
     IssueType,
     LineageEdge,
     LineageIssue,
@@ -117,22 +119,46 @@ class LineageDomainTests(unittest.TestCase):
             "DWM.RESULT_A",
         )
 
-    def test_program_inventory_prefixes_are_explicit_and_narrow(self):
-        self.assertEqual(PROGRAM_INVENTORY_PREFIXES, frozenset({"001", "005"}))
+    def test_program_inventory_prefix_is_the_single_005_authority(self):
+        # Program Inventory 不是第二套 marker registry：只有 canonical 005。
+        self.assertEqual(PROGRAM_INVENTORY_PREFIXES, frozenset({"005"}))
+        self.assertEqual(PROGRAM_NAME_LEGACY_MARKER, "005")
 
-    def test_program_inventory_reads_confirmed_001_prefix(self):
+    def test_program_inventory_accepts_tmp_named_program_result(self):
+        # 真实 DEV214 evidence：TMP_ 命名不能阻止 005 Program Result authority。
         self.assertEqual(
-            normalize_program_inventory_target("001:DWF.RESULT_A:anything"),
-            "DWF.RESULT_A",
+            normalize_program_inventory_target(
+                "005:DWS_DWP.TMP_P_REPORT_KYW_LIST:1:00"
+            ),
+            "DWP.TMP_P_REPORT_KYW_LIST",
         )
         self.assertEqual(
-            normalize_program_inventory_target("001:DWS_DWF.RESULT_A:anything"),
-            "DWF.RESULT_A",
+            normalize_program_inventory_target("005:DWS_DWP.TMP_X:1:00"),
+            "DWP.TMP_X",
         )
         self.assertEqual(
-            normalize_program_inventory_target("001:AECIF_ECIF.CUS_BAS_ENT:tail"),
-            "AECIF_ECIF.CUS_BAS_ENT",
+            normalize_program_inventory_target("005:DWS_DWP.TMP_X"),
+            "DWP.TMP_X",
         )
+
+    def test_program_inventory_ignores_non_005_prefix_without_failing(self):
+        # 001 / 002 / ABC / 无首段 / 无冒号名字都不提供 Program Inventory
+        # evidence，但不是异常：返回 None 且不 fail open。
+        for program_name in (
+            "001:DWF.RESULT_A:anything",
+            "001:DWS_DWF.RESULT_A:anything",
+            "001:AECIF_ECIF.CUS_BAS_ENT:tail",
+            "001:",
+            "001:ABC",
+            "001:DWS_DWF.TMP_RESULT:1:00",
+            "002:DWF.RESULT_A:anything",
+            "003:DWS_DWF.RESULT_A:1:00",
+            "ABC:DWF.RESULT_A:anything",
+            ":DWF.RESULT_A:anything",
+            "DEMO_PROGRAM",
+        ):
+            with self.subTest(program_name=program_name):
+                self.assertIsNone(normalize_program_inventory_target(program_name))
 
     def test_program_inventory_does_not_change_issue_44_canonical_grammar(self):
         parsed = parse_program_name("001:DWF.RESULT_A:1:00")
@@ -154,13 +180,15 @@ class LineageDomainTests(unittest.TestCase):
             "DWM.RESULT_A",
         )
 
-    def test_program_inventory_malformed_supported_prefix_raises(self):
+    def test_program_inventory_malformed_005_target_fails_open(self):
+        # 只有明确进入 005 协议却无法给出合法 target 的情况才是
+        # authoritative evidence 异常。
         for program_name in (
-            "001:",
             "005:",
-            "001:ABC",
+            "005:ABC",
             "005:not-qualified",
-            "001:DWS_DWF.TMP_RESULT:1:00",
+            "005:DWF.",
+            "005:.TABLE_A",
         ):
             with self.subTest(program_name=program_name):
                 with self.assertRaisesRegex(
@@ -168,18 +196,34 @@ class LineageDomainTests(unittest.TestCase):
                 ):
                     normalize_program_inventory_target(program_name)
 
-    def test_program_inventory_unknown_prefix_raises_instead_of_skipping(self):
-        for program_name in (
-            "002:DWF.RESULT_A:anything",
-            "003:DWS_DWF.RESULT_A:1:00",
-            "ABC:DWF.RESULT_A:anything",
-            ":DWF.RESULT_A:anything",
+    def test_issue_44_grammar_accepts_tmp_named_program_result(self):
+        # Issue #44 的 005 grammar 保持不变，但 TMP 命名不再让 target 失效。
+        for program_name, logical_target, step_seq in (
+            ("005:DWS_DWP.TMP_X:1:00", "DWP.TMP_X", 1),
+            (
+                "005:DWS_DWP.TMP_P_REPORT_KYW_LIST:1:00",
+                "DWP.TMP_P_REPORT_KYW_LIST",
+                1,
+            ),
+            ("005:DWP.TEMP_A:2:00", "DWP.TEMP_A", 2),
         ):
             with self.subTest(program_name=program_name):
-                with self.assertRaisesRegex(
-                    ValueError, "unsupported active program inventory prefix"
-                ):
-                    normalize_program_inventory_target(program_name)
+                parsed = parse_program_name(program_name)
+                self.assertEqual(parsed.legacy_marker, "005")
+                self.assertEqual(parsed.logical_target, logical_target)
+                self.assertEqual(parsed.step_seq, step_seq)
+                self.assertEqual(parsed.opaque_suffix, "00")
+                self.assertEqual(
+                    parsed.diagnostics,
+                    (ProgramNameDiagnostic.PROGRAM_NAME_TARGET_RESOLVED,),
+                )
+        self.assertEqual(
+            normalize_legacy_program_namespace("DWS_DWP.TMP_X"), "DWP.TMP_X"
+        )
+        self.assertEqual(
+            normalize_declared_target_from_program_name("DWS_DWP.TMP_P_REPORT_KYW_LIST"),
+            "DWP.TMP_P_REPORT_KYW_LIST",
+        )
 
     def test_program_name_target_first_parser_keeps_direct_dataset_name(self):
         parsed = parse_program_name("005:DWM.RESULT_A:1:00")
@@ -375,7 +419,7 @@ class LineageDomainTests(unittest.TestCase):
         self.assertEqual(edge.target, "DWM.DEMO_B")
         self.assertNotEqual(edge.source, edge.target)
 
-    def test_physical_dag_keeps_tmp_nodes(self):
+    def test_physical_node_kind_ignores_table_name(self):
         nodes = {
             node.node_key: node
             for node in (
@@ -389,29 +433,43 @@ class LineageDomainTests(unittest.TestCase):
             PhysicalEdge(source="TMP1", target="DWM.DEMO_B"),
         )
 
-        self.assertEqual(nodes["TMP1"].kind, PhysicalNodeKind.TEMPORARY_ASSET)
-        self.assertTrue(nodes["TMP1"].is_temporary)
+        # 没有显式 temporary evidence 时使用中性默认值，表名不参与分类。
+        self.assertEqual(nodes["TMP1"].kind, PhysicalNodeKind.FORMAL_ASSET)
+        self.assertFalse(nodes["TMP1"].is_temporary)
+        self.assertTrue(nodes["TMP1"].is_formal)
         self.assertTrue(nodes["DWM.DEMO_B"].is_formal)
+        # 显式 kind / CREATE TEMP fact 仍可产生 temporary 节点。
+        explicit = PhysicalNode("TMP1", "TMP1", PhysicalNodeKind.TEMPORARY_ASSET)
+        self.assertTrue(explicit.is_temporary)
+        self.assertTrue(PhysicalNode("SESSION_STAGE", "SESSION_STAGE").is_formal)
         self.assertEqual(
             [(edge.source, edge.target) for edge in edges],
             [("ODS.DEMO_A", "TMP1"), ("TMP1", "DWM.DEMO_B")],
         )
 
-    def test_temporary_name_rules_are_conservative_and_extensible(self):
-        self.assertTrue(is_temporary_asset("TMP_1"))
-        self.assertTrue(is_temporary_asset("TMP_STAGE_X"))
-        self.assertTrue(is_temporary_asset("DWM.TMP1"))
+    def test_temporary_naming_is_not_evidence(self):
+        for asset_name in (
+            "TMP_1",
+            "TMP_STAGE_X",
+            "DWM.TMP1",
+            "DWM.TEMP_A",
+            "DWP.STG_A",
+            "DWM.TEST_A",
+            "DWM.A_TMP",
+            "TMP_P_REPORT_KYW_LIST",
+        ):
+            with self.subTest(asset_name=asset_name):
+                self.assertFalse(is_temporary_asset(asset_name))
+                self.assertTrue(is_formal_asset(asset_name))
         self.assertFalse(is_temporary_asset("DWM.DEMO_C"))
-        self.assertFalse(is_temporary_asset("DWM.TMPORARY_BUSINESS"))
-        self.assertFalse(is_temporary_asset("DEMO_TMP_1"))
+        self.assertEqual(DEFAULT_TEMPORARY_ASSET_RULES, ())
+        # 只有调用方显式提供的证据型规则才可能产生 temporary 分类。
         self.assertTrue(
             is_temporary_asset(
                 "DWM.DEMO_STAGE_X",
                 rules=(lambda name: name.endswith("STAGE_X"),),
             )
         )
-        self.assertTrue(is_formal_asset("DWM.DEMO_C"))
-        self.assertFalse(is_formal_asset("TMP_STAGE_X"))
 
     def test_lineage_edge_represents_direct_formal_asset_fact(self):
         observed_at = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
@@ -440,14 +498,65 @@ class LineageDomainTests(unittest.TestCase):
         self.assertTrue(is_formal_asset(edge.source_table))
         self.assertTrue(is_formal_asset(edge.target_table))
 
-    def test_lineage_edge_rejects_tmp_endpoint_by_default(self):
-        with self.assertRaises(ValueError):
+    def test_lineage_edge_accepts_tmp_named_business_endpoint(self):
+        # TMP_ 名称不再拒绝正式 LineageEdge endpoint；能否成为正式 edge 由
+        # business boundary / Program Result / schema boundary 规则决定。
+        edge = LineageEdge(
+            environment="DEV214",
+            source_profile="mysql_dev_a",
+            source_table="DWP.TMP_P_REPORT_KYW_LIST",
+            target_table="DWM.RESULT_A",
+        )
+        self.assertEqual(edge.source_table, "DWP.TMP_P_REPORT_KYW_LIST")
+        self.assertEqual(edge.target_table, "DWM.RESULT_A")
+        self.assertEqual(
+            edge.source_dataset_identity,
+            DatasetIdentity("DEV214", "DWP", "TMP_P_REPORT_KYW_LIST"),
+        )
+        # 未限定 schema 的引用仍必须失败，但这与 TMP 命名无关。
+        with self.assertRaisesRegex(ValueError, "qualified schema.table"):
             LineageEdge(
                 environment="DEV",
                 source_profile="mysql_dev_a",
                 source_table="TMP_1",
                 target_table="DWA.DEMO_C",
             )
+
+    def test_dataset_identity_accepts_tmp_named_qualified_table(self):
+        identity = DatasetIdentity("DEV214", "DWP", "TMP_P_REPORT_KYW_LIST")
+
+        self.assertEqual(identity.canonical_name, "DWP.TMP_P_REPORT_KYW_LIST")
+        self.assertEqual(identity.key, ("DEV214", "DWP", "TMP_P_REPORT_KYW_LIST"))
+        for asset_name in (
+            "DWM.TMP_X",
+            "DWP.TEMP_A",
+            "DWF.STG_A",
+            "DWM.TEST_A",
+            "DWM.A_TMP",
+        ):
+            with self.subTest(asset_name=asset_name):
+                resolved = DatasetIdentity.from_name("DEV214", asset_name)
+                self.assertIsNotNone(resolved)
+                assert resolved is not None
+                self.assertEqual(resolved.canonical_name, asset_name)
+
+    def test_tmp_naming_does_not_change_business_or_technical_boundary(self):
+        for asset_name in (
+            "DWP.TMP_X",
+            "DWM.TEMP_A",
+            "DWF.STG_A",
+            "DWM.TEST_A",
+            "DWM.A_TMP",
+            "DWP.TMP_P_REPORT_KYW_LIST",
+        ):
+            with self.subTest(asset_name=asset_name):
+                self.assertTrue(is_business_asset(asset_name))
+                self.assertFalse(is_technical_asset(asset_name))
+        # DLO/DWO 边界只由显式 schema registry 决定，命名不参与。
+        self.assertFalse(is_business_asset("DLO.TMP_X"))
+        self.assertTrue(is_technical_asset("DLO.TMP_X"))
+        self.assertFalse(is_business_asset("DWO.TEMP_A"))
+        self.assertTrue(is_technical_asset("DWO.TEMP_A"))
 
     def test_business_asset_boundary_reuses_registered_schema_wrappers(self):
         cases = {

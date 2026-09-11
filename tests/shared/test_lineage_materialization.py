@@ -320,6 +320,171 @@ class LineageMaterializationTests(unittest.TestCase):
         self.assertEqual(evidence["collapsed_tmp_nodes"], ["SESSION_STAGE"])
         self.assertEqual(evidence["collapsed_technical_nodes"], [])
 
+    def test_tmp_naming_variants_do_not_change_physical_or_business_lineage(self):
+        # TMP / TEMP / STG / TEST 名称没有资产语义：它们不改变 PhysicalNodeKind、
+        # business boundary 或正式 LineageEdge。
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="DEMO_TMP_NAMING_IS_NOT_SEMANTICS",
+            script_code=(
+                'execute("INSERT INTO DWP.TMP_P_REPORT_KYW_LIST SELECT * FROM DWF.STG_A")\n'
+                'execute("INSERT INTO DWM.TEMP_B SELECT * FROM DWP.TMP_P_REPORT_KYW_LIST")\n'
+                'execute("INSERT INTO DWM.TEST_C SELECT * FROM DWM.TEMP_B")\n'
+                'execute("INSERT INTO DWM.A_TMP SELECT * FROM DWM.TEST_C")'
+            ),
+            expected_target="DWM.A_TMP",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            batch_id="batch-tmp-naming",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertTrue(all(node.is_formal for node in dag.nodes))
+        self.assertEqual(
+            edge_pairs(result),
+            {
+                ("DWF.STG_A", "DWP.TMP_P_REPORT_KYW_LIST"),
+                ("DWP.TMP_P_REPORT_KYW_LIST", "DWM.TEMP_B"),
+                ("DWM.TEMP_B", "DWM.TEST_C"),
+                ("DWM.TEST_C", "DWM.A_TMP"),
+            },
+        )
+
+    def test_005_tmp_named_program_result_is_authoritative(self):
+        # B/C：真实 DEV214 场景。TMP 命名的 005 结果表必须成为正式 Program
+        # Result，而不是被名称拒绝。
+        source = ProgramSource(
+            environment="DEV214",
+            source_profile="fixture",
+            program_name="005:DWS_DWP.TMP_P_REPORT_KYW_LIST:1:00",
+            script_code=(
+                'execute("INSERT INTO DWP.TMP_P_REPORT_KYW_LIST '
+                'SELECT * FROM DWF.SOURCE_A")'
+            ),
+            source_hash="sha256:tmp-program-result",
+        )
+        dag = build_program_physical_dag(source)
+        audit = audit_dag(dag, batch_id="batch-tmp-program-result")
+        result = materialize_program(
+            dag,
+            audit_result=audit,
+            batch_id="batch-tmp-program-result",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(source.logical_target, "DWP.TMP_P_REPORT_KYW_LIST")
+        self.assertEqual(source.step_seq, 1)
+        self.assertEqual(dag.expected_target, "DWP.TMP_P_REPORT_KYW_LIST")
+        self.assertEqual(audit.selected_materialization_target, "DWP.TMP_P_REPORT_KYW_LIST")
+        self.assertEqual(
+            edge_pairs(result), {("DWF.SOURCE_A", "DWP.TMP_P_REPORT_KYW_LIST")}
+        )
+        self.assertNotIn(IssueType.TARGET_MISMATCH, audit.issue_types)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, audit.issue_types)
+
+    def test_multi_result_sql_keeps_only_005_declared_program_result(self):
+        # J：SQL 多结果表时，只有 005 第二段声明的表获得 Program Result
+        # authority；其他 sink 只是 SQL / Physical lineage fact。
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWM.RESULT_A:1:00",
+            script_code=(
+                'execute("INSERT INTO DWM.RESULT_A SELECT * FROM DWF.SOURCE_A")\n'
+                'execute("INSERT INTO DWM.RESULT_B SELECT * FROM DWF.SOURCE_A")'
+            ),
+            source_hash="sha256:multi-result-authority",
+        )
+        dag = build_program_physical_dag(source)
+        audit = audit_dag(dag, batch_id="batch-multi-result")
+        result = materialize_program(
+            dag,
+            audit_result=audit,
+            batch_id="batch-multi-result",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(dag.expected_target, "DWM.RESULT_A")
+        self.assertEqual(audit.selected_materialization_target, "DWM.RESULT_A")
+        self.assertEqual(
+            {(edge.source, edge.target) for edge in dag.edges},
+            {
+                ("DWF.SOURCE_A", "DWM.RESULT_A"),
+                ("DWF.SOURCE_A", "DWM.RESULT_B"),
+            },
+        )
+        self.assertEqual(edge_pairs(result), {("DWF.SOURCE_A", "DWM.RESULT_A")})
+
+    def test_program_sql_mismatch_keeps_005_authority(self):
+        # K：005 program_name 与 SQL 实际 sink 冲突时仍以 program_name 为准；
+        # 差异只作为 audit / 治理证据，parser 不自动改 authority。
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWM.RESULT_A:1:00",
+            script_code=(
+                'execute("INSERT INTO DWM.RESULT_B SELECT * FROM DWF.SOURCE_A")'
+            ),
+            source_hash="sha256:program-sql-mismatch",
+        )
+        dag = build_program_physical_dag(source)
+        audit = audit_dag(dag, batch_id="batch-program-sql-mismatch")
+        result = materialize_program(
+            dag,
+            audit_result=audit,
+            batch_id="batch-program-sql-mismatch",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(source.logical_target, "DWM.RESULT_A")
+        self.assertEqual(dag.expected_target, "DWM.RESULT_A")
+        self.assertEqual(audit.selected_materialization_target, "DWM.RESULT_A")
+        self.assertEqual(result.edges, ())
+        self.assertIn(IssueType.TARGET_MISMATCH, audit.issue_types)
+
+    def test_dlo_dwo_edges_are_excluded_without_bypass_edge(self):
+        # L：DLO / DWO 不进入最终血缘结果，也不合成 bypass edge。
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="DEMO_DLO_DWO_BOUNDARY",
+            script_code=(
+                'execute("INSERT INTO DWF.B SELECT * FROM DLO.A")\n'
+                'execute("INSERT INTO DWF.B SELECT * FROM DWO.X")\n'
+                'execute("INSERT INTO DWM.C SELECT * FROM DWF.B")'
+            ),
+            expected_target="DWM.C",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            batch_id="batch-dlo-dwo-boundary",
+            observed_at=OBSERVED_AT,
+        )
+
+        # Physical / raw SQL fact 保留 DLO / DWO。
+        self.assertEqual(
+            {(edge.source, edge.target) for edge in dag.edges},
+            {
+                ("DLO.A", "DWF.B"),
+                ("DWO.X", "DWF.B"),
+                ("DWF.B", "DWM.C"),
+            },
+        )
+        # 正式 lineage 只保留 DWF.B -> DWM.C。
+        self.assertEqual(edge_pairs(result), {("DWF.B", "DWM.C")})
+        for forbidden in (
+            ("DLO.A", "DWF.B"),
+            ("DWO.X", "DWF.B"),
+            ("DLO.A", "DWM.C"),
+            ("DWO.X", "DWM.C"),
+            ("DLO.A", "DWO.X"),
+        ):
+            self.assertNotIn(forbidden, edge_pairs(result))
+
     def test_single_tmp_collapses_to_one_formal_edge(self):
         result = materialize_program(
             build_dag(SINGLE_TMP_PROGRAM),
@@ -942,7 +1107,7 @@ class LineageMaterializationTests(unittest.TestCase):
             source_profile="fixture",
             program_name="005:DWS_DWM.RESULT_A:00",
             script_code=(
-                'execute("INSERT INTO TMP_X SELECT * FROM ODS.SOURCE")\n'
+                'execute("CREATE TEMPORARY TABLE TMP_X AS SELECT * FROM ODS.SOURCE")\n'
                 'execute("INSERT INTO DWM.RESULT_A SELECT * FROM TMP_X")'
             ),
             source_hash="sha256:ambiguous-program-name",
@@ -972,9 +1137,9 @@ class LineageMaterializationTests(unittest.TestCase):
             source_profile="fixture",
             program_name="005:DWS_DM.RESULT_A:00",
             script_code=(
-                'execute("INSERT INTO TMP_A SELECT * FROM ODS.SRC_A")\n'
+                'execute("CREATE TEMPORARY TABLE TMP_A AS SELECT * FROM ODS.SRC_A")\n'
                 'execute("INSERT INTO DM.RESULT_A SELECT * FROM TMP_A")\n'
-                'execute("INSERT INTO TMP_B SELECT * FROM ODS.SRC_B")\n'
+                'execute("CREATE TEMPORARY TABLE TMP_B AS SELECT * FROM ODS.SRC_B")\n'
                 'execute("INSERT INTO DM.RESULT_B SELECT * FROM TMP_B")'
             ),
             source_hash="sha256:target-hint-selection",

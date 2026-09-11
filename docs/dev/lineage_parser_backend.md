@@ -118,11 +118,12 @@ Audit → Materialization 链路，比较 sources、target、statement type、pa
 edge 和 issue 结果。
 
 `LINEAGE_PIPELINE_VERSION` 当前为
-`lineage-pipeline-v10-sql-relation-context`。本次仍保持 `ParserBackend` abstraction、
-production default 和 downstream adapter 边界不变，但 legacy source extraction 的
-Physical facts 已修正：函数调用表达式中的 `FROM/JOIN/USING` 不再被当成 relation。
-因此同一 source hash 的 v9 facts 必须 coherent rebuild，不能复用旧的 Physical/Business
-projection。`legacy-parser-v2-relation-context` 只标识该 backend 的修正后 parser
+`lineage-pipeline-v11-asset-naming-semantics`。本次（Issue #121）修正的是 core lineage
+的资产语义：`TMP` / `TEMP` / `STG` / `TEST` 命名不再产生 temporary classification，非
+`005` program_name 不再进入 Program Inventory，`DLO`/`DWO` 仍不进入正式 lineage。
+因此同一 source hash 的 v10 facts 必须 coherent rebuild，不能复用旧的 Physical/Business
+projection。`ParserBackend` abstraction、production default 和 downstream adapter 边界
+保持不变；`legacy-parser-v2-relation-context` 只标识该 backend 的修正后 parser
 contract；真正控制持久化事实 cache invalidation 的仍是 pipeline version。未知但语法
 有效的 relation 不因 schema 未登记而删除。shadow backend 的结果不应写入 production
 facts 或 cache。

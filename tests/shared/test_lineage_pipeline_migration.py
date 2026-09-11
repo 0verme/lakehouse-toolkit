@@ -128,7 +128,7 @@ class PipelineVersionMigrationPreflightTests(unittest.TestCase):
                 ("profile_a", "profile_b"),
             )
             self.assertIn(
-                "current=lineage-pipeline-v10-sql-relation-context",
+                f"current={LINEAGE_PIPELINE_VERSION}",
                 str(raised.exception),
             )
             self.assertIn("stale_profiles=profile_a,profile_b", str(raised.exception))

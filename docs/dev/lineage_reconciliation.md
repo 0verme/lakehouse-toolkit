@@ -254,8 +254,8 @@ not exists Schedule edge  Y -> SOURCE
 producer 不要求与当前 target 关联；只要 scope 内存在 `X -> SOURCE`，就不能 suppression。
 判断继续复用 `normalize_lineage_comparison_table_key()` 的 qualified
 `schema.table` identity；不使用 basename、suffix、LIKE、schema guessing、表名关键字
-或人工 whitelist。`TMP`、`DLO`、`DWO` technical-only endpoint 仍由既有 business
-reconciliation boundary 负责，classifier 不重新引入它们。
+或人工 whitelist。`TMP` 命名没有 technical 语义；只有 `DLO`、`DWO` technical-only
+endpoint 仍由既有 business reconciliation boundary 负责，classifier 不重新引入它们。
 
 **absence of producer != proof of manual table**。该 classification 不声称 source
 是手工维护表、码值表或参考表，只记录当前 scope 内没有观察到内部 producer。
@@ -265,34 +265,32 @@ reconciliation boundary 负责，classifier 不重新引入它们。
 ### Program Inventory 契约
 
 「当前 environment 是否存在声明加工某张表的 active 内部程序」的唯一正式事实源是
-`dwp.lineage_program_state`，而不是最近的 SQL / Schedule edge。Program Inventory 是
-比 canonical program-name parser 更窄的独立职责，grammar 固定为：
+`dwp.lineage_program_state`，而不是最近的 SQL / Schedule edge。**只有 canonical
+`005` marker 提供 Program Result / Program Inventory 权威证据**，grammar 固定为：
 
 ```text
-<inventory_prefix>:<qualified_schema_table>[:...]
+005:<qualified_schema_table>[:...]
 ```
 
-- 只解释第 1 段 prefix 与第 2 段 qualified target；
+- 只解释第 1 段 marker 与第 2 段 qualified target；
 - 第 3 段起的后续 segment 一律不解释：不作为 step、不授予 canonical target authority、
   不进入 stable identity；
-- 复用显式 registry 的 legacy namespace normalization（如 `DWS_DWF.X -> DWF.X`），
-  不新增 basename / fuzzy schema guessing；
-- prefix 白名单只有真实 active program state 已确认的取值：
+- 复用显式 registry 的 legacy namespace normalization（如
+  `DWS_DWP.TMP_X -> DWP.TMP_X`），不新增 basename / fuzzy schema guessing；
+- 表名不参与分类：`DWP.TMP_P_REPORT_KYW_LIST` 是合法 Program Result target。
 
-```python
-PROGRAM_INVENTORY_PREFIXES = frozenset({"001", "005"})
-```
-
-它与 Issue #44 的 canonical grammar 是两个独立契约：`PROGRAM_NAME_LEGACY_MARKER` 仍为
+它与 Issue #44 的 canonical grammar 完全一致：`PROGRAM_NAME_LEGACY_MARKER` 为
 `"005"`，`parse_program_name()` 的 target authority、step sequencing 与 opaque suffix
-语义均不因 Program Inventory 扩大。`001` 只能是 inventory prefix，不能成为 canonical
-program。
+语义均不因 Program Inventory 扩大。`PROGRAM_INVENTORY_PREFIXES` 只是由
+`PROGRAM_NAME_LEGACY_MARKER` 派生的兼容常量（`frozenset({"005"})`），不是第二套
+marker registry。
 
-失败语义全部是 **uncertain => fail open-to-visible**：
+失败语义区分两类，完整契约见
+[`lineage_asset_semantics.md`](lineage_asset_semantics.md)：
 
-- 已支持 prefix 但第二段无法规范化为 qualified `schema.table` => 抛错，scope fail-open；
-- 未确认 prefix（例如 `002:`、`ABC:`）=> 抛错，scope fail-open，禁止静默当作
-  `NO_INTERNAL_PROGRAM`；
+- `005` 但第二段无法规范化为 qualified `schema.table` => 抛错，scope fail-open；
+- 非 `005`（`001:`、`002:`、`ABC:`、无冒号普通名字）=> 不是 Program Result 声明，
+  直接 skip，不提供 `HAS_INTERNAL_PROGRAM` evidence，也不阻止 suppression；
 - 错误发生时不得 publish 新 suppression，也不得 retire 旧 active suppression。
 
 ```text

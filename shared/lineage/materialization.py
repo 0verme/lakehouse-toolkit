@@ -43,7 +43,6 @@ from shared.lineage.domain import (
     ProgramState,
     is_business_asset,
     is_technical_asset,
-    is_temporary_asset,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
 
@@ -399,8 +398,9 @@ class _EdgeEvidenceAccumulator:
         if is_technical_asset(node_text):
             self.collapsed_technical_nodes.add_safe(node_text)
         else:
-            # Preserve explicit/custom temporary nodes that do not match the
-            # default TMP naming rule.
+            # A collapsible intermediate that is not a registered DLO/DWO
+            # technical node carries explicit temporary evidence
+            # (CREATE TEMP/TEMPORARY TABLE); naming is never consulted.
             self.collapsed_tmp_nodes.add_safe(node_text)
 
     def add_graph_summary(
@@ -634,10 +634,14 @@ def _node_asset_name(
 
 
 def _is_temporary(node_key: str, node_map: Mapping[str, PhysicalNode]) -> bool:
+    """Only explicit Physical DAG evidence marks a node as temporary.
+
+    A node missing from the DAG has no temporary evidence, so it is never
+    classified by table name.
+    """
+
     node = node_map.get(node_key)
-    if node is not None:
-        return node.kind is PhysicalNodeKind.TEMPORARY_ASSET
-    return is_temporary_asset(node_key)
+    return node is not None and node.kind is PhysicalNodeKind.TEMPORARY_ASSET
 
 
 def _is_business_boundary(
@@ -1189,10 +1193,11 @@ def _path_evidence(
             edge_records.append(_physical_edge_summary(edge))
             continue
         edge_records.append(_cached_physical_edge_summary(edge, edge_summary_cache))
-    # Keep TMP and registered DLO/DWO intermediates separate in evidence.  A
-    # path produced by this module only contains collapsible intermediates, so
-    # an intermediate that is not registered DLO/DWO is an explicitly temporary
-    # PhysicalNode (including CREATE TEMP names outside the default TMP rule).
+    # Keep explicit temporary intermediates and registered DLO/DWO
+    # intermediates separate in evidence.  A path produced by this module only
+    # contains collapsible intermediates, so an intermediate that is not
+    # registered DLO/DWO carries explicit temporary evidence
+    # (CREATE TEMP/TEMPORARY TABLE); naming is never consulted.
     intermediate_nodes = set(path[1:-1])
     technical_nodes = sorted(
         node for node in intermediate_nodes if is_technical_asset(node)

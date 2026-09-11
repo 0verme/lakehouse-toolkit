@@ -52,9 +52,12 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v10-sql-relation-context`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v11-asset-naming-semantics`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
-bump 到新的语义版本，并在本文记录原因。v7 在 v6 audit target semantics 的基础上
+bump 到新的语义版本，并在本文记录原因。v11 在 v10 relation-context 的基础上废除
+表名式临时表推断、把 Program Inventory 收口为单一 `005` authority，并明确 `DLO`/`DWO`
+不进入正式 lineage；因此所有 v10 active facts 都必须整体 rebuild（partial replay 会被
+preflight 阻止）。v7 在 v6 audit target semantics 的基础上
 固定 `005` canonical 四段 target authority 前的显式 legacy namespace registry：
 `DWS_DM -> DM`、`DWS_DWM -> DWM`、`DWS_DWA -> DWA`、`DWS_DWP -> DWP`、
 `DWS_DWD -> DWD`、`DWS_DWF -> DWF`、`DWS_DWUPRR -> DWUPRR` 与

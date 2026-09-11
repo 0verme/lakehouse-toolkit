@@ -314,9 +314,12 @@ def build_active_program_target_inventory(
 
     This function consumes only DWS-materialized ``ProgramState`` values.  A
     state from another environment or an inactive state is irrelevant; an
-    active state in the requested environment must have a valid supported
-    inventory shape and the requested active batch provenance.  Any ambiguity
-    is an error so the caller can fail open rather than hide SQL_ONLY rows.
+    active state in the requested environment must have the requested active
+    batch provenance.  Only the canonical ``005`` marker provides Program
+    Result authority: any other prefix (``001``, ``002``, ``ABC``, a plain
+    name) simply carries no Program Inventory evidence and is skipped without
+    failing open.  A malformed ``005`` declaration is an authoritative-evidence
+    error so the caller can fail open rather than hide SQL_ONLY rows.
     """
 
     if not isinstance(environment, str) or not environment.strip():
@@ -347,17 +350,17 @@ def build_active_program_target_inventory(
         try:
             target = normalize_program_inventory_target(state.program_name)
         except (TypeError, ValueError) as exc:
-            # The domain message already names the offending prefix / target, so
-            # surface it verbatim: a swallowed cause makes an environment-wide
-            # fail-open undiagnosable.
+            # A malformed 005 target is authoritative evidence we cannot honour.
+            # Surface the domain message verbatim: a swallowed cause makes an
+            # environment-wide fail-open undiagnosable.
             reason = str(exc).strip()
             raise ReconciliationSuppressionError(
                 reason or "active program inventory target normalization failed"
             ) from exc
         if target is None:
-            raise ReconciliationSuppressionError(
-                "active program state has no valid inventory target"
-            )
+            # 非 005（001 / 002 / 其他 prefix / 无冒号名字）不提供 Program
+            # Inventory evidence，但也不是异常：直接跳过，不 fail open。
+            continue
         targets.add(target)
     return frozenset(targets)
 
