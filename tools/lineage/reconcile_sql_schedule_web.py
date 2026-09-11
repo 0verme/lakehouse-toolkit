@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 from io import BytesIO
+from time import perf_counter
 from typing import Any, cast
 
 from openpyxl import Workbook
@@ -35,6 +36,7 @@ from shared.lineage.reconciliation import (
     LineageReconciliationResult,
     LineageReconciliationRow,
     ReconciliationStatus,
+    ReconciliationTiming,
     TargetSummaryStatus,
     normalize_lineage_comparison_table_key,
 )
@@ -427,63 +429,131 @@ def reconcile_target(
     target_table: str,
     *,
     runner: ReconciliationRunner | None = None,
+    timing: ReconciliationTiming | None = None,
 ) -> LineageReconciliationResult:
-    """Call the formal Python reconciliation function for one target."""
+    """Call the formal target-scoped reconciliation function."""
 
     if not isinstance(scope, LineageEnvironmentScope):
         raise TypeError("scope must be a LineageEnvironmentScope")
     if not isinstance(target_table, str) or not target_table.strip():
         raise ValueError("target_table must be a non-empty string")
+    target = normalize_lineage_comparison_table_key(target_table)
     reconcile = runner or run_reconciliation
-    return reconcile(
-        dws_profile=scope.dws_profile,
-        environment=scope.environment,
-        sql_source_profile=scope.sql_source_profile,
-        schedule_source_profile=scope.schedule_source_profile,
-        target_table=target_table.strip(),
-    )
+    kwargs: dict[str, object] = {
+        "dws_profile": scope.dws_profile,
+        "environment": scope.environment,
+        "sql_source_profile": scope.sql_source_profile,
+        "schedule_source_profile": scope.schedule_source_profile,
+        "target_table": target,
+    }
+    if timing is not None and runner is None:
+        kwargs["timing"] = timing
+    return reconcile(**kwargs)  # type: ignore[arg-type]
 
 
 def reconcile_targets(
     scope: LineageEnvironmentScope,
-    target_tables: Iterable[str],
+    target_tables: Iterable[str] | str,
     *,
     runner: ReconciliationRunner | None = None,
     suppression_store: Any | None = None,
+    timing: ReconciliationTiming | None = None,
 ) -> tuple[TargetReconciliationOutcome, ...]:
-    """Run each target independently so one failure cannot abort the batch."""
+    """Run one batched DWS query and split its result back by target."""
 
-    outcomes: list[TargetReconciliationOutcome] = []
-    for raw_target in target_tables:
+    if not isinstance(scope, LineageEnvironmentScope):
+        raise TypeError("scope must be a LineageEnvironmentScope")
+    batch_timing = timing or ReconciliationTiming()
+    started = perf_counter()
+    entries: list[tuple[str, str | None, ReconciliationErrorView | None]] = []
+    normalized_targets: list[str] = []
+    seen_targets: set[str] = set()
+    raw_targets = (target_tables,) if isinstance(target_tables, str) else target_tables
+    for raw_target in raw_targets:
         target = raw_target.strip() if isinstance(raw_target, str) else str(raw_target)
         if not target:
             continue
         try:
-            result = reconcile_target(scope, target, runner=runner)
+            normalized = normalize_lineage_comparison_table_key(target)
+        except Exception as error:  # noqa: BLE001 - report invalid input per row
+            entries.append((target, None, map_reconciliation_error(error)))
+            continue
+        if normalized in seen_targets:
+            continue
+        seen_targets.add(normalized)
+        normalized_targets.append(normalized)
+        entries.append((normalized, normalized, None))
+
+    outcomes_by_target: dict[str, TargetReconciliationOutcome] = {}
+    if normalized_targets:
+        try:
+            if len(normalized_targets) == 1:
+                result = reconcile_target(
+                    scope,
+                    normalized_targets[0],
+                    runner=runner,
+                    timing=batch_timing if runner is None else None,
+                )
+            else:
+                reconcile = runner or run_reconciliation
+                kwargs: dict[str, object] = {
+                    "dws_profile": scope.dws_profile,
+                    "environment": scope.environment,
+                    "sql_source_profile": scope.sql_source_profile,
+                    "schedule_source_profile": scope.schedule_source_profile,
+                    "target_tables": tuple(normalized_targets),
+                }
+                if runner is None:
+                    kwargs["timing"] = batch_timing
+                result = reconcile(**kwargs)  # type: ignore[arg-type]
+            batch_timing.reconciliation_rows = len(result.rows)
+
+            suppression_started = perf_counter()
             suppressed_edge_keys = (
-                load_usable_suppressed_edge_keys(result, suppression_store)
+                load_usable_suppressed_edge_keys(
+                    result,
+                    suppression_store,
+                    target_tables=tuple(normalized_targets),
+                )
                 if suppression_store is not None
                 else frozenset()
             )
-            view_model = build_reconciliation_view_model(
-                result,
-                target_table=target,
-                suppressed_edge_keys=suppressed_edge_keys,
+            batch_timing.suppression_lookup_ms = int(
+                (perf_counter() - suppression_started) * 1000
             )
-        except Exception as error:  # noqa: BLE001 - isolate one user target
-            outcomes.append(
-                TargetReconciliationOutcome(
+            for target in normalized_targets:
+                view_model = build_reconciliation_view_model(
+                    result,
                     target_table=target,
-                    error=map_reconciliation_error(error),
+                    suppressed_edge_keys=suppressed_edge_keys,
                 )
-            )
-        else:
-            outcomes.append(
-                TargetReconciliationOutcome(
+                outcomes_by_target[target] = TargetReconciliationOutcome(
                     target_table=target,
                     view_model=view_model,
                 )
+        except Exception as error:  # noqa: BLE001 - one batch failure is shared
+            failure = map_reconciliation_error(error)
+            for target in normalized_targets:
+                outcomes_by_target[target] = TargetReconciliationOutcome(
+                    target_table=target,
+                    error=failure,
+                )
+
+    batch_timing.total_ms = int((perf_counter() - started) * 1000)
+    outcomes: list[TargetReconciliationOutcome] = []
+    for display_target, normalized_target, error in entries:
+        if normalized_target is None:
+            outcomes.append(
+                TargetReconciliationOutcome(
+                    target_table=display_target,
+                    error=error
+                    or ReconciliationErrorView(
+                        error_code="INVALID_TARGET", message="目标表无效。"
+                    ),
+                )
             )
+        else:
+            outcomes.append(outcomes_by_target[normalized_target])
     return tuple(outcomes)
 
 
@@ -673,11 +743,24 @@ def main(
             suppression_store = None
 
     put_markdown("## SQL / 调度血缘对账结果")
+    timing = ReconciliationTiming()
     outcomes = reconcile_targets(
         scope,
         targets,
         runner=runner,
         suppression_store=suppression_store,
+        timing=timing,
+    )
+    put_markdown(
+        "查询 timing："
+        f"SQL target-scoped DWS read `{timing.sql_target_scoped_read_ms} ms / "
+        f"{timing.sql_rows_read} rows`；"
+        f"Schedule target-scoped DWS read `{timing.schedule_target_scoped_read_ms} "
+        f"ms / {timing.schedule_rows_read} rows`；"
+        f"reconciliation CPU `{timing.reconciliation_cpu_ms} ms / "
+        f"{timing.reconciliation_rows} rows`；"
+        f"suppression lookup `{timing.suppression_lookup_ms} ms`；"
+        f"TOTAL `{timing.total_ms} ms`。"
     )
     for outcome in outcomes:
         _render_outcome(outcome)
@@ -685,7 +768,10 @@ def main(
     export_rows = build_export_rows(outcomes)
     if export_rows:
         put_file(
-            build_export_filename(scope.environment, targets),
+            build_export_filename(
+                scope.environment,
+                tuple(outcome.target_table for outcome in outcomes),
+            ),
             build_excel_bytes(export_rows),
             "导出 Excel",
         )

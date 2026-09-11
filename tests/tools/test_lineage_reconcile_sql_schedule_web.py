@@ -117,6 +117,53 @@ def make_empty_result(target: str = "DWM.RESULT"):
     return make_result(target, sql_sources=(), schedule_sources=())
 
 
+def make_batch_result(targets: tuple[str, ...]):
+    sql_edges = tuple(
+        LineageEdge(
+            environment=ENVIRONMENT,
+            source_profile=SQL_PROFILE,
+            source_table=source,
+            target_table=target,
+            program_name=f"DEMO_SQL_{source.rsplit('.', 1)[-1]}",
+            batch_id="batch-sql",
+            observed_at=OBSERVED_AT,
+        )
+        for target in targets
+        for source in ("DWF.A", "DWF.B")
+    )
+    schedule_edges = tuple(
+        ScheduleLineageEdge(
+            environment=ENVIRONMENT,
+            source_profile=SCHEDULE_PROFILE,
+            process_name=f"DEMO_SCHEDULE_{source.rsplit('.', 1)[-1]}",
+            project_version_key="DEMO_PROJECT:1.0",
+            raw_source_table=source,
+            raw_target_table=target,
+            source_table=source,
+            target_table=target,
+        )
+        for target in targets
+        for source in ("DWF.A", "DWF.C")
+    )
+    return reconcile_lineage_snapshots(
+        SQLBusinessLineageSnapshot(
+            batch_id="batch-sql",
+            edges=sql_edges,
+            observed_at=OBSERVED_AT,
+            snapshot_scope=((ENVIRONMENT, SQL_PROFILE),),
+        ),
+        ScheduleLineageSnapshot(
+            batch_id="batch-schedule",
+            edges=schedule_edges,
+            observed_at=OBSERVED_AT,
+        ),
+        environment=ENVIRONMENT,
+        sql_source_profile=SQL_PROFILE,
+        schedule_source_profile=SCHEDULE_PROFILE,
+        target_tables=targets,
+    )
+
+
 def make_suppression_row(
     result: LineageReconciliationResult,
     *,
@@ -139,7 +186,7 @@ def make_suppression_row(
         source_table=source_table,
         target_table=target_table or result.target_summaries[0].target_table,
         raw_status=ReconciliationStatus.SQL_ONLY,
-        suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PRODUCER,
+        suppression_reason=ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
         sql_batch_id=sql_batch_id or result.sql_batch_id,
         schedule_batch_id=schedule_batch_id or result.schedule_batch_id,
         classifier_version=classifier_version,
@@ -296,6 +343,9 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
                     "sql_batch_id": "batch-sql",
                     "schedule_batch_id": "batch-schedule",
                     "active_only": True,
+                    "target_tables": ("DWM.RESULT",),
+                    "suppression_reason": ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM,
+                    "classifier_version": SUPPRESSION_CLASSIFIER_VERSION,
                 }
             ],
         )
@@ -404,9 +454,11 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
 
     def test_unsupported_classifier_version_does_not_hide_sql_only(self):
         result = make_result()
-        suppression = make_suppression_row(
-            result,
-            classifier_version="reconciliation-suppression-v0",
+        suppression = make_suppression_row(result)
+        object.__setattr__(
+            suppression,
+            "classifier_version",
+            "reconciliation-suppression-v0",
         )
 
         outcome, _ = run_with_suppression(result, (suppression,))
@@ -486,15 +538,12 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
 
     def test_multi_target_suppression_is_independent_by_target(self):
         first = make_result("DWM.RESULT_A")
-        second = make_result("DWM.RESULT_B")
         reader = _SuppressionReader((make_suppression_row(first),))
 
         outcomes = reconcile_targets(
             make_scope(),
             ("DWM.RESULT_A", "DWM.RESULT_B"),
-            runner=lambda **kwargs: (
-                first if kwargs["target_table"] == "DWM.RESULT_A" else second
-            ),
+            runner=lambda **kwargs: make_batch_result(kwargs["target_tables"]),
             suppression_store=reader,
         )
 
@@ -506,6 +555,11 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         self.assertIn(
             "DWF.B",
             [row.source_table for row in require_view_model(outcomes[1]).rows],
+        )
+        self.assertEqual(len(reader.calls), 1)
+        self.assertEqual(
+            reader.calls[0]["target_tables"],
+            ("DWM.RESULT_A", "DWM.RESULT_B"),
         )
 
     def test_ui_suppression_reader_is_read_only(self):
@@ -726,32 +780,29 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             },
         )
 
-    def test_multiple_targets_isolate_one_failure(self):
-        calls: list[str] = []
+    def test_multiple_targets_use_one_batch_runner_and_preserve_order(self):
+        calls: list[dict[str, object]] = []
 
         def runner(**kwargs):
-            target = kwargs["target_table"]
-            calls.append(target)
-            if target == "DWM.FAIL":
-                raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-            return make_result(target)
+            calls.append(kwargs)
+            return make_batch_result(kwargs["target_tables"])
 
         outcomes = reconcile_targets(
             make_scope(),
-            ("DWM.RESULT_A", "DWM.FAIL", "DWA.RESULT_B"),
+            (" DWM.RESULT_A ", "DWM.RESULT_A", "DWA.RESULT_B"),
             runner=runner,
         )
 
-        self.assertEqual(calls, ["DWM.RESULT_A", "DWM.FAIL", "DWA.RESULT_B"])
-        self.assertEqual(len(outcomes), 3)
-        self.assertTrue(outcomes[0].succeeded)
-        self.assertFalse(outcomes[1].succeeded)
-        self.assertIsNotNone(outcomes[1].error)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(
-            outcomes[1].error.error_code,  # type: ignore[union-attr]
-            SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
+            calls[0]["target_tables"],
+            ("DWM.RESULT_A", "DWA.RESULT_B"),
         )
-        self.assertTrue(outcomes[2].succeeded)
+        self.assertEqual(
+            [outcome.target_table for outcome in outcomes],
+            ["DWM.RESULT_A", "DWA.RESULT_B"],
+        )
+        self.assertTrue(all(outcome.succeeded for outcome in outcomes))
 
     def test_fail_closed_error_mapping_preserves_both_snapshot_codes(self):
         sql_error = map_reconciliation_error(

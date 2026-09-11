@@ -23,6 +23,7 @@ from shared.lineage.domain import (
     normalize_lineage_schema,
     normalize_declared_target_from_program_name,
     normalize_legacy_program_namespace,
+    normalize_program_inventory_target,
     parse_declared_primary_target,
     parse_program_name,
 )
@@ -96,6 +97,19 @@ class LineageDomainTests(unittest.TestCase):
         )
         self.assertEqual(first.opaque_suffix, "00")
         self.assertEqual(second.opaque_suffix, "XYZ")
+
+    def test_program_inventory_target_reuses_legacy_namespace_mapping(self):
+        self.assertEqual(
+            normalize_program_inventory_target("005:DWS_DWF.RESULT_A:00"),
+            "DWF.RESULT_A",
+        )
+        self.assertEqual(
+            normalize_program_inventory_target("005:DWM.RESULT_A:1:00"),
+            "DWM.RESULT_A",
+        )
+        self.assertIsNone(normalize_program_inventory_target("DEMO_PROGRAM"))
+        with self.assertRaises(ValueError):
+            normalize_program_inventory_target("005:DWM.RESULT_A:1:00:EXTRA")
 
     def test_program_name_target_first_parser_keeps_direct_dataset_name(self):
         parsed = parse_program_name("005:DWM.RESULT_A:1:00")

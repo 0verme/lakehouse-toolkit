@@ -18,6 +18,7 @@ from shared.lineage.materialization_dws import DWSMaterializationStore
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
     LineageReconciliationResult,
+    ReconciliationTiming,
     _resolve_source_profiles,
     normalize_lineage_comparison_table_key,
     reconcile_active_dws_lineage,
@@ -99,9 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target",
+        action="append",
         default=None,
         metavar="SCHEMA.TABLE",
-        help="only report one comparison-normalized target table",
+        help="comparison-normalized target table; repeat for one batched request",
     )
     parser.add_argument(
         "--format",
@@ -128,8 +130,10 @@ def run(
     schedule_source_profile: str | None = None,
     source_profile: str | None = None,
     target_table: str | None = None,
+    target_tables: Iterable[object] | str | None = None,
     sql_store: Any | None = None,
     schedule_store: Any | None = None,
+    timing: ReconciliationTiming | None = None,
 ) -> LineageReconciliationResult:
     """Read two DWS active snapshots and return their reconciliation report."""
 
@@ -152,6 +156,8 @@ def run(
         schedule_source_profile=schedule_source_profile,
         source_profile=source_profile,
         target_table=target_table,
+        target_tables=target_tables,
+        timing=timing,
     )
 
 
@@ -333,18 +339,24 @@ def cli(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     try:
         output = _safe_output_path(args.output)
+        target_values = tuple(args.target or ())
+        target_table = target_values[0] if len(target_values) == 1 else None
+        target_tables = target_values if len(target_values) > 1 else None
+        timing = ReconciliationTiming()
         result = run(
             dws_profile=args.dws_profile,
             environment=args.environment,
             sql_source_profile=args.sql_source_profile,
             schedule_source_profile=args.schedule_source_profile,
             source_profile=args.source_profile,
-            target_table=args.target,
+            target_table=target_table,
+            target_tables=target_tables,
+            timing=timing,
         )
         content = _render(
             result,
             output_format=args.output_format,
-            target_table=args.target,
+            target_table=target_table,
             elapsed_ms=int((time.perf_counter() - started) * 1000),
         )
         _write_or_print(content, output)

@@ -17,6 +17,7 @@ from datetime import datetime
 from time import perf_counter
 from typing import Any
 
+from shared.lineage.domain import normalize_lineage_comparison_table_key
 from shared.lineage.dws_timestamp import (
     TIMESTAMPTZ_PARAM_SQL,
     dws_timestamp_param,
@@ -62,6 +63,13 @@ SELECT_SCHEDULE_EDGE_SQL = f"""
            {dws_timestamp_projection("updated_at")}
     FROM dwp.lineage_schedule_edge
 """
+ACTIVE_SCHEDULE_METADATA_SQL = f"""
+    SELECT DISTINCT batch_id, environment, source_profile,
+           {dws_timestamp_projection("observed_at")}
+    FROM dwp.lineage_schedule_edge
+    WHERE is_active = TRUE
+    ORDER BY batch_id, environment, source_profile, observed_at
+"""
 DEACTIVATE_SCHEDULE_EDGE_SQL = (
     "UPDATE dwp.lineage_schedule_edge SET is_active = FALSE WHERE is_active = TRUE"
 )
@@ -92,6 +100,22 @@ def _key_text(value: object, field_name: str) -> str:
     if "\x1f" in text:
         raise ValueError(f"{field_name} contains the stable-key separator")
     return text
+
+
+def _normalize_target_tables(
+    target_tables: Iterable[object],
+) -> tuple[str, ...]:
+    values = (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    if not values:
+        raise ValueError("target_tables must contain at least one table")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        target = normalize_lineage_comparison_table_key(value)
+        if target not in seen:
+            seen.add(target)
+            normalized.append(target)
+    return tuple(normalized)
 
 
 _timestamp_param = dws_timestamp_param
@@ -167,6 +191,27 @@ class DWSSchedulePublishMetrics:
     commit_ms: int = 0
     prepared_edge_rows: int = 0
     validated_edge_rows: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DWSScheduleActiveSnapshotMetadata:
+    """Compact active schedule provenance without transferring edge payloads."""
+
+    batch_id: str
+    snapshot_scope: tuple[tuple[str, str], ...]
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        _key_text(self.batch_id, "batch_id")
+        if not self.snapshot_scope:
+            raise ValueError("snapshot_scope must not be empty")
+        if not isinstance(self.observed_at, datetime):
+            raise TypeError("observed_at must be a datetime")
+        object.__setattr__(
+            self,
+            "snapshot_scope",
+            tuple(sorted(self.snapshot_scope)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +429,7 @@ class DWSScheduleLineageStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        target_tables: Iterable[object] | None = None,
     ) -> tuple[DWSScheduleLineageRow, ...]:
         conditions: list[str] = []
         params: list[object] = []
@@ -393,6 +439,11 @@ class DWSScheduleLineageStore:
             params.append(batch_id)
         if active_only:
             conditions.append("is_active = TRUE")
+        if target_tables is not None:
+            targets = _normalize_target_tables(target_tables)
+            placeholders = ", ".join("?" for _ in targets)
+            conditions.append(f"target_table IN ({placeholders})")
+            params.extend(targets)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         with self._cursor_scope(connection) as cursor:
             self._execute(
@@ -678,17 +729,60 @@ class DWSScheduleLineageStore:
             )
             self._validate_candidate(connection, candidate)
 
+    def get_active_snapshot_metadata(
+        self,
+    ) -> DWSScheduleActiveSnapshotMetadata | None:
+        """Read compact active provenance without loading schedule edge rows."""
+
+        with self._connection_scope() as connection:
+            with self._cursor_scope(connection) as cursor:
+                self._execute(cursor, ACTIVE_SCHEDULE_METADATA_SQL)
+                raw_rows = cursor.fetchall()
+        if not raw_rows:
+            return None
+
+        batch_ids: set[str] = set()
+        scopes: set[tuple[str, str]] = set()
+        observed_values: set[datetime] = set()
+        for raw in raw_rows:
+            values = tuple(raw)
+            if len(values) != 4:
+                raise ValueError("active schedule metadata row has invalid shape")
+            batch_ids.add(_key_text(values[0], "batch_id"))
+            scopes.add(
+                (
+                    _required_text(values[1], "environment"),
+                    _required_text(values[2], "source_profile"),
+                )
+            )
+            observed_values.add(_parse_timestamp(values[3], "observed_at"))
+        if len(batch_ids) != 1:
+            raise ValueError("schedule active rows contain more than one batch")
+        if len(observed_values) != 1:
+            raise ValueError("schedule active rows contain more than one observation")
+        return DWSScheduleActiveSnapshotMetadata(
+            batch_id=next(iter(batch_ids)),
+            snapshot_scope=tuple(sorted(scopes)),
+            observed_at=next(iter(observed_values)),
+        )
+
+    def get_active_snapshot_scope(self) -> tuple[tuple[str, str], ...]:
+        metadata = self.get_active_snapshot_metadata()
+        return () if metadata is None else metadata.snapshot_scope
+
     def read_rows(
         self,
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        target_tables: Iterable[object] | None = None,
     ) -> tuple[DWSScheduleLineageRow, ...]:
         with self._connection_scope() as connection:
             return self._fetch_rows(
                 connection,
                 batch_id=batch_id,
                 active_only=active_only,
+                target_tables=target_tables,
             )
 
     def read_edges(
@@ -696,21 +790,28 @@ class DWSScheduleLineageStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        target_tables: Iterable[object] | None = None,
     ) -> tuple[ScheduleLineageEdge, ...]:
         return tuple(
             row.edge
-            for row in self.read_rows(batch_id=batch_id, active_only=active_only)
+            for row in self.read_rows(
+                batch_id=batch_id,
+                active_only=active_only,
+                target_tables=target_tables,
+            )
         )
 
     def get_active_batch_id(self) -> str | None:
-        rows = self.read_rows(active_only=True)
-        return _active_batch_id(rows)
+        metadata = self.get_active_snapshot_metadata()
+        return None if metadata is None else metadata.batch_id
 
 
 DWSScheduleLineageWriter = DWSScheduleLineageStore
 
 
 __all__ = [
+    "ACTIVE_SCHEDULE_METADATA_SQL",
+    "DWSScheduleActiveSnapshotMetadata",
     "DWSScheduleLineageRow",
     "DWSScheduleLineageStore",
     "DWSScheduleLineageWriter",
