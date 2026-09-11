@@ -96,3 +96,17 @@ svn_profiles:
     environment: PROD
     root_path: "E:/demo/svn/production"
     layout: dwf
+
+# Environment-level lineage read scopes.
+# Web reconciliation only exposes environment to users;
+# backend profiles are resolved here.
+# dws_profile refers to a profile in configs/database.example.yaml (or the
+# deployment's configs/database.local.yaml), not to a lineage provider profile.
+scopes:
+  - name: demo_dev
+    environment: DEMO_DEV
+    sql_source_profile: mysql_dev_a
+    schedule_source_profile: mysql_dev_a
+    dws_profile: demo
+    label: 示例开发环境（DEMO_DEV）
+    enabled: true

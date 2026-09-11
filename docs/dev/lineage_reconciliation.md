@@ -211,10 +211,16 @@ tools/lineage/reconcile_sql_schedule_web.py
 ```
 
 页面只让用户选择 environment，并以 textarea 接收每行一个目标表；SQL / Schedule
-source profile 与 DWS profile 由 `LineageEnvironmentScopeResolver` 从
-`configs/lineage_scopes.local.yaml`（缺失时使用公开的
-`configs/lineage_scopes.example.yaml`）解析。公开 example 只包含 `DEMO_*` 占位值，
-真实配置不得提交仓库。
+source profile 与 DWS profile 由 `LineageEnvironmentScopeResolver` 从同一个
+lineage deployment config `configs/lineage_providers.local.yaml`（local 缺失时使用
+`configs/lineage_providers.example.yaml`）的 `scopes` 根节点解析。公开 example 中的
+scope 只引用同文件内已定义的 demo provider profile；真实配置不得提交仓库。
+
+`scopes` 只属于 reconciliation Web / scope resolver 的配置要求。旧的 lineage
+provider ingestion、provider verification、SVN verification 与 materialization 仍可
+读取没有 `scopes` 的既有 `lineage_providers.local.yaml`；scope resolver 在缺少或
+结构非法时返回 `LINEAGE_SCOPE_CONFIG_INVALID` / `LINEAGE_SCOPE_CONFIG_NOT_FOUND`。
+部署人员无需创建 `configs/lineage_scopes.local.yaml`。
 
 每个目标表独立调用 `tools.lineage.reconcile_sql_schedule.run()`，该函数继续进入
 `reconcile_active_dws_lineage()`。页面不读取源 metadata、不解析 SQL、不读取旧调度

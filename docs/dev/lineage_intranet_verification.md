@@ -75,7 +75,15 @@ configs/lineage_providers.local.yaml
 `connection` 中的直接值只能保存在被忽略的本地配置，不得提交真实密码、Token、
 私钥或连接串；缺少必填连接字段时命令会显式失败，不会使用弱默认值。
 
-缺少显式 `--config`、文件不存在或 profile 配置不合法时，命令会显式失败，不会 fallback 到真实默认地址或公开 demo 数据库。
+现有内网 `configs/lineage_providers.local.yaml` 无需迁移原有 provider 配置。若启用
+reconciliation Web，只需在同一文件增加 `scopes`，其中
+`sql_source_profile` / `schedule_source_profile` 引用该文件已有的 provider，
+`dws_profile` 引用 `configs/database.local.yaml` 的 database profile；不要创建
+`configs/lineage_scopes.local.yaml`。不使用 reconciliation Web 时，旧配置缺少
+`scopes` 不影响 provider ingestion、verification 或 materialization。
+
+缺少显式 `--config`、文件不存在或 profile 配置不合法时，命令会显式失败，不会使用
+真实默认地址或公开 demo 数据库。
 
 ## Verification Command
 

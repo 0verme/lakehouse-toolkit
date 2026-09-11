@@ -4,7 +4,7 @@ The web UI deliberately exposes only ``environment``.  SQL and schedule
 source profiles, as well as the DWS connection profile, remain deployment
 configuration and are resolved here rather than in the presentation layer.
 Public example configuration contains placeholders only; real deployments
-may provide ``configs/lineage_scopes.local.yaml``.
+may provide ``configs/lineage_providers.local.yaml``.
 """
 
 from __future__ import annotations
@@ -14,9 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-CONFIG_PATH = ROOT_DIR / "configs" / "lineage_scopes.local.yaml"
-EXAMPLE_CONFIG_PATH = ROOT_DIR / "configs" / "lineage_scopes.example.yaml"
+from .providers import (
+    CONFIG_PATH as LINEAGE_PROVIDER_CONFIG_PATH,
+    EXAMPLE_CONFIG_PATH as LINEAGE_PROVIDER_EXAMPLE_CONFIG_PATH,
+)
+
+CONFIG_PATH = LINEAGE_PROVIDER_CONFIG_PATH
+EXAMPLE_CONFIG_PATH = LINEAGE_PROVIDER_EXAMPLE_CONFIG_PATH
 
 UNKNOWN_LINEAGE_ENVIRONMENT = "UNKNOWN_LINEAGE_ENVIRONMENT"
 DISABLED_LINEAGE_ENVIRONMENT = "DISABLED_LINEAGE_ENVIRONMENT"
@@ -141,7 +145,7 @@ class LineageEnvironmentScopeResolver:
 def load_lineage_environment_scopes(
     config_path: str | Path | None = None,
 ) -> tuple[LineageEnvironmentScope, ...]:
-    """Load local override configuration, falling back to public example data."""
+    """Load scopes from the provider config, falling back to its public example."""
 
     try:
         import yaml  # pyright: ignore[reportMissingModuleSource]
