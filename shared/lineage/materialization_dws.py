@@ -2586,6 +2586,39 @@ class DWSMaterializationStore:
             row = self._fetch_active_batch_row(connection)
         return None if row is None else row.batch_id
 
+    def get_active_snapshot_scope(self) -> tuple[tuple[str, str], ...]:
+        """Return the declared scope of the current active SQL snapshot.
+
+        ``lineage_batch.snapshot_scope`` is the only persisted indication that
+        a successful empty/full scope was actually observed.  Reconciliation
+        uses this metadata to avoid treating a different profile's active batch
+        as an empty snapshot for the requested scope.
+        """
+
+        with self._connection_scope() as connection:
+            row = self._fetch_active_batch_row(connection)
+        if row is None or row.snapshot_scope is None:
+            return ()
+        try:
+            decoded = json.loads(row.snapshot_scope)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("active DWS snapshot scope is not valid JSON") from exc
+        if not isinstance(decoded, list):
+            raise ValueError("active DWS snapshot scope must be a JSON list")
+        scopes: set[tuple[str, str]] = set()
+        for item in decoded:
+            if not isinstance(item, Mapping):
+                raise ValueError("active DWS snapshot scope item is invalid")
+            scopes.add(
+                (
+                    _required_text(item.get("environment"), "snapshot environment"),
+                    _required_text(
+                        item.get("source_profile"), "snapshot source_profile"
+                    ),
+                )
+            )
+        return tuple(sorted(scopes))
+
     def list_batch_metadata(self) -> tuple[BatchMetadata, ...]:
         with self._connection_scope() as connection:
             with self._cursor_scope(connection) as cursor:
