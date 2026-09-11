@@ -52,7 +52,7 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v9-business-asset-boundary`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v10-sql-relation-context`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
 bump 到新的语义版本，并在本文记录原因。v7 在 v6 audit target semantics 的基础上
 固定 `005` canonical 四段 target authority 前的显式 legacy namespace registry：
@@ -79,6 +79,13 @@ v9 在上述语义之上冻结 Business Asset Boundary：DLO/DWO 仅保留在 Ph
 Business `MULTI_SINK_CANDIDATE`，并将 clean boundary-only 程序从
 `NO_LINEAGE_EDGE` coverage failure 中排除。相同 source hash 的旧 v8 facts 必须
 rebuild，避免复用 boundary 规则变更前的 Business projection。
+
+v10 修正 legacy relation extraction 的上下文边界：只有 relation position 中的
+`FROM/JOIN/USING` 才能提供 table-level Physical source；函数调用表达式中的
+`FROM/JOIN/USING` 不再把 `alias.column` 当成 `schema.table`。括号内带有顶层
+`SELECT/WITH` 的 derived query 仍保留真实 relation，未知但语法有效的 schema 也
+不因未登记而过滤。相同 source hash 的旧 v9 facts 必须 coherent rebuild，避免
+复用错误的 Physical Edge、Business projection 和 edge evidence。
 
 ## Incremental planner
 

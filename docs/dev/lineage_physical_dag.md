@@ -106,8 +106,12 @@ normalization 只清理格式，不改写 SQL 中观察到的物理 schema；例
 名称保留。
 
 SQL comment 使用共享的 `strip_sql_comments`。该 helper 会忽略引号中的
-`--`、`/*` 文本；SQL literal 还会在 `FROM/JOIN/USING` 扫描前被遮盖。CTE 名称
-只在当前 statement 内作为 SQL relation alias 过滤，不会创建 Physical 节点：
+`--`、`/*` 文本；SQL literal 还会在 `FROM/JOIN/USING` 扫描前被遮盖。source
+扫描还会检查括号上下文：函数调用表达式中的 `FROM/JOIN/USING` 不属于 relation
+position，括号内带有顶层 `SELECT/WITH` 的 derived query 则仍保留真实 relation。
+这个判断不检查 schema registry，因此未知但语法有效的 relation 不会因为未登记而
+被删除。CTE 名称只在当前 statement 内作为 SQL relation alias 过滤，不会创建
+Physical 节点：
 
 ```sql
 WITH base AS (SELECT * FROM ODS.A), joined AS (

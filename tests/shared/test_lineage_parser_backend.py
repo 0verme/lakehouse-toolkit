@@ -79,7 +79,7 @@ class ParserBackendContractTests(unittest.TestCase):
 
         result = analyze_sql(SCRIPT)
         self.assertEqual(result.backend, "legacy")
-        self.assertEqual(result.backend_version, "legacy-parser-v1")
+        self.assertEqual(result.backend_version, "legacy-parser-v2-relation-context")
         self.assertEqual(result.parse_status, SqlParseStatus.SUCCESS)
         self.assertEqual(result.confidence, SqlParseConfidence.HIGH)
         self.assertEqual(result.candidate_count, 1)
