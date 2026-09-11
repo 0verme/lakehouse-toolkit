@@ -101,6 +101,48 @@ DISTRIBUTE BY HASH(schedule_edge_key);
 
 
 -- ============================================================================
+-- Issue #111 extension: reconciliation suppression audit
+-- ============================================================================
+--
+-- This is a presentation-classification audit projection.  It never replaces
+-- the raw MATCH / SQL_ONLY / SCHEDULE_ONLY reconciliation fact and is written
+-- by the explicit suppression materialization boundary, not by a UI renderer.
+-- Stable suppression_key excludes both batch ids; row_key identifies one
+-- materialized observation.  Lifecycle correctness is enforced by the writer.
+
+CREATE TABLE dwp.lineage_reconciliation_suppression (
+    row_key                  VARCHAR(128) NOT NULL,
+    suppression_key          VARCHAR(128) NOT NULL,
+
+    environment              VARCHAR(128) NOT NULL,
+    sql_source_profile       VARCHAR(256) NOT NULL,
+    schedule_source_profile  VARCHAR(256) NOT NULL,
+
+    source_table             VARCHAR(512) NOT NULL,
+    target_table             VARCHAR(512) NOT NULL,
+
+    raw_status               VARCHAR(32) NOT NULL,
+    suppression_reason       VARCHAR(64) NOT NULL,
+
+    sql_batch_id             VARCHAR(128) NOT NULL,
+    schedule_batch_id        VARCHAR(128) NOT NULL,
+    classifier_version       VARCHAR(128) NOT NULL,
+
+    observed_at              TIMESTAMP(6) WITH TIME ZONE,
+
+    first_seen_at            TIMESTAMP(6) WITH TIME ZONE,
+    last_seen_at             TIMESTAMP(6) WITH TIME ZONE,
+
+    is_active                BOOLEAN DEFAULT FALSE,
+
+    created_at               TIMESTAMP(6) WITH TIME ZONE,
+    updated_at               TIMESTAMP(6) WITH TIME ZONE
+)
+WITH (ORIENTATION = ROW)
+DISTRIBUTE BY HASH(suppression_key);
+
+
+-- ============================================================================
 -- 1. Program state
 -- ============================================================================
 

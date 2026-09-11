@@ -12,6 +12,7 @@ MATRIX_PATH = ROOT / "docs" / "research" / "issue-39-dws-lifecycle-matrix.json"
 TABLE_NAMES = (
     "lineage_batch",
     "lineage_schedule_edge",
+    "lineage_reconciliation_suppression",
     "lineage_program_state",
     "lineage_edge",
     "lineage_business_edge",
@@ -20,6 +21,7 @@ TABLE_NAMES = (
 ORIENTATIONS = {
     "lineage_batch": "ROW",
     "lineage_schedule_edge": "COLUMN",
+    "lineage_reconciliation_suppression": "ROW",
     "lineage_program_state": "ROW",
     "lineage_edge": "COLUMN",
     "lineage_business_edge": "COLUMN",
@@ -41,7 +43,9 @@ class DwsSchemaContractTests(unittest.TestCase):
         cls.doc = DOC_PATH.read_text(encoding="utf-8")
         cls.matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
 
-    def test_ddl_declares_five_writer_tables_and_schedule_extension(self):
+    def test_ddl_declares_lineage_writer_tables_and_reconciliation_suppression_extension(
+        self,
+    ):
         tables = tuple(
             re.findall(r"^CREATE TABLE ([^\s(]+) \(", self.ddl, re.MULTILINE)
         )
@@ -76,12 +80,46 @@ class DwsSchemaContractTests(unittest.TestCase):
             "lineage_edge": ("row_key", "edge_key"),
             "lineage_business_edge": ("row_key", "business_edge_key"),
             "lineage_issue": ("row_key", "stable_issue_key"),
+            "lineage_reconciliation_suppression": (
+                "row_key",
+                "suppression_key",
+            ),
         }
         for table_name, keys in required_keys.items():
             block = table_block(self.ddl, table_name)
             for key in keys:
                 with self.subTest(table=table_name, key=key):
                     self.assertRegex(block, rf"\b{re.escape(key)}\b")
+
+    def test_suppression_audit_preserves_scope_provenance_and_lifecycle_contract(self):
+        suppression = table_block(self.ddl, "lineage_reconciliation_suppression")
+        for field in (
+            "row_key",
+            "suppression_key",
+            "environment",
+            "sql_source_profile",
+            "schedule_source_profile",
+            "source_table",
+            "target_table",
+            "raw_status",
+            "suppression_reason",
+            "sql_batch_id",
+            "schedule_batch_id",
+            "classifier_version",
+            "observed_at",
+            "first_seen_at",
+            "last_seen_at",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ):
+            with self.subTest(field=field):
+                self.assertRegex(suppression, rf"\b{field}\b")
+        self.assertIn(
+            "DISTRIBUTE BY HASH(suppression_key)",
+            self.ddl,
+        )
+        self.assertNotRegex(suppression, r"(?i)\b(?:PRIMARY|UNIQUE|CHECK)\b")
 
     def test_schedule_edge_preserves_raw_comparison_and_history_contract(self):
         schedule = table_block(self.ddl, "lineage_schedule_edge")
