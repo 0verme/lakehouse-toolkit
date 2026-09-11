@@ -1167,6 +1167,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="database profile used by the DWS backend",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="lineage provider YAML; defaults to local/example loader rules",
+    )
+    parser.add_argument(
         "--db-path",
         type=Path,
         default=MATERIALIZATION_DB_PATH,
@@ -1223,6 +1229,7 @@ def build_parser() -> argparse.ArgumentParser:
 def cli(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     return main(
+        config_path=args.config,
         db_path=args.db_path,
         store_backend=args.store,
         dws_profile=args.dws_profile,
@@ -1236,9 +1243,10 @@ def cli(argv: Sequence[str] | None = None) -> int:
     )
 
 
-def main(
+def run(
     providers: Iterable[ProgramSourceProvider] | None = None,
     *,
+    config_path: str | Path | None = None,
     db_path: str | Path = MATERIALIZATION_DB_PATH,
     batch_id: str | None = None,
     observed_at: datetime | None = None,
@@ -1258,8 +1266,8 @@ def main(
     limit: int | None = None,
     slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
     diagnostic: bool = False,
-) -> int:
-    """定时任务边界；异常向外传播并由进程返回 non-zero。"""
+) -> PublishResult | DWSPublishResult:
+    """运行一次 lineage materialization，并返回发布结果供 orchestration 复用。"""
 
     progress_every = _validate_progress_every(progress_every)
     selected_profiles = _normalize_selected_profiles(selected_profiles)
@@ -1273,7 +1281,9 @@ def main(
     coverage = LineageCoverageAccumulator()
     try:
         active_providers = (
-            tuple(providers) if providers is not None else load_default_providers()
+            tuple(providers)
+            if providers is not None
+            else load_default_providers(config_path)
         )
         _emit_log(
             "job",
@@ -1358,6 +1368,55 @@ def main(
         "SUCCESS",
         **job_summary,
         elapsed_ms=_elapsed_ms(job_started_at),
+    )
+    return result
+
+
+def main(
+    providers: Iterable[ProgramSourceProvider] | None = None,
+    *,
+    config_path: str | Path | None = None,
+    db_path: str | Path = MATERIALIZATION_DB_PATH,
+    batch_id: str | None = None,
+    observed_at: datetime | None = None,
+    job_keys: Mapping[str, str] | None = None,
+    store: SQLiteMaterializationStore | DWSMaterializationStore | None = None,
+    store_backend: str = "sqlite",
+    dws_profile: str | None = None,
+    complete_snapshot: bool = True,
+    snapshot_scopes: Iterable[
+        SnapshotScope | ProgramIdentity | ProgramSource | tuple[str, str]
+    ]
+    | None = None,
+    coverage_report_path: str | Path | None = COVERAGE_REPORT_PATH,
+    force_rebuild: bool = False,
+    progress_every: int = DEFAULT_PROGRESS_EVERY,
+    selected_profiles: Iterable[str] | str | None = None,
+    limit: int | None = None,
+    slow_threshold_ms: int = DEFAULT_SLOW_THRESHOLD_MS,
+    diagnostic: bool = False,
+) -> int:
+    """兼容原有 crontab 调用，成功时仍返回 zero。"""
+
+    run(
+        providers,
+        config_path=config_path,
+        db_path=db_path,
+        batch_id=batch_id,
+        observed_at=observed_at,
+        job_keys=job_keys,
+        store=store,
+        store_backend=store_backend,
+        dws_profile=dws_profile,
+        complete_snapshot=complete_snapshot,
+        snapshot_scopes=snapshot_scopes,
+        coverage_report_path=coverage_report_path,
+        force_rebuild=force_rebuild,
+        progress_every=progress_every,
+        selected_profiles=selected_profiles,
+        limit=limit,
+        slow_threshold_ms=slow_threshold_ms,
+        diagnostic=diagnostic,
     )
     return 0
 

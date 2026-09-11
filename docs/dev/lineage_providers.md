@@ -120,8 +120,8 @@ connection_env:
 
 `configs/lineage_providers.local.yaml` 是唯一的 lineage deployment config，同时承载
 `mysql_process_profiles`、`svn_profiles`、`production` 和可选的 `scopes`。公开模板
-`configs/lineage_providers.example.yaml` 保持同样的根结构。`scopes` 仅供
-reconciliation Web / `LineageEnvironmentScopeResolver` 使用，例如：
+`configs/lineage_providers.example.yaml` 保持同样的根结构。`scopes` 供
+reconciliation Web、lineage daily job 和 `LineageEnvironmentScopeResolver` 使用，例如：
 
 ```yaml
 scopes:
@@ -136,9 +136,9 @@ scopes:
 
 `dws_profile` 仍引用 `configs/database.local.yaml`（或公开 database example）中的
 数据库 profile，不把 JDBC 配置放入 lineage provider config。旧 provider 配置没有
-`scopes` 时仍可用于 ingestion、verification 和 materialization；只有 reconciliation
-scope resolver 会对缺失或非法的 `scopes` 返回配置错误。不要创建独立的
-`configs/lineage_scopes.local.yaml`。
+`scopes` 时仍可用于 ingestion、verification 和单任务 materialization；reconciliation
+scope resolver 与 lineage daily job 会对缺失或非法的 `scopes` 返回配置错误。不要创建
+独立的 `configs/lineage_scopes.local.yaml` 或其它 daily 专用配置文件。
 
 `table`、`program_name_column`、`script_code_column` 和可选的
 `expected_target_column` 都会通过 `shared.config.env.safe_identifier` 校验后才
@@ -221,16 +221,16 @@ full replay 结果。`--limit` 始终是 partial replay；不带 `--limit` 的�
 
 ```bash
 # processing sample
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 20 --force-rebuild
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 100 --force-rebuild
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 500 --force-rebuild
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 20 --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 100 --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --limit 500 --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_processing --force-rebuild
 
 # DWF sample
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 20 --force-rebuild
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 100 --force-rebuild
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 500 --force-rebuild
-python -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 20 --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 100 --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --limit 500 --force-rebuild
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --profile prod_svn_dwf --force-rebuild
 ```
 
 最后两条是 profile full 命令，不代表本仓库已经执行过真实内网扫描。验收时应

@@ -158,7 +158,7 @@ repository 的 active reader contract。
 单 target golden check：
 
 ```bash
-python -B -m tools.lineage.reconcile_sql_schedule \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -B -m tools.lineage.reconcile_sql_schedule \
   --dws-profile <DWS_PROFILE> \
   --environment <ENVIRONMENT> \
   --sql-profile <SQL_SOURCE_PROFILE> \
@@ -171,7 +171,7 @@ python -B -m tools.lineage.reconcile_sql_schedule \
 也允许，任一值不同则 fail fast：
 
 ```bash
-python -B -m tools.lineage.reconcile_sql_schedule \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -B -m tools.lineage.reconcile_sql_schedule \
   --dws-profile <DWS_PROFILE> \
   --environment <ENVIRONMENT> \
   --profile <PROFILE> \
@@ -216,11 +216,11 @@ lineage deployment config `configs/lineage_providers.local.yaml`（local 缺失�
 `configs/lineage_providers.example.yaml`）的 `scopes` 根节点解析。公开 example 中的
 scope 只引用同文件内已定义的 demo provider profile；真实配置不得提交仓库。
 
-`scopes` 只属于 reconciliation Web / scope resolver 的配置要求。旧的 lineage
-provider ingestion、provider verification、SVN verification 与 materialization 仍可
-读取没有 `scopes` 的既有 `lineage_providers.local.yaml`；scope resolver 在缺少或
-结构非法时返回 `LINEAGE_SCOPE_CONFIG_INVALID` / `LINEAGE_SCOPE_CONFIG_NOT_FOUND`。
-部署人员无需创建 `configs/lineage_scopes.local.yaml`。
+`scopes` 是 reconciliation Web / scope resolver 与 lineage daily job 的配置要求。旧的
+lineage provider ingestion、provider verification、SVN verification 与单任务
+materialization 仍可读取没有 `scopes` 的既有 `lineage_providers.local.yaml`；scope
+resolver 和 daily job 在缺少或结构非法时返回 `LINEAGE_SCOPE_CONFIG_INVALID` /
+`LINEAGE_SCOPE_CONFIG_NOT_FOUND`。部署人员无需创建 `configs/lineage_scopes.local.yaml`。
 
 每个目标表独立调用 `tools.lineage.reconcile_sql_schedule.run()`，该函数继续进入
 `reconcile_active_dws_lineage()`。页面不读取源 metadata、不解析 SQL、不读取旧调度
@@ -288,16 +288,62 @@ dwp.lineage_reconciliation_suppression
 显式 materialization command：
 
 ```bash
-python -B -m tools.lineage.materialize_reconciliation_suppressions --dry-run
-python -B -m tools.lineage.materialize_reconciliation_suppressions --environment DEV214
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -B -m jobs.crontab.imp_lineage_suppression --dry-run
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -B -m jobs.crontab.imp_lineage_suppression --environment DEV214
 ```
 
 `--dry-run` 只输出每个 scope 的 bounded summary：`environment`、两侧 batch、raw
-`SQL_ONLY` 数、suppressed 数和 actionable `SQL_ONLY` 数，不输出大量真实表名。PyWebIO
+`SQL_ONLY` 数、suppressed 数和 actionable `SQL_ONLY` 数，不输出大量真实表名。该选项只属于
+suppression 单任务；SQL 与 Schedule 当前没有统一的只读 dry-run 语义，因此 daily 入口不提供
+`--dry-run`。PyWebIO
 presentation adapter 使用 audit row 前必须同时校验 scope、`raw_status`、reason、
 `classifier_version` 以及 `sql_batch_id == 当前 SQL batch`、
 `schedule_batch_id == 当前 Schedule batch`。任何无法验证的情况都 fail-open-to-visible。
 UI renderer 不能执行 DWS `INSERT`。
+
+### 统一 lineage 日批
+
+生产正式调度只需要维护以下一个入口：
+
+```text
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_daily
+```
+
+只运行一个已配置 environment：
+
+```text
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_daily --environment DEV214
+```
+
+依赖关系固定为 SQL 与 Schedule 两个 sibling 都成功后才执行 Suppression：
+
+```text
+SQL lineage ─────┐
+                 ├─ Suppression materialization
+Schedule lineage ┘
+```
+
+daily 会按现有 `scopes` 选择 enabled scope，不新增 daily 配置文件。单任务补跑仍使用
+各自正式 CLI：
+
+```text
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_edge --store dws --dws-profile <DATABASE_PROFILE> --profile <SQL_SOURCE_PROFILE>
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_schedule_lineage --dws-profile <DATABASE_PROFILE> --profile <SCHEDULE_SOURCE_PROFILE>
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_suppression --environment DEV214
+```
+
+若 SQL 或 Schedule 任一失败，Suppression 输出 `SKIPPED reason=upstream_failed`，不会读取旧
+snapshot 进行派生刷新；其它 environment 仍继续执行，任一 environment FAILED 时 daily
+最终返回 non-zero。由于三个子任务的 dry-run 语义不同，daily 第一版不提供 `--dry-run`。
+
+### 可执行入口职责
+
+- `tools/lineage`：只保留 PyWebIO / Web 页面及明确的人工或诊断 CLI；
+- `jobs/crontab`：集中放置 SQL lineage、Schedule lineage、Suppression materialization
+  和 daily orchestration 等生产 batch 入口；
+- `shared/lineage`：继续承载 domain、service、parser、store 和 classifier 等可复用逻辑。
+
+当前 reconciliation Web 仍由 `configs/tools.yaml` 注册，生产 batch 不通过 Web 注册表启动。
 
 审计查询示例：
 

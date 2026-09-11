@@ -97,7 +97,7 @@ candidate = candidate_from_fact(fact, source_kind="lineage_audit")
 CLI：
 
 ```bash
-python -m tools.lineage.audit_golden sample \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.audit_golden sample \
   --input sanitized_candidates.jsonl \
   --output audit_corpus.jsonl \
   --seed 35 \
@@ -105,7 +105,7 @@ python -m tools.lineage.audit_golden sample \
   --negative-control-count 2 \
   --sampling-group prod-2026-q1
 
-python -m tools.lineage.audit_golden validate \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.audit_golden validate \
   --input audit_corpus.jsonl \
   --require-labels
 ```
@@ -115,7 +115,7 @@ python -m tools.lineage.audit_golden validate \
 `metrics` 只接受全部完成事实标注的 corpus：
 
 ```bash
-python -m tools.lineage.audit_golden metrics \
+"C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m tools.lineage.audit_golden metrics \
   --input audit_corpus.jsonl \
   --output artifacts/lineage_audit_golden/audit_metrics.json
 ```

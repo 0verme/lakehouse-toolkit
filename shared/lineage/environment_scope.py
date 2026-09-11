@@ -97,7 +97,7 @@ class LineageEnvironmentScope:
 
 
 class LineageEnvironmentScopeResolver:
-    """Resolve configured environments without exposing profile selection to UI."""
+    """Resolve configured environments without exposing profile selection to callers."""
 
     def __init__(self, scopes: Iterable[LineageEnvironmentScope]) -> None:
         values = tuple(scopes)
@@ -124,7 +124,7 @@ class LineageEnvironmentScopeResolver:
         return self._scopes
 
     def enabled_scopes(self) -> tuple[LineageEnvironmentScope, ...]:
-        """Return only scopes that may be selected by the public UI."""
+        """Return only scopes enabled for UI and production batch consumers."""
 
         return tuple(scope for scope in self._scopes if scope.enabled)
 
