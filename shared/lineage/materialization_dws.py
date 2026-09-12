@@ -54,6 +54,12 @@ from shared.lineage.evolution import (
 )
 from shared.lineage.materialization import MaterializationBatch, _canonical_json
 from shared.lineage.physical_dag import ProgramPhysicalDAG
+from shared.lineage.reconciliation import (
+    ActiveSnapshotNotFoundError,
+    ReconciliationFactProjection,
+    ReconciliationTiming,
+    SQL_ACTIVE_SNAPSHOT_NOT_FOUND,
+)
 from shared.lineage.version import LINEAGE_PIPELINE_VERSION
 
 DWS_SCHEMA = "dwp"
@@ -192,6 +198,17 @@ BUSINESS_EDGE_SELECT_SQL = f"""
            {dws_timestamp_projection("e.created_at")},
            {dws_timestamp_projection("e.updated_at")}
     FROM dwp.lineage_business_edge AS e
+"""
+BUSINESS_RECONCILIATION_PROJECTION_SQL = """
+    SELECT e.source_table, e.target_table,
+           COUNT(e.source_table),
+           COUNT(DISTINCT NULLIF(e.program_name, ''))
+    FROM dwp.lineage_batch AS b
+    LEFT JOIN dwp.lineage_business_edge AS e
+      ON e.batch_id = b.batch_id
+     AND e.is_active = TRUE
+     AND e.environment = ?
+     AND e.source_profile = ?
 """
 ISSUE_SELECT_SQL = f"""
     SELECT i.row_key, i.stable_issue_key, i.environment, i.source_profile,
@@ -412,6 +429,16 @@ class _DWSBatchRow:
 
 
 @dataclass(frozen=True, slots=True)
+class DWSActiveSnapshotMetadata:
+    """Compact active SQL provenance used by target-scoped reconciliation."""
+
+    batch_id: str
+    snapshot_scope: tuple[tuple[str, str], ...]
+    observed_at: datetime
+    is_active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class _DWSPreparedCandidate:
     batch: MaterializationBatch
     previous_batch_id: str | None
@@ -502,6 +529,28 @@ def _stored_int(value: object, field_name: str) -> int:
     if isinstance(value, float) and parsed != value:
         raise ValueError(f"{field_name} is not a valid integer")
     return parsed
+
+
+def _snapshot_scope_from_json(value: str | None) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("active DWS snapshot scope is not valid JSON") from exc
+    if not isinstance(decoded, list):
+        raise ValueError("active DWS snapshot scope must be a JSON list")
+    scopes: set[tuple[str, str]] = set()
+    for item in decoded:
+        if not isinstance(item, Mapping):
+            raise ValueError("active DWS snapshot scope item is invalid")
+        scopes.add(
+            (
+                _required_text(item.get("environment"), "snapshot environment"),
+                _required_text(item.get("source_profile"), "snapshot source_profile"),
+            )
+        )
+    return tuple(sorted(scopes))
 
 
 # Backward-compatible private aliases keep the SQL lineage adapter's existing
@@ -1516,13 +1565,21 @@ class DWSMaterializationStore:
         return self._connection
 
     @contextmanager
-    def _connection_scope(self) -> Iterator[Any]:
+    def _connection_scope(
+        self,
+        timing: ReconciliationTiming | None = None,
+    ) -> Iterator[Any]:
         if self._connection is not None:
             yield self._connection
             return
         if self.profile is None:
             raise RuntimeError("DWS materialization has no database profile")
-        connection = self._connection_factory(self.profile)
+        connect_started = perf_counter() if timing is not None else None
+        try:
+            connection = self._connection_factory(self.profile)
+        finally:
+            if timing is not None and connect_started is not None:
+                timing.connect_ms += int((perf_counter() - connect_started) * 1000)
         if connection is None:
             raise RuntimeError("DWS connection factory returned no connection")
         try:
@@ -1746,18 +1803,38 @@ class DWSMaterializationStore:
             _issue_from_row,
         )
 
-    def _fetch_active_batch_row(self, connection: Any) -> _DWSBatchRow | None:
-        with self._cursor_scope(connection) as cursor:
-            self._execute(cursor, BATCH_SELECT_SQL + " WHERE is_active = TRUE")
-            rows = cursor.fetchall()
-        if len(rows) > 1:
-            raise ValueError("DWS contains more than one active batch")
-        if not rows:
-            return None
-        active = _batch_from_row(rows[0])
-        if active.publish_status != "PUBLISHED":
-            raise ValueError("active batch must have PUBLISHED status")
-        return active
+    def _fetch_active_batch_row(
+        self,
+        connection: Any,
+        timing: ReconciliationTiming | None = None,
+    ) -> _DWSBatchRow | None:
+        resolve_started = perf_counter() if timing is not None else None
+        try:
+            with self._cursor_scope(connection) as cursor:
+                self._execute(cursor, BATCH_SELECT_SQL + " WHERE is_active = TRUE")
+                rows = cursor.fetchall()
+            if len(rows) > 1:
+                raise ValueError("DWS contains more than one active batch")
+            if not rows:
+                return None
+            conversion_started = perf_counter() if timing is not None else None
+            try:
+                active = _batch_from_row(rows[0])
+                if active.publish_status != "PUBLISHED":
+                    raise ValueError("active batch must have PUBLISHED status")
+                return active
+            finally:
+                if timing is not None and conversion_started is not None:
+                    timing.record_dws_phase(
+                        "sql",
+                        "conversion",
+                        int((perf_counter() - conversion_started) * 1000),
+                    )
+        finally:
+            if timing is not None and resolve_started is not None:
+                timing.sql_active_batch_resolve_ms += int(
+                    (perf_counter() - resolve_started) * 1000
+                )
 
     def _fetch_batch_row(
         self,
@@ -2613,6 +2690,23 @@ class DWSMaterializationStore:
             )
             self._validate_candidate_in_transaction(connection, candidate)
 
+    def get_active_snapshot_metadata(
+        self,
+        *,
+        timing: ReconciliationTiming | None = None,
+    ) -> DWSActiveSnapshotMetadata | None:
+        """Read active SQL batch provenance without reading business facts."""
+
+        with self._connection_scope(timing) as connection:
+            row = self._fetch_active_batch_row(connection, timing)
+        if row is None:
+            return None
+        return DWSActiveSnapshotMetadata(
+            batch_id=row.batch_id,
+            snapshot_scope=_snapshot_scope_from_json(row.snapshot_scope),
+            observed_at=row.observed_at,
+        )
+
     def get_active_batch_id(self) -> str | None:
         with self._connection_scope() as connection:
             row = self._fetch_active_batch_row(connection)
@@ -2629,27 +2723,7 @@ class DWSMaterializationStore:
 
         with self._connection_scope() as connection:
             row = self._fetch_active_batch_row(connection)
-        if row is None or row.snapshot_scope is None:
-            return ()
-        try:
-            decoded = json.loads(row.snapshot_scope)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("active DWS snapshot scope is not valid JSON") from exc
-        if not isinstance(decoded, list):
-            raise ValueError("active DWS snapshot scope must be a JSON list")
-        scopes: set[tuple[str, str]] = set()
-        for item in decoded:
-            if not isinstance(item, Mapping):
-                raise ValueError("active DWS snapshot scope item is invalid")
-            scopes.add(
-                (
-                    _required_text(item.get("environment"), "snapshot environment"),
-                    _required_text(
-                        item.get("source_profile"), "snapshot source_profile"
-                    ),
-                )
-            )
-        return tuple(sorted(scopes))
+        return () if row is None else _snapshot_scope_from_json(row.snapshot_scope)
 
     def list_batch_metadata(self) -> tuple[BatchMetadata, ...]:
         with self._connection_scope() as connection:
@@ -2720,6 +2794,94 @@ class DWSMaterializationStore:
                 batch_id=batch_id,
                 active_only=active_only,
             )
+
+    def read_reconciliation_projection(
+        self,
+        *,
+        batch_id: str,
+        environment: str,
+        source_profile: str,
+        target_tables: Iterable[object] | None = None,
+        timing: ReconciliationTiming | None = None,
+    ) -> tuple[ReconciliationFactProjection, ...]:
+        """Read grouped business facts for one fixed active batch and scope."""
+
+        batch_id = _required_text(batch_id, "batch_id")
+        environment = _required_text(environment, "environment")
+        source_profile = _required_text(source_profile, "source_profile")
+        targets = None if target_tables is None else _normalize_target_tables(target_tables)
+        conditions = ["b.batch_id = ?", "b.is_active = TRUE"]
+        params: list[object] = [environment, source_profile]
+        join_target_sql = ""
+        if targets is not None:
+            placeholders = ", ".join("?" for _ in targets)
+            join_target_sql = f" AND e.target_table IN ({placeholders})"
+            params.extend(targets)
+        params.append(batch_id)
+        sql = (
+            BUSINESS_RECONCILIATION_PROJECTION_SQL
+            + join_target_sql
+            + " WHERE "
+            + " AND ".join(conditions)
+            + " GROUP BY e.source_table, e.target_table"
+        )
+        with self._connection_scope(timing) as connection:
+            with self._cursor_scope(connection) as cursor:
+                execute_started = perf_counter() if timing is not None else None
+                try:
+                    self._execute(cursor, sql, params)
+                finally:
+                    if timing is not None and execute_started is not None:
+                        timing.record_dws_phase(
+                            "sql",
+                            "execute",
+                            int((perf_counter() - execute_started) * 1000),
+                        )
+                fetch_started = perf_counter() if timing is not None else None
+                try:
+                    raw_rows = cursor.fetchall()
+                finally:
+                    if timing is not None and fetch_started is not None:
+                        timing.record_dws_phase(
+                            "sql",
+                            "fetch",
+                            int((perf_counter() - fetch_started) * 1000),
+                        )
+        if not raw_rows:
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+
+        conversion_started = perf_counter() if timing is not None else None
+        try:
+            projections: list[ReconciliationFactProjection] = []
+            for raw in raw_rows:
+                values = tuple(raw)
+                if len(values) != 4:
+                    raise ValueError("DWS reconciliation projection row has invalid shape")
+                source, target = values[0], values[1]
+                fact_count = _stored_int(values[2], "fact_count")
+                provenance_count = _stored_int(values[3], "provenance_count")
+                if source is None and target is None:
+                    if fact_count != 0 or provenance_count != 0:
+                        raise ValueError("empty DWS reconciliation projection is invalid")
+                    continue
+                if source is None or target is None:
+                    raise ValueError("DWS reconciliation projection identity is NULL")
+                projections.append(
+                    ReconciliationFactProjection(
+                        source_table=_stored_required_text(source, "source_table"),
+                        target_table=_stored_required_text(target, "target_table"),
+                        fact_count=fact_count,
+                        provenance_count=provenance_count,
+                    )
+                )
+            return tuple(projections)
+        finally:
+            if timing is not None and conversion_started is not None:
+                timing.record_dws_phase(
+                    "sql",
+                    "conversion",
+                    int((perf_counter() - conversion_started) * 1000),
+                )
 
     def read_edges(
         self,
@@ -2930,6 +3092,8 @@ def _rollback(connection: Any) -> None:
 
 
 __all__ = [
+    "BUSINESS_RECONCILIATION_PROJECTION_SQL",
+    "DWSActiveSnapshotMetadata",
     "DWSBusinessEdgeRow",
     "DWSIssueRow",
     "DWSMaterializationStore",

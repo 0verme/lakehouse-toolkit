@@ -8,6 +8,7 @@ provider, nor TMP collapse is part of this comparison boundary.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,7 +67,7 @@ class ActiveSnapshotNotFoundError(LineageReconciliationError):
 
 @dataclass(slots=True)
 class ReconciliationTiming:
-    """Operational timings for one target-scoped reconciliation batch."""
+    """Bounded, non-sensitive timings for one reconciliation request."""
 
     sql_target_scoped_read_ms: int = 0
     schedule_target_scoped_read_ms: int = 0
@@ -76,18 +77,78 @@ class ReconciliationTiming:
     sql_rows_read: int = 0
     schedule_rows_read: int = 0
     reconciliation_rows: int = 0
+    connect_ms: int = 0
+    sql_active_batch_resolve_ms: int = 0
+    sql_execute_ms: int = 0
+    sql_fetch_ms: int = 0
+    sql_conversion_ms: int = 0
+    schedule_active_batch_resolve_ms: int = 0
+    schedule_execute_ms: int = 0
+    schedule_fetch_ms: int = 0
+    schedule_conversion_ms: int = 0
+    sql_fact_rows_read: int = 0
+    schedule_fact_rows_read: int = 0
+
+    def record_dws_phase(self, side: str, phase: str, elapsed_ms: int) -> None:
+        """Receive phase timings from DWS adapters without exposing SQL values."""
+
+        if side not in {"sql", "schedule"}:
+            return
+        if phase not in {"active_batch_resolve", "execute", "fetch", "conversion"}:
+            return
+        field_name = f"{side}_{phase}_ms"
+        setattr(self, field_name, getattr(self, field_name) + max(0, int(elapsed_ms)))
 
     def as_dict(self) -> dict[str, int]:
         return {
+            "connect_ms": self.connect_ms,
+            "sql_active_batch_resolve_ms": self.sql_active_batch_resolve_ms,
+            "sql_execute_ms": self.sql_execute_ms,
+            "sql_fetch_ms": self.sql_fetch_ms,
+            "sql_conversion_ms": self.sql_conversion_ms,
+            "schedule_active_batch_resolve_ms": self.schedule_active_batch_resolve_ms,
+            "schedule_execute_ms": self.schedule_execute_ms,
+            "schedule_fetch_ms": self.schedule_fetch_ms,
+            "schedule_conversion_ms": self.schedule_conversion_ms,
             "sql_target_scoped_read_ms": self.sql_target_scoped_read_ms,
             "schedule_target_scoped_read_ms": self.schedule_target_scoped_read_ms,
             "reconciliation_cpu_ms": self.reconciliation_cpu_ms,
             "suppression_lookup_ms": self.suppression_lookup_ms,
             "total_ms": self.total_ms,
             "sql_rows_read": self.sql_rows_read,
+            "sql_fact_rows_read": self.sql_fact_rows_read,
             "schedule_rows_read": self.schedule_rows_read,
+            "schedule_fact_rows_read": self.schedule_fact_rows_read,
             "reconciliation_rows": self.reconciliation_rows,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationFactProjection:
+    """Minimal grouped fact returned by a reconciliation-specific DWS read."""
+
+    source_table: str
+    target_table: str
+    fact_count: int
+    provenance_count: int
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.source_table, "source_table"),
+            (self.target_table, "target_table"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        for value, field_name in (
+            (self.fact_count, "fact_count"),
+            (self.provenance_count, "provenance_count"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        if self.fact_count == 0:
+            raise ValueError("fact_count must be positive for a grouped fact")
+        if self.provenance_count > self.fact_count:
+            raise ValueError("provenance_count cannot exceed fact_count")
 
 
 def normalize_lineage_comparison_table_key(value: object) -> str:
@@ -501,12 +562,184 @@ class ScheduleLineageReader(Protocol):
     ) -> Iterable[Any]: ...
 
 
+class ReconciliationProjectionReader(Protocol):
+    """Optional narrow reader used only by the reconciliation read path."""
+
+    def read_reconciliation_projection(
+        self,
+        *,
+        batch_id: str,
+        environment: str,
+        source_profile: str,
+        target_tables: Iterable[object] | None = None,
+        timing: ReconciliationTiming | None = None,
+    ) -> Iterable[ReconciliationFactProjection]: ...
+
+
+def _call_with_optional_timing(
+    method: Any,
+    kwargs: dict[str, object],
+    timing: ReconciliationTiming | None,
+) -> Any:
+    """Call old reader fakes and new instrumented readers uniformly."""
+
+    if timing is None:
+        return method(**kwargs)
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return method(**kwargs)
+    accepts_timing = any(
+        parameter.name == "timing"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if accepts_timing:
+        return method(**{**kwargs, "timing": timing})
+    return method(**kwargs)
+
+
+def _resolve_active_sql_snapshot_metadata(
+    reader: SQLBusinessLineageReader,
+    *,
+    environment: str,
+    source_profile: str,
+    timing: ReconciliationTiming | None = None,
+) -> tuple[str, datetime, tuple[tuple[str, str], ...]]:
+    """Resolve SQL active batch, observation and scope exactly once."""
+
+    scope = _validate_scope(environment, source_profile)
+    metadata_reader = getattr(reader, "get_active_snapshot_metadata", None)
+    if callable(metadata_reader):
+        metadata = _call_with_optional_timing(metadata_reader, {}, timing)
+        if metadata is None or not _is_true(getattr(metadata, "is_active", True)):
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+        active_batch_id = getattr(metadata, "batch_id", None)
+        observed_at = getattr(metadata, "observed_at", None)
+        raw_scope = getattr(metadata, "snapshot_scope", None)
+        if raw_scope is None:
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+        try:
+            snapshot_scope = _normalize_snapshot_scopes(raw_scope)
+        except (TypeError, ValueError) as exc:
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND) from exc
+        if scope not in snapshot_scope:
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+    else:
+        active_batch_id = reader.get_active_batch_id()
+        if not isinstance(active_batch_id, str) or not active_batch_id.strip():
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+        active_batch_id = active_batch_id.strip()
+        metadata = reader.get_batch_metadata(active_batch_id)
+        if metadata is None or not _is_true(getattr(metadata, "is_active", None)):
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+        observed_at = getattr(metadata, "observed_at", None)
+        if not isinstance(observed_at, datetime):
+            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+        snapshot_scope = ()
+        scope_reader = getattr(reader, "get_active_snapshot_scope", None)
+        if callable(scope_reader):
+            try:
+                raw_scope = scope_reader()
+                if not isinstance(raw_scope, (tuple, list, set, frozenset)):
+                    raise TypeError("snapshot scope reader must return an iterable")
+                snapshot_scope = _normalize_snapshot_scopes(raw_scope)
+            except (TypeError, ValueError) as exc:
+                raise ActiveSnapshotNotFoundError(
+                    SQL_ACTIVE_SNAPSHOT_NOT_FOUND
+                ) from exc
+            if scope not in snapshot_scope:
+                raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+
+    if not isinstance(active_batch_id, str) or not active_batch_id.strip():
+        raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+    if not isinstance(observed_at, datetime):
+        raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+    return active_batch_id.strip(), observed_at, snapshot_scope
+
+
+def _resolve_active_schedule_snapshot_metadata(
+    reader: ScheduleLineageReader,
+    *,
+    environment: str,
+    source_profile: str,
+    timing: ReconciliationTiming | None = None,
+) -> tuple[str, datetime | None, tuple[tuple[str, str], ...], bool]:
+    """Resolve schedule active batch metadata exactly once."""
+
+    scope = _validate_scope(environment, source_profile)
+    metadata_reader = getattr(reader, "get_active_snapshot_metadata", None)
+    metadata_available = callable(metadata_reader)
+    metadata = (
+        _call_with_optional_timing(metadata_reader, {}, timing)
+        if metadata_available
+        else None
+    )
+    if metadata_available:
+        if metadata is None or not _is_true(getattr(metadata, "is_active", True)):
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        active_batch_id = getattr(metadata, "batch_id", None)
+        declared_observed_at = getattr(metadata, "observed_at", None)
+        raw_scope = getattr(metadata, "snapshot_scope", None)
+        if raw_scope is None:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        try:
+            snapshot_scope = _normalize_snapshot_scopes(raw_scope)
+        except (TypeError, ValueError) as exc:
+            raise ActiveSnapshotNotFoundError(
+                SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND
+            ) from exc
+        if scope not in snapshot_scope:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        if not isinstance(declared_observed_at, datetime):
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+    else:
+        active_batch_id = reader.get_active_batch_id()
+        declared_observed_at = None
+        snapshot_scope = ()
+
+    if not isinstance(active_batch_id, str) or not active_batch_id.strip():
+        raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+    return active_batch_id.strip(), declared_observed_at, snapshot_scope, metadata_available
+
+
+def _read_reconciliation_projections(
+    reader: ReconciliationProjectionReader,
+    *,
+    batch_id: str,
+    environment: str,
+    source_profile: str,
+    target_tables: tuple[str, ...] | None,
+    timing: ReconciliationTiming | None,
+) -> tuple[ReconciliationFactProjection, ...]:
+    kwargs: dict[str, object] = {
+        "batch_id": batch_id,
+        "environment": environment,
+        "source_profile": source_profile,
+    }
+    if target_tables is not None:
+        kwargs["target_tables"] = target_tables
+    rows = tuple(
+        _call_with_optional_timing(
+            reader.read_reconciliation_projection,
+            kwargs,
+            timing,
+        )
+    )
+    if any(not isinstance(row, ReconciliationFactProjection) for row in rows):
+        raise TypeError(
+            "reconciliation projection reader must return grouped fact projections"
+        )
+    return rows
+
+
 def read_active_sql_business_snapshot(
     reader: SQLBusinessLineageReader,
     *,
     environment: str,
     source_profile: str,
     target_tables: Iterable[object] | str | None = None,
+    timing: ReconciliationTiming | None = None,
 ) -> SQLBusinessLineageSnapshot:
     """Read a verified active SQL snapshot, pushing target filters to DWS."""
 
@@ -517,29 +750,14 @@ def read_active_sql_business_snapshot(
         else normalize_lineage_comparison_target_tables(target_tables)
     )
     target_set = None if resolved_targets is None else frozenset(resolved_targets)
-    active_batch_id = reader.get_active_batch_id()
-    if not isinstance(active_batch_id, str) or not active_batch_id.strip():
-        raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
-    active_batch_id = active_batch_id.strip()
-    metadata = reader.get_batch_metadata(active_batch_id)
-    if metadata is None or not _is_true(getattr(metadata, "is_active", None)):
-        raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
-    observed_at = getattr(metadata, "observed_at", None)
-    if not isinstance(observed_at, datetime):
-        raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
-
-    snapshot_scope: tuple[tuple[str, str], ...] = ()
-    scope_reader = getattr(reader, "get_active_snapshot_scope", None)
-    if callable(scope_reader):
-        try:
-            raw_scope = scope_reader()
-            if not isinstance(raw_scope, (tuple, list, set, frozenset)):
-                raise TypeError("snapshot scope reader must return an iterable")
-            snapshot_scope = _normalize_snapshot_scopes(raw_scope)
-        except (TypeError, ValueError) as exc:
-            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND) from exc
-        if scope not in snapshot_scope:
-            raise ActiveSnapshotNotFoundError(SQL_ACTIVE_SNAPSHOT_NOT_FOUND)
+    active_batch_id, observed_at, snapshot_scope = (
+        _resolve_active_sql_snapshot_metadata(
+            reader,
+            environment=scope[0],
+            source_profile=scope[1],
+            timing=timing,
+        )
+    )
 
     read_kwargs: dict[str, object] = {
         "batch_id": active_batch_id,
@@ -547,7 +765,9 @@ def read_active_sql_business_snapshot(
     }
     if resolved_targets is not None:
         read_kwargs["target_tables"] = resolved_targets
-    edges = tuple(reader.read_edges(**read_kwargs))  # type: ignore[arg-type]
+    edges = tuple(
+        _call_with_optional_timing(reader.read_edges, read_kwargs, timing)
+    )
     if any(not isinstance(edge, LineageEdge) for edge in edges):
         raise TypeError("SQL active reader must return LineageEdge values")
     if any(
@@ -581,6 +801,7 @@ def read_active_schedule_snapshot(
     environment: str,
     source_profile: str,
     target_tables: Iterable[object] | str | None = None,
+    timing: ReconciliationTiming | None = None,
 ) -> ScheduleLineageSnapshot:
     """Read an active schedule snapshot with verified target pushdown.
 
@@ -597,43 +818,24 @@ def read_active_schedule_snapshot(
         else normalize_lineage_comparison_target_tables(target_tables)
     )
     target_set = None if resolved_targets is None else frozenset(resolved_targets)
-
-    metadata_reader = getattr(reader, "get_active_snapshot_metadata", None)
-    metadata_available = callable(metadata_reader)
-    metadata = metadata_reader() if metadata_available else None
-    if metadata_available:
-        if metadata is None or not _is_true(getattr(metadata, "is_active", True)):
-            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-        active_batch_id = getattr(metadata, "batch_id", None)
-        declared_observed_at = getattr(metadata, "observed_at", None)
-        raw_scope = getattr(metadata, "snapshot_scope", None)
-        if raw_scope is None:
-            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-        try:
-            snapshot_scope = _normalize_snapshot_scopes(raw_scope)
-        except (TypeError, ValueError) as exc:
-            raise ActiveSnapshotNotFoundError(
-                SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND
-            ) from exc
-        if scope not in snapshot_scope:
-            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-        if not isinstance(declared_observed_at, datetime):
-            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-    else:
-        active_batch_id = reader.get_active_batch_id()
-        declared_observed_at = None
-        snapshot_scope = ()
-
-    if not isinstance(active_batch_id, str) or not active_batch_id.strip():
-        raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-    active_batch_id = active_batch_id.strip()
+    (
+        active_batch_id,
+        declared_observed_at,
+        snapshot_scope,
+        metadata_available,
+    ) = _resolve_active_schedule_snapshot_metadata(
+        reader,
+        environment=scope[0],
+        source_profile=scope[1],
+        timing=timing,
+    )
     read_kwargs: dict[str, object] = {
         "batch_id": active_batch_id,
         "active_only": True,
     }
     if resolved_targets is not None:
         read_kwargs["target_tables"] = resolved_targets
-    rows = tuple(reader.read_rows(**read_kwargs))  # type: ignore[arg-type]
+    rows = tuple(_call_with_optional_timing(reader.read_rows, read_kwargs, timing))
 
     scoped_rows: list[Any] = []
     observed_values: set[datetime] = set()
@@ -710,41 +912,129 @@ def reconcile_active_dws_lineage(
         schedule_source_profile=schedule_source_profile,
     )
     started = perf_counter() if timing is not None else None
-    sql_started = perf_counter() if timing is not None else None
-    sql_snapshot = read_active_sql_business_snapshot(
-        sql_reader,
-        environment=environment,
-        source_profile=sql_profile,
-        target_tables=resolved_targets,
+    sql_projection_reader = getattr(
+        sql_reader, "read_reconciliation_projection", None
     )
-    if timing is not None and sql_started is not None:
-        timing.sql_target_scoped_read_ms = int(
-            (perf_counter() - sql_started) * 1000
+    schedule_projection_reader = getattr(
+        schedule_reader, "read_reconciliation_projection", None
+    )
+    use_projection = all(
+        callable(value)
+        for value in (
+            sql_projection_reader,
+            schedule_projection_reader,
+            getattr(sql_reader, "get_active_snapshot_metadata", None),
+            getattr(schedule_reader, "get_active_snapshot_metadata", None),
         )
-        timing.sql_rows_read = len(sql_snapshot.edges)
-
-    schedule_started = perf_counter() if timing is not None else None
-    schedule_snapshot = read_active_schedule_snapshot(
-        schedule_reader,
-        environment=environment,
-        source_profile=schedule_profile,
-        target_tables=resolved_targets,
     )
-    if timing is not None and schedule_started is not None:
-        timing.schedule_target_scoped_read_ms = int(
-            (perf_counter() - schedule_started) * 1000
+
+    if use_projection:
+        sql_started = perf_counter() if timing is not None else None
+        sql_batch_id, sql_observed_at, _ = _resolve_active_sql_snapshot_metadata(
+            sql_reader,
+            environment=environment,
+            source_profile=sql_profile,
+            timing=timing,
         )
-        timing.schedule_rows_read = len(schedule_snapshot.edges)
+        sql_projections = _read_reconciliation_projections(
+            sql_reader,  # type: ignore[arg-type]
+            batch_id=sql_batch_id,
+            environment=environment,
+            source_profile=sql_profile,
+            target_tables=resolved_targets,
+            timing=timing,
+        )
+        if timing is not None and sql_started is not None:
+            timing.sql_target_scoped_read_ms = int(
+                (perf_counter() - sql_started) * 1000
+            )
+            timing.sql_rows_read = len(sql_projections)
+            timing.sql_fact_rows_read = sum(
+                row.fact_count for row in sql_projections
+            )
 
-    cpu_started = perf_counter() if timing is not None else None
-    result = reconcile_lineage_snapshots(
-        sql_snapshot,
-        schedule_snapshot,
-        environment=environment,
-        sql_source_profile=sql_profile,
-        schedule_source_profile=schedule_profile,
-        target_tables=resolved_targets,
-    )
+        schedule_started = perf_counter() if timing is not None else None
+        schedule_batch_id, schedule_observed_at, _, _ = (
+            _resolve_active_schedule_snapshot_metadata(
+                schedule_reader,
+                environment=environment,
+                source_profile=schedule_profile,
+                timing=timing,
+            )
+        )
+        schedule_projections = _read_reconciliation_projections(
+            schedule_reader,  # type: ignore[arg-type]
+            batch_id=schedule_batch_id,
+            environment=environment,
+            source_profile=schedule_profile,
+            target_tables=resolved_targets,
+            timing=timing,
+        )
+        if not schedule_projections and resolved_targets is None:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+        if timing is not None and schedule_started is not None:
+            timing.schedule_target_scoped_read_ms = int(
+                (perf_counter() - schedule_started) * 1000
+            )
+            timing.schedule_rows_read = len(schedule_projections)
+            timing.schedule_fact_rows_read = sum(
+                row.fact_count for row in schedule_projections
+            )
+
+        cpu_started = perf_counter() if timing is not None else None
+        result = _reconcile_fact_projections(
+            sql_projections,
+            schedule_projections,
+            environment=environment,
+            sql_source_profile=sql_profile,
+            schedule_source_profile=schedule_profile,
+            target_tables=resolved_targets,
+            sql_batch_id=sql_batch_id,
+            schedule_batch_id=schedule_batch_id,
+            sql_observed_at=sql_observed_at,
+            schedule_observed_at=schedule_observed_at,
+        )
+    else:
+        sql_started = perf_counter() if timing is not None else None
+        sql_snapshot = read_active_sql_business_snapshot(
+            sql_reader,
+            environment=environment,
+            source_profile=sql_profile,
+            target_tables=resolved_targets,
+            timing=timing,
+        )
+        if timing is not None and sql_started is not None:
+            timing.sql_target_scoped_read_ms = int(
+                (perf_counter() - sql_started) * 1000
+            )
+            timing.sql_rows_read = len(sql_snapshot.edges)
+            timing.sql_fact_rows_read = len(sql_snapshot.edges)
+
+        schedule_started = perf_counter() if timing is not None else None
+        schedule_snapshot = read_active_schedule_snapshot(
+            schedule_reader,
+            environment=environment,
+            source_profile=schedule_profile,
+            target_tables=resolved_targets,
+            timing=timing,
+        )
+        if timing is not None and schedule_started is not None:
+            timing.schedule_target_scoped_read_ms = int(
+                (perf_counter() - schedule_started) * 1000
+            )
+            timing.schedule_rows_read = len(schedule_snapshot.edges)
+            timing.schedule_fact_rows_read = len(schedule_snapshot.edges)
+
+        cpu_started = perf_counter() if timing is not None else None
+        result = reconcile_lineage_snapshots(
+            sql_snapshot,
+            schedule_snapshot,
+            environment=environment,
+            sql_source_profile=sql_profile,
+            schedule_source_profile=schedule_profile,
+            target_tables=resolved_targets,
+        )
+
     if timing is not None and cpu_started is not None:
         timing.reconciliation_cpu_ms = int((perf_counter() - cpu_started) * 1000)
         timing.reconciliation_rows = len(result.rows)
@@ -830,6 +1120,45 @@ def reconcile_lineage_snapshots(
         aggregate.schedule_fact_count += 1
         aggregate.schedule_processes.add(edge.process_name)
 
+    return _result_from_comparison_values(
+        sql_values,
+        schedule_values,
+        environment=sql_scope[0],
+        sql_source_profile=sql_profile,
+        schedule_source_profile=schedule_profile,
+        target_tables=resolved_targets,
+        sql_batch_id=sql_snapshot.batch_id,
+        schedule_batch_id=schedule_snapshot.batch_id,
+        sql_observed_at=sql_snapshot.observed_at,
+        schedule_observed_at=schedule_snapshot.observed_at,
+    )
+
+
+@dataclass(slots=True)
+class _ComparisonAccumulator:
+    sql_fact_count: int = 0
+    schedule_fact_count: int = 0
+    sql_program_count: int = 0
+    schedule_process_count: int = 0
+    sql_programs: set[str] = field(default_factory=set)
+    schedule_processes: set[str] = field(default_factory=set)
+
+
+def _result_from_comparison_values(
+    sql_values: dict[tuple[str, str, str], _ComparisonAccumulator],
+    schedule_values: dict[tuple[str, str, str], _ComparisonAccumulator],
+    *,
+    environment: str,
+    sql_source_profile: str,
+    schedule_source_profile: str,
+    target_tables: tuple[str, ...] | None,
+    sql_batch_id: str,
+    schedule_batch_id: str,
+    sql_observed_at: datetime | None,
+    schedule_observed_at: datetime | None,
+) -> LineageReconciliationResult:
+    """Build the stable result shape from full or grouped reader values."""
+
     all_keys = sorted(set(sql_values) | set(schedule_values), key=_key_sort_key)
     rows: list[LineageReconciliationRow] = []
     for key in all_keys:
@@ -840,8 +1169,8 @@ def reconcile_lineage_snapshots(
         rows.append(
             LineageReconciliationRow(
                 environment=key[0],
-                sql_source_profile=sql_profile,
-                schedule_source_profile=schedule_profile,
+                sql_source_profile=sql_source_profile,
+                schedule_source_profile=schedule_source_profile,
                 source_table=key[2],
                 target_table=key[1],
                 sql_present=sql_present,
@@ -849,44 +1178,103 @@ def reconcile_lineage_snapshots(
                 status=_resolve_status(sql_present, schedule_present),
                 sql_fact_count=sql_aggregate.sql_fact_count,
                 schedule_fact_count=schedule_aggregate.schedule_fact_count,
-                sql_program_count=len(sql_aggregate.sql_programs),
-                schedule_process_count=len(schedule_aggregate.schedule_processes),
+                sql_program_count=(
+                    len(sql_aggregate.sql_programs)
+                    if sql_aggregate.sql_programs
+                    else sql_aggregate.sql_program_count
+                ),
+                schedule_process_count=(
+                    len(schedule_aggregate.schedule_processes)
+                    if schedule_aggregate.schedule_processes
+                    else schedule_aggregate.schedule_process_count
+                ),
             )
         )
 
     summaries = _build_target_summaries(
         rows,
-        environment=sql_scope[0],
-        sql_source_profile=sql_profile,
-        schedule_source_profile=schedule_profile,
+        environment=environment,
+        sql_source_profile=sql_source_profile,
+        schedule_source_profile=schedule_source_profile,
         target_table=(
-            next(iter(resolved_targets))
-            if resolved_targets is not None and len(resolved_targets) == 1
-            else None
+            target_tables[0] if target_tables is not None and len(target_tables) == 1 else None
         ),
-        target_tables=resolved_targets,
+        target_tables=target_tables,
     )
     return LineageReconciliationResult(
-        environment=sql_scope[0],
-        sql_source_profile=sql_profile,
-        schedule_source_profile=schedule_profile,
+        environment=environment,
+        sql_source_profile=sql_source_profile,
+        schedule_source_profile=schedule_source_profile,
         rows=tuple(rows),
         target_summaries=summaries,
-        sql_batch_id=sql_snapshot.batch_id,
-        schedule_batch_id=schedule_snapshot.batch_id,
-        sql_observed_at=sql_snapshot.observed_at,
-        schedule_observed_at=schedule_snapshot.observed_at,
+        sql_batch_id=sql_batch_id,
+        schedule_batch_id=schedule_batch_id,
+        sql_observed_at=sql_observed_at,
+        schedule_observed_at=schedule_observed_at,
         sql_edge_count=sum(row.sql_fact_count for row in rows),
         schedule_edge_count=sum(row.schedule_fact_count for row in rows),
     )
 
 
-@dataclass(slots=True)
-class _ComparisonAccumulator:
-    sql_fact_count: int = 0
-    schedule_fact_count: int = 0
-    sql_programs: set[str] = field(default_factory=set)
-    schedule_processes: set[str] = field(default_factory=set)
+def _reconcile_fact_projections(
+    sql_projections: Iterable[ReconciliationFactProjection],
+    schedule_projections: Iterable[ReconciliationFactProjection],
+    *,
+    environment: str,
+    sql_source_profile: str,
+    schedule_source_profile: str,
+    target_tables: tuple[str, ...] | None,
+    sql_batch_id: str,
+    schedule_batch_id: str,
+    sql_observed_at: datetime | None,
+    schedule_observed_at: datetime | None,
+) -> LineageReconciliationResult:
+    """Apply the existing comparison rules to grouped, narrow DWS facts."""
+
+    sql_scope = _validate_scope(environment, sql_source_profile)
+    schedule_scope = _validate_scope(environment, schedule_source_profile)
+    target_set = None if target_tables is None else frozenset(target_tables)
+    sql_values: dict[tuple[str, str, str], _ComparisonAccumulator] = {}
+    schedule_values: dict[tuple[str, str, str], _ComparisonAccumulator] = {}
+
+    for projection in sql_projections:
+        if not isinstance(projection, ReconciliationFactProjection):
+            raise TypeError("SQL projection rows must contain grouped fact projections")
+        key = _comparison_key(
+            sql_scope[0], projection.source_table, projection.target_table
+        )
+        if key is None or (target_set is not None and key[1] not in target_set):
+            continue
+        aggregate = sql_values.setdefault(key, _ComparisonAccumulator())
+        aggregate.sql_fact_count += projection.fact_count
+        aggregate.sql_program_count += projection.provenance_count
+
+    for projection in schedule_projections:
+        if not isinstance(projection, ReconciliationFactProjection):
+            raise TypeError(
+                "schedule projection rows must contain grouped fact projections"
+            )
+        key = _comparison_key(
+            schedule_scope[0], projection.source_table, projection.target_table
+        )
+        if key is None or (target_set is not None and key[1] not in target_set):
+            continue
+        aggregate = schedule_values.setdefault(key, _ComparisonAccumulator())
+        aggregate.schedule_fact_count += projection.fact_count
+        aggregate.schedule_process_count += projection.provenance_count
+
+    return _result_from_comparison_values(
+        sql_values,
+        schedule_values,
+        environment=sql_scope[0],
+        sql_source_profile=sql_source_profile,
+        schedule_source_profile=schedule_source_profile,
+        target_tables=target_tables,
+        sql_batch_id=sql_batch_id,
+        schedule_batch_id=schedule_batch_id,
+        sql_observed_at=sql_observed_at,
+        schedule_observed_at=schedule_observed_at,
+    )
 
 
 def _comparison_key(
@@ -1064,10 +1452,12 @@ __all__ = [
     "ActiveSnapshotNotFoundError",
     "LineageReconciliationError",
     "LineageReconciliationResult",
+    "ReconciliationFactProjection",
     "LineageReconciliationRow",
     "LineageReconciliationTargetSummary",
     "ReconciliationStatus",
     "ReconciliationTargetStatus",
+    "ReconciliationProjectionReader",
     "ReconciliationTiming",
     "SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND",
     "SQL_ACTIVE_SNAPSHOT_NOT_FOUND",

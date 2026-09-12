@@ -133,20 +133,30 @@ def run(
     target_tables: Iterable[object] | str | None = None,
     sql_store: Any | None = None,
     schedule_store: Any | None = None,
+    connection: Any | None = None,
     timing: ReconciliationTiming | None = None,
 ) -> LineageReconciliationResult:
-    """Read two DWS active snapshots and return their reconciliation report."""
+    """Read two DWS active snapshots and return their reconciliation report.
+
+    ``connection`` is caller-owned and lets a Web request share one DWS
+    connection across SQL, schedule and suppression reads.
+    """
 
     if sql_store is None or schedule_store is None:
-        if not isinstance(dws_profile, str) or not dws_profile.strip():
+        if connection is None and (
+            not isinstance(dws_profile, str) or not dws_profile.strip()
+        ):
             raise ValueError(
-                "--dws-profile is required unless both DWS stores are injected"
+                "--dws-profile is required unless both DWS stores or a connection "
+                "are injected"
             )
     resolved_sql_store = sql_store or DWSMaterializationStore(
-        profile=dws_profile.strip() if isinstance(dws_profile, str) else None
+        profile=dws_profile.strip() if isinstance(dws_profile, str) else None,
+        connection=connection,
     )
     resolved_schedule_store = schedule_store or DWSScheduleLineageStore(
-        profile=dws_profile.strip() if isinstance(dws_profile, str) else None
+        profile=dws_profile.strip() if isinstance(dws_profile, str) else None,
+        connection=connection,
     )
     return reconcile_active_dws_lineage(
         resolved_sql_store,

@@ -17,6 +17,7 @@ from shared.lineage.materialization import MaterializationBatch, materialize_pro
 from shared.lineage.materialization_dws import (
     ACTIVATE_BATCH_SQL,
     BATCH_SELECT_SQL,
+    BUSINESS_RECONCILIATION_PROJECTION_SQL,
     BUSINESS_EDGE_SELECT_SQL,
     INSERT_BATCH_SQL,
     INSERT_BUSINESS_EDGE_SQL,
@@ -35,6 +36,7 @@ from shared.lineage.materialization_dws import (
     _timestamp_param,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG, build_program_physical_dag
+from shared.lineage.reconciliation import ReconciliationTiming
 from shared.lineage.version import LINEAGE_PIPELINE_VERSION
 
 OBSERVED_AT = datetime(2026, 2, 1, 8, 9, 10, tzinfo=timezone.utc)
@@ -750,6 +752,54 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             {(edge.source_table, edge.target_table) for edge in filtered},
             {("DWF.SOURCE_A", "DWM.RESULT_A")},
         )
+
+    def test_reconciliation_projection_is_grouped_and_has_no_ordering(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROJECTION",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE;",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:projection",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-projection",
+            observed_at=OBSERVED_AT,
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        timing = ReconciliationTiming()
+        projections = self.store.read_reconciliation_projection(
+            batch_id="batch-dws-projection",
+            environment="DEV",
+            source_profile="fixture",
+            target_tables=("DWS_DWM.RESULT",),
+            timing=timing,
+        )
+
+        self.assertEqual(
+            projections[0].source_table,
+            "DWF.SOURCE",
+        )
+        self.assertEqual(projections[0].target_table, "DWM.RESULT")
+        self.assertEqual(projections[0].fact_count, 1)
+        self.assertEqual(projections[0].provenance_count, 1)
+        projection_sql = next(
+            sql
+            for operation, sql, _ in self.jdbc_boundary.calls
+            if operation == "execute" and "COUNT(e.source_table)" in sql
+        )
+        self.assertNotIn("ORDER BY", projection_sql.upper())
+        self.assertNotIn("ORDER BY", BUSINESS_RECONCILIATION_PROJECTION_SQL.upper())
+        self.assertIn("target_table IN (?)", projection_sql)
+        self.assertIn("batch_id = ?", projection_sql)
+        self.assertIn("sql_execute_ms", timing.as_dict())
 
     def test_business_boundary_keeps_technical_physical_rows_out_of_business_rows(
         self,
