@@ -133,3 +133,16 @@ tools:
     python: python
     enable: true
     auto_restart: false
+
+  - name: lineage_explorer
+    title: 血缘探索
+    group: lineage
+    type: python
+    workdir: tools/lineage
+    script: lineage_explorer_web.py
+    host: 127.0.0.1
+    port: 8615
+    log: logs/lineage_explorer.log
+    python: python
+    enable: true
+    auto_restart: false

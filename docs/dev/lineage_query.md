@@ -1,18 +1,19 @@
 # Lineage Phase 6：Query、Viewer 合约与 Blast Radius
 
-Phase 6 只消费 Phase 5 已发布的 active `lineage_edge`。查询层不调用
-Provider、不读取 `script_code`、不重新解析 SQL，也不构建 Physical DAG：
+Phase 6 只消费已发布的 materialized lineage fact。查询层不调用 Provider、不读取
+`script_code`、不重新解析 SQL，也不构建 Physical DAG：
 
 ```text
-active lineage_edge
+active lineage_edge / lineage_business_edge
         ↓
-LineageQueryService / BFS
+LineageQueryService / bounded traversal
         ↓
-Viewer JSON 或 BlastRadiusResult
+Domain Graph / Viewer JSON 或 BlastRadiusResult
 ```
 
-SQLite 只是当前 reference adapter；BFS 依赖的最小 reader 合约可以由未来的
-PostgreSQL、Oracle、DWS 等 repository 实现。
+SQLite 仍是 reference adapter；`DWSLineageEdgeReader` 是正式 DWS adapter。BFS 依赖的
+最小 reader contract 可由不同 repository 实现，DWS-specific row/schema 不进入
+Query Service 或 PyWebIO。
 
 ## 方向与 scope
 
@@ -23,6 +24,12 @@ source = upstream
 target = downstream
 ```
 
+Query Service 也支持 `direction = both`：它在同一 request scope 内复用已有的
+upstream/downstream traversal，合并 root、stable node identity 和去重 edge，不复制
+第二套 BFS。View 是显式的：`business` 读取 `dwp.lineage_business_edge`，`physical`
+读取 `dwp.lineage_edge`。`TMP` / `TEMP` / `STG` / `TEST` 命名不参与任一 view 的过滤或
+temporary 判断；temporary 只能来自显式 asset fact。详见
+[`lineage_explorer.md`](lineage_explorer.md)。
 例如 `ODS.DEMO_A → DWM.DEMO_B → DWA.DEMO_C`：
 
 - 查询 `DWM.DEMO_B` 的 upstream 返回 `ODS.DEMO_A`；
@@ -76,9 +83,10 @@ cycle 节点时，`truncated = false`。因此 depth 边界恰好是自然终点
 truncation。
 
 如果 root 在当前 active environment/profile projection 中完全不存在，返回空
-contract，不凭空声明该资产已知。如果 root 存在但查询方向没有邻居，保留 root
-节点，返回空 edges。这同样覆盖没有 active batch、active empty batch、方向叶子
-节点和 unknown table。
+contract，并在支持 `contains_node()` 的 reader（包括 DWS reader）上将
+`root_found=False`；不凭空声明该资产已知。如果 root 存在但查询方向没有邻居，
+保留 root 节点，返回空 edges。DWS 没有 active snapshot 时 fail closed，不能把它
+静默当成空图；SQLite reference adapter 的既有空结果语义保持不变。
 
 ## Viewer JSON contract
 

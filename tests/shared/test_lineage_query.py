@@ -292,6 +292,46 @@ class LineageQueryTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(first.truncated)
 
+    def test_both_merges_root_edges_and_deduplicates_with_global_node_bound(self):
+        reader = FixtureEdgeReader(BRANCH_EDGES)
+        service = LineageQueryService(reader)
+
+        result = service.query_both("DWA.DEMO_D", "DEV", depth=2, max_nodes=4)
+
+        self.assertEqual(
+            [node.table for node in result.nodes],
+            ["DWA.DEMO_D", "DWM.DEMO_B", "DWM.DEMO_C", "ODS.DEMO_A"],
+        )
+        self.assertEqual(
+            {(edge.source, edge.target) for edge in result.edges},
+            {
+                ("ODS.DEMO_A", "DWM.DEMO_B"),
+                ("ODS.DEMO_A", "DWM.DEMO_C"),
+                ("DWM.DEMO_B", "DWA.DEMO_D"),
+                ("DWM.DEMO_C", "DWA.DEMO_D"),
+            },
+        )
+        self.assertEqual(
+            sum(node.table == "DWA.DEMO_D" for node in result.nodes),
+            1,
+        )
+        self.assertFalse(result.truncated)
+
+        bounded = service.query_both("DWA.DEMO_D", "DEV", depth=2, max_nodes=3)
+        self.assertEqual(len(bounded.nodes), 3)
+        self.assertTrue(bounded.truncated)
+
+    def test_both_keeps_legacy_unknown_root_empty_contract(self):
+        result = LineageQueryService(FixtureEdgeReader(())).query_both(
+            "DWA.UNKNOWN",
+            "DEV",
+        )
+
+        self.assertEqual(result.nodes, ())
+        self.assertEqual(result.edges, ())
+        self.assertIsNone(result.root_found)
+        self.assertFalse(result.truncated)
+
     def test_viewer_json_is_stable_and_has_minimum_contract(self):
         first = LineageQueryService(FixtureEdgeReader(BRANCH_EDGES)).query_downstream(
             "ODS.DEMO_A", "DEV"
