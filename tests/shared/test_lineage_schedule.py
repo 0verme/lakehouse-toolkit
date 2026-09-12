@@ -18,9 +18,11 @@ from shared.lineage.schedule import (
     normalize_schedule_table_key,
 )
 from shared.lineage.dws_timestamp import TIMESTAMPTZ_PARAM_SQL
+from shared.lineage.reconciliation import ReconciliationTiming
 from shared.lineage.schedule_materialization import (
     DWSScheduleLineageStore,
     INSERT_SCHEDULE_EDGE_SQL,
+    SCHEDULE_RECONCILIATION_PROJECTION_SQL,
     SELECT_SCHEDULE_EDGE_SQL,
 )
 
@@ -433,6 +435,36 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         self.assertEqual(metadata.snapshot_scope, (("DEV", "mysql_dev_a"),))
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0].target_table, "DWM.RESULT_A")
+
+    def test_reconciliation_projection_returns_grouped_target_facts(self):
+        first = make_edge(
+            "DEMO_PROCESS_A",
+            source="DWS_DWF.A",
+            target="DWS_DWM.RESULT_A",
+        )
+        second = make_edge(
+            "DEMO_PROCESS_B",
+            source="DWS_DWF.A",
+            target="DWS_DWM.RESULT_A",
+        )
+        self.publish((first, second), "batch-schedule-projection")
+
+        timing = ReconciliationTiming()
+        projections = self.store.read_reconciliation_projection(
+            batch_id="batch-schedule-projection",
+            environment="DEV",
+            source_profile="mysql_dev_a",
+            target_tables=("DWM.RESULT_A",),
+            timing=timing,
+        )
+
+        self.assertEqual(len(projections), 1)
+        self.assertEqual(projections[0].source_table, "DWF.A")
+        self.assertEqual(projections[0].target_table, "DWM.RESULT_A")
+        self.assertEqual(projections[0].fact_count, 2)
+        self.assertEqual(projections[0].provenance_count, 2)
+        self.assertNotIn("ORDER BY", SCHEDULE_RECONCILIATION_PROJECTION_SQL.upper())
+        self.assertIn("schedule_execute_ms", timing.as_dict())
 
     def test_duplicate_configuration_is_one_fact_but_process_provenance_survives(self):
         first = make_edge("DEMO_PROCESS_A")

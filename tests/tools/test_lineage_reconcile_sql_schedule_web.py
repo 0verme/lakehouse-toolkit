@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 from io import BytesIO
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 
@@ -779,6 +780,28 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
                 "target_table": "DWM.RESULT",
             },
         )
+
+    def test_request_connection_is_forwarded_to_default_runner(self):
+        captured = {}
+        connection = object()
+
+        def runner(**kwargs):
+            captured.update(kwargs)
+            return make_result(kwargs["target_table"])
+
+        with patch(
+            "tools.lineage.reconcile_sql_schedule_web.run_reconciliation",
+            runner,
+        ):
+            outcomes = reconcile_targets(
+                make_scope(),
+                ("DWM.RESULT",),
+                connection=connection,
+            )
+
+        self.assertTrue(outcomes[0].succeeded)
+        self.assertIs(captured["connection"], connection)
+        self.assertIn("timing", captured)
 
     def test_multiple_targets_use_one_batch_runner_and_preserve_order(self):
         calls: list[dict[str, object]] = []

@@ -429,6 +429,7 @@ def reconcile_target(
     target_table: str,
     *,
     runner: ReconciliationRunner | None = None,
+    connection: Any | None = None,
     timing: ReconciliationTiming | None = None,
 ) -> LineageReconciliationResult:
     """Call the formal target-scoped reconciliation function."""
@@ -446,6 +447,8 @@ def reconcile_target(
         "schedule_source_profile": scope.schedule_source_profile,
         "target_table": target,
     }
+    if connection is not None and runner is None:
+        kwargs["connection"] = connection
     if timing is not None and runner is None:
         kwargs["timing"] = timing
     return reconcile(**kwargs)  # type: ignore[arg-type]
@@ -457,9 +460,13 @@ def reconcile_targets(
     *,
     runner: ReconciliationRunner | None = None,
     suppression_store: Any | None = None,
+    connection: Any | None = None,
     timing: ReconciliationTiming | None = None,
 ) -> tuple[TargetReconciliationOutcome, ...]:
-    """Run one batched DWS query and split its result back by target."""
+    """Run one batched DWS query and split its result back by target.
+
+    A caller may provide one request-scoped connection for all DWS adapters.
+    """
 
     if not isinstance(scope, LineageEnvironmentScope):
         raise TypeError("scope must be a LineageEnvironmentScope")
@@ -492,6 +499,7 @@ def reconcile_targets(
                     scope,
                     normalized_targets[0],
                     runner=runner,
+                    connection=connection,
                     timing=batch_timing if runner is None else None,
                 )
             else:
@@ -504,6 +512,8 @@ def reconcile_targets(
                     "target_tables": tuple(normalized_targets),
                 }
                 if runner is None:
+                    if connection is not None:
+                        kwargs["connection"] = connection
                     kwargs["timing"] = batch_timing
                 result = reconcile(**kwargs)  # type: ignore[arg-type]
             batch_timing.reconciliation_rows = len(result.rows)
@@ -732,31 +742,74 @@ def main(
         put_red_text(escape(str(error)))
         return
 
-    if suppression_store is None:
-        try:
-            suppression_store = DWSReconciliationSuppressionStore(
-                profile=scope.dws_profile
-            )
-        except Exception:
-            # Suppression is presentation-only; an unavailable store leaves
-            # the raw reconciliation rows visible.
-            suppression_store = None
-
-    put_markdown("## SQL / 调度血缘对账结果")
+    request_connection: Any | None = None
+    connection_error: Exception | None = None
     timing = ReconciliationTiming()
-    outcomes = reconcile_targets(
-        scope,
-        targets,
-        runner=runner,
-        suppression_store=suppression_store,
-        timing=timing,
-    )
+    request_started = perf_counter()
+    if runner is None:
+        try:
+            from shared.db.gaussdb import connect_with_profile
+
+            connect_started = perf_counter()
+            request_connection = connect_with_profile(scope.dws_profile)
+            if request_connection is None:
+                raise RuntimeError("DWS connection factory returned no connection")
+            timing.connect_ms = int((perf_counter() - connect_started) * 1000)
+        except Exception as error:  # connection errors become per-target UI errors
+            connection_error = error
+
+    try:
+        if suppression_store is None and connection_error is None:
+            try:
+                suppression_store = DWSReconciliationSuppressionStore(
+                    connection=request_connection,
+                    profile=scope.dws_profile if request_connection is None else None,
+                )
+            except Exception:
+                # Suppression is presentation-only; an unavailable store leaves
+                # the raw reconciliation rows visible.
+                suppression_store = None
+
+        put_markdown("## SQL / 调度血缘对账结果")
+        if connection_error is not None:
+            failure = map_reconciliation_error(connection_error)
+            outcomes = tuple(
+                TargetReconciliationOutcome(target_table=target, error=failure)
+                for target in targets
+            )
+        else:
+            outcomes = reconcile_targets(
+                scope,
+                targets,
+                runner=runner,
+                suppression_store=suppression_store,
+                connection=request_connection,
+                timing=timing,
+            )
+    finally:
+        if request_connection is not None:
+            close = getattr(request_connection, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        if runner is None:
+            timing.total_ms = int((perf_counter() - request_started) * 1000)
     put_markdown(
         "查询 timing："
-        f"SQL target-scoped DWS read `{timing.sql_target_scoped_read_ms} ms / "
-        f"{timing.sql_rows_read} rows`；"
-        f"Schedule target-scoped DWS read `{timing.schedule_target_scoped_read_ms} "
-        f"ms / {timing.schedule_rows_read} rows`；"
+        f"连接 `{timing.connect_ms} ms`；"
+        f"SQL active batch `{timing.sql_active_batch_resolve_ms} ms`，"
+        f"execute `{timing.sql_execute_ms} ms`，fetch `{timing.sql_fetch_ms} ms`，"
+        f"conversion `{timing.sql_conversion_ms} ms`，"
+        f"target-scoped read `{timing.sql_target_scoped_read_ms} ms / "
+        f"{timing.sql_rows_read} projection rows / {timing.sql_fact_rows_read} facts`；"
+        f"Schedule active batch `{timing.schedule_active_batch_resolve_ms} ms`，"
+        f"execute `{timing.schedule_execute_ms} ms`，fetch `{timing.schedule_fetch_ms} ms`，"
+        f"conversion `{timing.schedule_conversion_ms} ms`，"
+        f"target-scoped read `{timing.schedule_target_scoped_read_ms} ms / "
+        f"{timing.schedule_rows_read} projection rows / "
+        f"{timing.schedule_fact_rows_read} facts`；"
         f"reconciliation CPU `{timing.reconciliation_cpu_ms} ms / "
         f"{timing.reconciliation_rows} rows`；"
         f"suppression lookup `{timing.suppression_lookup_ms} ms`；"

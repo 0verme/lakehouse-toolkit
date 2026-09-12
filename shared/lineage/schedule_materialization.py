@@ -31,6 +31,12 @@ from shared.lineage.materialization_dws import (
     _commit,
     _rollback,
 )
+from shared.lineage.reconciliation import (
+    ActiveSnapshotNotFoundError,
+    ReconciliationFactProjection,
+    ReconciliationTiming,
+    SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
+)
 from shared.lineage.schedule import (
     ScheduleLineageEdge,
     deduplicate_schedule_edges,
@@ -68,7 +74,23 @@ ACTIVE_SCHEDULE_METADATA_SQL = f"""
            {dws_timestamp_projection("observed_at")}
     FROM dwp.lineage_schedule_edge
     WHERE is_active = TRUE
-    ORDER BY batch_id, environment, source_profile, observed_at
+"""
+SCHEDULE_RECONCILIATION_PROJECTION_SQL = """
+    SELECT e.source_table, e.target_table,
+           COUNT(e.source_table),
+           COUNT(DISTINCT NULLIF(e.process_name, ''))
+    FROM (
+        SELECT batch_id
+        FROM dwp.lineage_schedule_edge
+        WHERE is_active = TRUE
+          AND batch_id = ?
+        GROUP BY batch_id
+    ) AS b
+    LEFT JOIN dwp.lineage_schedule_edge AS e
+      ON e.batch_id = b.batch_id
+     AND e.is_active = TRUE
+     AND e.environment = ?
+     AND e.source_profile = ?
 """
 DEACTIVATE_SCHEDULE_EDGE_SQL = (
     "UPDATE dwp.lineage_schedule_edge SET is_active = FALSE WHERE is_active = TRUE"
@@ -132,6 +154,18 @@ def _stored_bool(value: object, field_name: str) -> bool:
     if isinstance(value, str) and value.strip().upper() in {"FALSE", "0", "F"}:
         return False
     raise ValueError(f"{field_name} is not a valid boolean")
+
+
+def _stored_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{field_name} is not a valid integer")
+    try:
+        parsed = int(value) if isinstance(value, float) else int(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} is not a valid integer") from exc
+    if isinstance(value, float) and parsed != value:
+        raise ValueError(f"{field_name} is not a valid integer")
+    return parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,8 +439,11 @@ class DWSScheduleLineageStore:
         return self._connection_boundary.connection
 
     @contextmanager
-    def _connection_scope(self) -> Iterator[Any]:
-        with self._connection_boundary._connection_scope() as connection:
+    def _connection_scope(
+        self,
+        timing: ReconciliationTiming | None = None,
+    ) -> Iterator[Any]:
+        with self._connection_boundary._connection_scope(timing) as connection:
             yield connection
 
     @staticmethod
@@ -731,44 +768,172 @@ class DWSScheduleLineageStore:
 
     def get_active_snapshot_metadata(
         self,
+        *,
+        timing: ReconciliationTiming | None = None,
     ) -> DWSScheduleActiveSnapshotMetadata | None:
         """Read compact active provenance without loading schedule edge rows."""
 
-        with self._connection_scope() as connection:
+        resolve_started = perf_counter() if timing is not None else None
+        with self._connection_scope(timing) as connection:
             with self._cursor_scope(connection) as cursor:
-                self._execute(cursor, ACTIVE_SCHEDULE_METADATA_SQL)
-                raw_rows = cursor.fetchall()
+                execute_started = perf_counter() if timing is not None else None
+                try:
+                    self._execute(cursor, ACTIVE_SCHEDULE_METADATA_SQL)
+                finally:
+                    if timing is not None and execute_started is not None:
+                        timing.record_dws_phase(
+                            "schedule",
+                            "execute",
+                            int((perf_counter() - execute_started) * 1000),
+                        )
+                fetch_started = perf_counter() if timing is not None else None
+                try:
+                    raw_rows = cursor.fetchall()
+                finally:
+                    if timing is not None and fetch_started is not None:
+                        timing.record_dws_phase(
+                            "schedule",
+                            "fetch",
+                            int((perf_counter() - fetch_started) * 1000),
+                        )
         if not raw_rows:
+            if timing is not None and resolve_started is not None:
+                timing.schedule_active_batch_resolve_ms += int(
+                    (perf_counter() - resolve_started) * 1000
+                )
             return None
 
-        batch_ids: set[str] = set()
-        scopes: set[tuple[str, str]] = set()
-        observed_values: set[datetime] = set()
-        for raw in raw_rows:
-            values = tuple(raw)
-            if len(values) != 4:
-                raise ValueError("active schedule metadata row has invalid shape")
-            batch_ids.add(_key_text(values[0], "batch_id"))
-            scopes.add(
-                (
-                    _required_text(values[1], "environment"),
-                    _required_text(values[2], "source_profile"),
+        conversion_started = perf_counter() if timing is not None else None
+        try:
+            batch_ids: set[str] = set()
+            scopes: set[tuple[str, str]] = set()
+            observed_values: set[datetime] = set()
+            for raw in raw_rows:
+                values = tuple(raw)
+                if len(values) != 4:
+                    raise ValueError("active schedule metadata row has invalid shape")
+                batch_ids.add(_key_text(values[0], "batch_id"))
+                scopes.add(
+                    (
+                        _required_text(values[1], "environment"),
+                        _required_text(values[2], "source_profile"),
+                    )
                 )
+                observed_values.add(_parse_timestamp(values[3], "observed_at"))
+            if len(batch_ids) != 1:
+                raise ValueError("schedule active rows contain more than one batch")
+            if len(observed_values) != 1:
+                raise ValueError("schedule active rows contain more than one observation")
+            return DWSScheduleActiveSnapshotMetadata(
+                batch_id=next(iter(batch_ids)),
+                snapshot_scope=tuple(sorted(scopes)),
+                observed_at=next(iter(observed_values)),
             )
-            observed_values.add(_parse_timestamp(values[3], "observed_at"))
-        if len(batch_ids) != 1:
-            raise ValueError("schedule active rows contain more than one batch")
-        if len(observed_values) != 1:
-            raise ValueError("schedule active rows contain more than one observation")
-        return DWSScheduleActiveSnapshotMetadata(
-            batch_id=next(iter(batch_ids)),
-            snapshot_scope=tuple(sorted(scopes)),
-            observed_at=next(iter(observed_values)),
-        )
+        finally:
+            if timing is not None and conversion_started is not None:
+                timing.record_dws_phase(
+                    "schedule",
+                    "conversion",
+                    int((perf_counter() - conversion_started) * 1000),
+                )
+            if timing is not None and resolve_started is not None:
+                timing.schedule_active_batch_resolve_ms += int(
+                    (perf_counter() - resolve_started) * 1000
+                )
 
     def get_active_snapshot_scope(self) -> tuple[tuple[str, str], ...]:
         metadata = self.get_active_snapshot_metadata()
         return () if metadata is None else metadata.snapshot_scope
+
+    def read_reconciliation_projection(
+        self,
+        *,
+        batch_id: str,
+        environment: str,
+        source_profile: str,
+        target_tables: Iterable[object] | None = None,
+        timing: ReconciliationTiming | None = None,
+    ) -> tuple[ReconciliationFactProjection, ...]:
+        """Read grouped schedule facts for one fixed active batch and scope."""
+
+        batch_id = _key_text(batch_id, "batch_id")
+        environment = _required_text(environment, "environment")
+        source_profile = _required_text(source_profile, "source_profile")
+        targets = None if target_tables is None else _normalize_target_tables(target_tables)
+        params: list[object] = [batch_id, environment, source_profile]
+        join_target_sql = ""
+        if targets is not None:
+            placeholders = ", ".join("?" for _ in targets)
+            join_target_sql = f" AND e.target_table IN ({placeholders})"
+            params.extend(targets)
+        sql = (
+            SCHEDULE_RECONCILIATION_PROJECTION_SQL
+            + join_target_sql
+            + " GROUP BY e.source_table, e.target_table"
+        )
+        with self._connection_scope(timing) as connection:
+            with self._cursor_scope(connection) as cursor:
+                execute_started = perf_counter() if timing is not None else None
+                try:
+                    self._execute(cursor, sql, params)
+                finally:
+                    if timing is not None and execute_started is not None:
+                        timing.record_dws_phase(
+                            "schedule",
+                            "execute",
+                            int((perf_counter() - execute_started) * 1000),
+                        )
+                fetch_started = perf_counter() if timing is not None else None
+                try:
+                    raw_rows = cursor.fetchall()
+                finally:
+                    if timing is not None and fetch_started is not None:
+                        timing.record_dws_phase(
+                            "schedule",
+                            "fetch",
+                            int((perf_counter() - fetch_started) * 1000),
+                        )
+        if not raw_rows:
+            raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
+
+        conversion_started = perf_counter() if timing is not None else None
+        try:
+            projections: list[ReconciliationFactProjection] = []
+            for raw in raw_rows:
+                values = tuple(raw)
+                if len(values) != 4:
+                    raise ValueError(
+                        "DWS schedule reconciliation projection row has invalid shape"
+                    )
+                source, target = values[0], values[1]
+                fact_count = _stored_int(values[2], "fact_count")
+                provenance_count = _stored_int(values[3], "provenance_count")
+                if source is None and target is None:
+                    if fact_count != 0 or provenance_count != 0:
+                        raise ValueError(
+                            "empty DWS schedule reconciliation projection is invalid"
+                        )
+                    continue
+                if source is None or target is None:
+                    raise ValueError(
+                        "DWS schedule reconciliation projection identity is NULL"
+                    )
+                projections.append(
+                    ReconciliationFactProjection(
+                        source_table=_required_text(source, "source_table"),
+                        target_table=_required_text(target, "target_table"),
+                        fact_count=fact_count,
+                        provenance_count=provenance_count,
+                    )
+                )
+            return tuple(projections)
+        finally:
+            if timing is not None and conversion_started is not None:
+                timing.record_dws_phase(
+                    "schedule",
+                    "conversion",
+                    int((perf_counter() - conversion_started) * 1000),
+                )
 
     def read_rows(
         self,
@@ -811,6 +976,7 @@ DWSScheduleLineageWriter = DWSScheduleLineageStore
 
 __all__ = [
     "ACTIVE_SCHEDULE_METADATA_SQL",
+    "SCHEDULE_RECONCILIATION_PROJECTION_SQL",
     "DWSScheduleActiveSnapshotMetadata",
     "DWSScheduleLineageRow",
     "DWSScheduleLineageStore",

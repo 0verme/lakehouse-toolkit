@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from shared.lineage.domain import LineageEdge
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
+    ReconciliationFactProjection,
     ReconciliationStatus,
     ReconciliationTiming,
     SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
@@ -116,6 +117,58 @@ class FakeScheduleMetadataReader(FakeScheduleReader):
 
     def get_active_snapshot_metadata(self):
         return self.metadata
+
+
+class FakeProjectionReader:
+    def __init__(
+        self,
+        projections: tuple[ReconciliationFactProjection, ...],
+        *,
+        side: str,
+        batch_id: str,
+        scope: tuple[tuple[str, str], ...],
+    ) -> None:
+        self.projections = projections
+        self.side = side
+        self.batch_id = batch_id
+        self.scope = scope
+        self.metadata_calls = 0
+        self.projection_calls: list[tuple[str, str, tuple[str, ...] | None]] = []
+
+    def get_active_snapshot_metadata(self):
+        self.metadata_calls += 1
+        return SimpleNamespace(
+            batch_id=self.batch_id,
+            observed_at=OBSERVED_AT,
+            snapshot_scope=self.scope,
+            is_active=True,
+        )
+
+    def read_reconciliation_projection(
+        self,
+        *,
+        batch_id: str,
+        environment: str,
+        source_profile: str,
+        target_tables: Iterable[object] | None = None,
+        timing: ReconciliationTiming | None = None,
+    ) -> tuple[ReconciliationFactProjection, ...]:
+        self.projection_calls.append(
+            (
+                batch_id,
+                source_profile,
+                None if target_tables is None else tuple(target_tables),
+            )
+        )
+        if timing is not None:
+            timing.record_dws_phase(self.side, "execute", 1)
+        return self.projections
+
+    def read_edges(self, **kwargs):
+        raise AssertionError("projection path must not read full edge rows")
+
+    def read_rows(self, **kwargs):
+        raise AssertionError("projection path must not read full schedule rows")
 
 
 def sql_edge(
@@ -623,6 +676,61 @@ class ReconciliationDomainTests(unittest.TestCase):
 
 
 class ActiveReaderContractTests(unittest.TestCase):
+    def test_projected_reader_uses_one_metadata_read_and_grouped_counts(self):
+        sql_reader = FakeProjectionReader(
+            (
+                ReconciliationFactProjection(
+                    "DWF.A", "DWM.RESULT_A", fact_count=3, provenance_count=2
+                ),
+            ),
+            side="sql",
+            batch_id="batch-sql-projected",
+            scope=((ENVIRONMENT, PROFILE),),
+        )
+        schedule_reader = FakeProjectionReader(
+            (
+                ReconciliationFactProjection(
+                    "DWF.A", "DWM.RESULT_A", fact_count=2, provenance_count=1
+                ),
+            ),
+            side="schedule",
+            batch_id="batch-schedule-projected",
+            scope=((ENVIRONMENT, PROFILE),),
+        )
+        timing = ReconciliationTiming()
+
+        result = reconcile_active_dws_lineage(
+            sql_reader,
+            schedule_reader,
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_tables=("DWS_DWM.RESULT_A",),
+            timing=timing,
+        )
+
+        self.assertEqual(sql_reader.metadata_calls, 1)
+        self.assertEqual(schedule_reader.metadata_calls, 1)
+        self.assertEqual(
+            sql_reader.projection_calls,
+            [("batch-sql-projected", PROFILE, ("DWM.RESULT_A",))],
+        )
+        self.assertEqual(
+            schedule_reader.projection_calls,
+            [("batch-schedule-projected", PROFILE, ("DWM.RESULT_A",))],
+        )
+        row = result.rows[0]
+        self.assertEqual(row.status, ReconciliationStatus.MATCH)
+        self.assertEqual(row.sql_fact_count, 3)
+        self.assertEqual(row.schedule_fact_count, 2)
+        self.assertEqual(row.sql_program_count, 2)
+        self.assertEqual(row.schedule_process_count, 1)
+        self.assertEqual(timing.sql_rows_read, 1)
+        self.assertEqual(timing.sql_fact_rows_read, 3)
+        self.assertEqual(timing.schedule_rows_read, 1)
+        self.assertEqual(timing.schedule_fact_rows_read, 2)
+        self.assertGreaterEqual(timing.sql_execute_ms, 1)
+        self.assertGreaterEqual(timing.schedule_execute_ms, 1)
+
     def test_active_sql_reader_uses_batch_and_active_join_contract(self):
         edge = sql_edge("DWF.A", "DWM.RESULT_A", batch_id="batch-sql")
         reader = FakeSQLReader((edge,))
@@ -841,13 +949,24 @@ class ActiveReaderContractTests(unittest.TestCase):
         self.assertEqual(
             set(timing.as_dict()),
             {
+                "connect_ms",
+                "sql_active_batch_resolve_ms",
+                "sql_execute_ms",
+                "sql_fetch_ms",
+                "sql_conversion_ms",
+                "schedule_active_batch_resolve_ms",
+                "schedule_execute_ms",
+                "schedule_fetch_ms",
+                "schedule_conversion_ms",
                 "sql_target_scoped_read_ms",
                 "schedule_target_scoped_read_ms",
                 "reconciliation_cpu_ms",
                 "suppression_lookup_ms",
                 "total_ms",
                 "sql_rows_read",
+                "sql_fact_rows_read",
                 "schedule_rows_read",
+                "schedule_fact_rows_read",
                 "reconciliation_rows",
             },
         )
