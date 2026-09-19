@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from html import escape
 from io import BytesIO
 from time import perf_counter
@@ -56,6 +57,33 @@ _STATUS_PRIORITY = {
     ReconciliationStatus.SCHEDULE_ONLY: 1,
     ReconciliationStatus.MATCH: 2,
 }
+_NOT_APPLICABLE_LABEL = "—"
+SHOW_SUPPRESSED_OPTION = "show_suppressed"
+SHOW_SELF_REFERENCE_OPTION = "show_self_reference"
+
+
+class ReconciliationRowKind(str, Enum):
+    """Presentation-only classification of one raw reconciliation row.
+
+    The raw ``MATCH`` / ``SQL_ONLY`` / ``SCHEDULE_ONLY`` contract is never
+    changed; this enum only decides whether a row participates in the formal
+    summary and whether the UI expands it as audit evidence.
+    """
+
+    NORMAL = "NORMAL"
+    SUPPRESSED = "SUPPRESSED"
+    SELF_REFERENCE = "SELF_REFERENCE"
+
+
+_PRESENTATION_LABELS = {
+    ReconciliationRowKind.SUPPRESSED: "手工码值/静态来源（不参与对账）",
+    ReconciliationRowKind.SELF_REFERENCE: "自关联（不参与调度对账）",
+}
+_PRESENTATION_PRIORITY = {
+    ReconciliationRowKind.NORMAL: 0,
+    ReconciliationRowKind.SUPPRESSED: 1,
+    ReconciliationRowKind.SELF_REFERENCE: 2,
+}
 _ERROR_MESSAGES = {
     SQL_ACTIVE_SNAPSHOT_NOT_FOUND: "SQL active snapshot 不存在，无法验证该目标。",
     SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND: "Schedule active snapshot 不存在，无法验证该目标。",
@@ -82,15 +110,59 @@ class EnvironmentOption:
         return {"label": self.label, "value": self.value}
 
 
+def _display_status_label(
+    kind: ReconciliationRowKind,
+    status: ReconciliationStatus,
+) -> str:
+    """Return the business label; evidence rows never reuse a diff label."""
+
+    evidence_label = _PRESENTATION_LABELS.get(kind)
+    return evidence_label if evidence_label is not None else status_to_label(status)
+
+
+def _display_schedule_value(
+    kind: ReconciliationRowKind,
+    schedule_configured: bool,
+) -> str:
+    """The schedule side is deliberately not evaluated for evidence rows."""
+
+    if kind is not ReconciliationRowKind.NORMAL:
+        return _NOT_APPLICABLE_LABEL
+    return "是" if schedule_configured else "否"
+
+
 @dataclass(frozen=True, slots=True)
 class ReconciliationRowView:
-    """Safe row projection used by the HTML table."""
+    """Safe row projection used by the HTML table.
+
+    ``kind`` is a presentation classification layered on top of the raw
+    domain status: one row is classified exactly once, and only ``NORMAL``
+    rows participate in the formal summary and target status.
+    """
 
     source_table: str
     sql_actual: bool
     schedule_configured: bool
     status: ReconciliationStatus
-    status_label: str
+    kind: ReconciliationRowKind = ReconciliationRowKind.NORMAL
+
+    @property
+    def is_evidence(self) -> bool:
+        """Return whether this row is expanded audit evidence only."""
+
+        return self.kind is not ReconciliationRowKind.NORMAL
+
+    @property
+    def status_label(self) -> str:
+        return _display_status_label(self.kind, self.status)
+
+    @property
+    def sql_display(self) -> str:
+        return "是" if self.sql_actual else "否"
+
+    @property
+    def schedule_display(self) -> str:
+        return _display_schedule_value(self.kind, self.schedule_configured)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,17 +174,18 @@ class ReconciliationExportRow:
     sql_actual: bool
     schedule_configured: bool
     status: ReconciliationStatus
+    kind: ReconciliationRowKind = ReconciliationRowKind.NORMAL
 
     @property
     def status_label(self) -> str:
-        return status_to_label(self.status)
+        return _display_status_label(self.kind, self.status)
 
     def as_excel_row(self) -> tuple[str, str, str, str, str]:
         return (
             self.target_table,
             self.source_table,
             "是" if self.sql_actual else "否",
-            "是" if self.schedule_configured else "否",
+            _display_schedule_value(self.kind, self.schedule_configured),
             self.status_label,
         )
 
@@ -130,7 +203,12 @@ class ReconciliationSummary:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationViewModel:
-    """Presentation model for exactly one target table."""
+    """Presentation model for exactly one target table.
+
+    ``rows`` keeps every classified row (NORMAL / SUPPRESSED / SELF_REFERENCE)
+    exactly once.  ``summary`` is always the NORMAL-only formal result, while
+    :meth:`visible_rows` only decides which evidence the user expanded.
+    """
 
     target_table: str
     environment: str
@@ -142,6 +220,38 @@ class ReconciliationViewModel:
     status_label: str
     rows: tuple[ReconciliationRowView, ...]
     summary: ReconciliationSummary
+
+    def visible_rows(
+        self,
+        *,
+        show_suppressed: bool = False,
+        show_self_reference: bool = False,
+    ) -> tuple[ReconciliationRowView, ...]:
+        """Return NORMAL rows plus only the evidence the user asked to expand."""
+
+        return tuple(
+            row
+            for row in self.rows
+            if row.kind is ReconciliationRowKind.NORMAL
+            or (row.kind is ReconciliationRowKind.SUPPRESSED and show_suppressed)
+            or (
+                row.kind is ReconciliationRowKind.SELF_REFERENCE and show_self_reference
+            )
+        )
+
+    @property
+    def suppressed_count(self) -> int:
+        """Return the number of suppressed static-source evidence rows."""
+
+        return sum(row.kind is ReconciliationRowKind.SUPPRESSED for row in self.rows)
+
+    @property
+    def self_reference_count(self) -> int:
+        """Return the number of self-reference evidence rows."""
+
+        return sum(
+            row.kind is ReconciliationRowKind.SELF_REFERENCE for row in self.rows
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,25 +319,59 @@ def sort_rows(
     )
 
 
-def filter_suppressed_rows(
-    rows: Iterable[LineageReconciliationRow],
-    suppressed_edge_keys: Iterable[tuple[str, str]],
-) -> tuple[LineageReconciliationRow, ...]:
-    """Hide only SQL_ONLY rows whose exact edge identity is usable."""
+def is_self_reference_row(row: LineageReconciliationRow) -> bool:
+    """Return True when both sides share one comparison-normalized identity."""
 
-    keys = frozenset(suppressed_edge_keys)
-    return tuple(
-        row
-        for row in rows
-        if not (
-            _coerce_status(row.status) is ReconciliationStatus.SQL_ONLY
-            and (row.source_table, row.target_table) in keys
-        )
+    return normalize_lineage_comparison_table_key(
+        row.source_table
+    ) == normalize_lineage_comparison_table_key(row.target_table)
+
+
+def classify_reconciliation_row(
+    row: LineageReconciliationRow,
+    suppressed_edge_keys: Iterable[tuple[str, str]] = (),
+) -> ReconciliationRowKind:
+    """Classify one raw row for presentation without changing its status.
+
+    Only the existing suppression evidence can mark a ``SQL_ONLY`` row as
+    ``SUPPRESSED``; no table-name, schema or keyword guessing is performed.
+    Self-reference wins over suppression so one row is classified at most once.
+    """
+
+    if is_self_reference_row(row):
+        return ReconciliationRowKind.SELF_REFERENCE
+    if (
+        _coerce_status(row.status) is ReconciliationStatus.SQL_ONLY
+        and (row.source_table, row.target_table) in suppressed_edge_keys
+    ):
+        return ReconciliationRowKind.SUPPRESSED
+    return ReconciliationRowKind.NORMAL
+
+
+def resolve_display_options(values: object) -> tuple[bool, bool]:
+    """Resolve checkbox values into ``(show_suppressed, show_self_reference)``.
+
+    Missing or unknown values keep the evidence hidden (fail closed), so the
+    display options can never widen the formal reconciliation result.
+    """
+
+    if values is None:
+        selected: set[object] = set()
+    elif isinstance(values, str):
+        selected = {values}
+    elif isinstance(values, (list, tuple, set, frozenset)):
+        selected = set(cast(Iterable[object], values))
+    else:
+        selected = set()
+    return (
+        SHOW_SUPPRESSED_OPTION in selected,
+        SHOW_SELF_REFERENCE_OPTION in selected,
     )
 
 
-def _export_row_sort_key(row: ReconciliationExportRow) -> tuple[int, str, str]:
+def _export_row_sort_key(row: ReconciliationExportRow) -> tuple[int, int, str, str]:
     return (
+        _PRESENTATION_PRIORITY[row.kind],
         _STATUS_PRIORITY[_coerce_status(row.status)],
         row.target_table,
         row.source_table,
@@ -236,8 +380,16 @@ def _export_row_sort_key(row: ReconciliationExportRow) -> tuple[int, str, str]:
 
 def build_export_rows(
     outcomes: Iterable[TargetReconciliationOutcome],
+    *,
+    show_suppressed: bool = False,
+    show_self_reference: bool = False,
 ) -> tuple[ReconciliationExportRow, ...]:
-    """Flatten successful target view models into the business export projection."""
+    """Flatten the rows visible in the UI into the business export projection.
+
+    Evidence rows are exported only when the matching display option is on,
+    exactly like the HTML table.  The formal reconciliation result is not
+    consulted here, so the export cannot disagree with the page.
+    """
 
     export_rows: list[ReconciliationExportRow] = []
     for outcome in outcomes:
@@ -253,8 +405,12 @@ def build_export_rows(
                 sql_actual=row.sql_actual,
                 schedule_configured=row.schedule_configured,
                 status=row.status,
+                kind=row.kind,
             )
-            for row in view_model.rows
+            for row in view_model.visible_rows(
+                show_suppressed=show_suppressed,
+                show_self_reference=show_self_reference,
+            )
         )
     return tuple(sorted(export_rows, key=_export_row_sort_key))
 
@@ -354,7 +510,12 @@ def build_reconciliation_view_model(
     target_table: str | None = None,
     suppressed_edge_keys: Iterable[tuple[str, str]] | None = None,
 ) -> ReconciliationViewModel:
-    """Convert one formal result into the target-centric UI model."""
+    """Convert one formal result into the target-centric UI model.
+
+    Every raw row is classified exactly once.  The formal summary and target
+    status consume only ``NORMAL`` rows; suppressed static sources and
+    self-reference edges stay available as expandable audit evidence.
+    """
 
     if not isinstance(result, LineageReconciliationResult):
         raise TypeError("result must be a LineageReconciliationResult")
@@ -375,21 +536,30 @@ def build_reconciliation_view_model(
     else:
         raise ValueError("a single target_table is required for the UI model")
 
-    rows = filter_suppressed_rows(
-        (row for row in result.rows if row.target_table == resolved_target),
-        suppressed_edge_keys or (),
+    target_rows = tuple(
+        row for row in result.rows if row.target_table == resolved_target
     )
-    summary = build_summary(sort_rows(rows))
-    target_status = _summary_status(summary)
+    suppressed_keys = frozenset(suppressed_edge_keys or ())
+    ordered_rows = sort_rows(target_rows)
     row_views = tuple(
         ReconciliationRowView(
             source_table=row.source_table,
             sql_actual=row.sql_present,
             schedule_configured=row.schedule_present,
             status=_coerce_status(row.status),
-            status_label=status_to_label(row.status),
+            kind=classify_reconciliation_row(row, suppressed_keys),
         )
-        for row in sort_rows(rows)
+        for row in ordered_rows
+    )
+    summary = build_summary(
+        row
+        for row in ordered_rows
+        if classify_reconciliation_row(row, suppressed_keys)
+        is ReconciliationRowKind.NORMAL
+    )
+    target_status = _summary_status(summary)
+    visible_row_views = tuple(
+        sorted(row_views, key=lambda row: _PRESENTATION_PRIORITY[row.kind])
     )
     return ReconciliationViewModel(
         target_table=resolved_target,
@@ -402,7 +572,7 @@ def build_reconciliation_view_model(
         status_label=(
             "一致" if target_status is TargetSummaryStatus.CONSISTENT else "有差异"
         ),
-        rows=row_views,
+        rows=visible_row_views,
         summary=summary,
     )
 
@@ -596,21 +766,55 @@ def _summary_status(summary: ReconciliationSummary) -> TargetSummaryStatus:
     return TargetSummaryStatus.DIFFERENT
 
 
-def _render_rows_html(view_model: ReconciliationViewModel) -> str:
+def _render_hidden_evidence_note(
+    view_model: ReconciliationViewModel,
+    *,
+    show_suppressed: bool,
+    show_self_reference: bool,
+) -> str:
+    """Render the optional 'hidden evidence' hint for one target result."""
+
+    hidden_parts: list[str] = []
+    if not show_suppressed and view_model.suppressed_count:
+        hidden_parts.append(f"静态来源 {view_model.suppressed_count} 条")
+    if not show_self_reference and view_model.self_reference_count:
+        hidden_parts.append(f"自关联 {view_model.self_reference_count} 条")
+    if not hidden_parts:
+        return ""
+    return (
+        '<p class="lineage-reconciliation-hidden">已隐藏（不参与对账）：'
+        + "，".join(hidden_parts)
+        + "。</p>"
+    )
+
+
+def _render_rows_html(
+    view_model: ReconciliationViewModel,
+    *,
+    show_suppressed: bool = False,
+    show_self_reference: bool = False,
+) -> str:
     rows = []
-    for row in view_model.rows:
-        row_class = (
-            ' class="lineage-reconciliation-diff"'
-            if row.status is not ReconciliationStatus.MATCH
-            else ""
-        )
+    for row in view_model.visible_rows(
+        show_suppressed=show_suppressed,
+        show_self_reference=show_self_reference,
+    ):
+        if row.kind is ReconciliationRowKind.NORMAL:
+            row_class = (
+                ' class="lineage-reconciliation-diff"'
+                if row.status is not ReconciliationStatus.MATCH
+                else ""
+            )
+        else:
+            # Evidence rows must never reuse the actionable-difference styling.
+            row_class = ' class="lineage-reconciliation-evidence"'
         rows.append(
             "<tr"
             + row_class
             + ">"
             + f"<td>{escape(row.source_table)}</td>"
-            + f"<td>{'是' if row.sql_actual else '否'}</td>"
-            + f"<td>{'是' if row.schedule_configured else '否'}</td>"
+            + f"<td>{escape(row.sql_display)}</td>"
+            + f"<td>{escape(row.schedule_display)}</td>"
             + f"<td>{escape(row.status_label)}</td>"
             + "</tr>"
         )
@@ -642,33 +846,67 @@ def _render_rows_html(view_model: ReconciliationViewModel) -> str:
   background: #fff1f0;
   font-weight: 600;
 }
+.lineage-reconciliation-evidence {
+  color: #5b6472;
+  background: #f5f6f8;
+}
+.lineage-reconciliation-hidden {
+  color: #5b6472;
+  font-size: 13px;
+  margin: 4px 0 12px;
+}
 </style>
 <table class="lineage-reconciliation-table">
 <thead><tr><th>表名</th><th>SQL实际调用</th><th>调度已配置</th><th>差异类型</th></tr></thead>
 <tbody>"""
         + "".join(rows)
         + "</tbody></table>"
+        + _render_hidden_evidence_note(
+            view_model,
+            show_suppressed=show_suppressed,
+            show_self_reference=show_self_reference,
+        )
     )
 
 
-def _render_view_model(view_model: ReconciliationViewModel) -> None:
+def _render_view_model(
+    view_model: ReconciliationViewModel,
+    *,
+    show_suppressed: bool = False,
+    show_self_reference: bool = False,
+) -> None:
     from pywebio.output import put_html  # pyright: ignore[reportMissingImports]
 
     from shared.ui.pywebio_helper import put_separator
 
     put_html(f"<h3>目标表：{escape(view_model.target_table)}</h3>")
-    put_html(_render_rows_html(view_model))
+    put_html(
+        _render_rows_html(
+            view_model,
+            show_suppressed=show_suppressed,
+            show_self_reference=show_self_reference,
+        )
+    )
     put_separator("-")
 
 
-def _render_outcome(outcome: TargetReconciliationOutcome) -> None:
+def _render_outcome(
+    outcome: TargetReconciliationOutcome,
+    *,
+    show_suppressed: bool = False,
+    show_self_reference: bool = False,
+) -> None:
     from shared.ui.pywebio_helper import put_red_text
 
     if outcome.error is not None:
         put_red_text(escape(f"目标表：{outcome.target_table}；{outcome.error.message}"))
         return
     if outcome.view_model is not None:
-        _render_view_model(outcome.view_model)
+        _render_view_model(
+            outcome.view_model,
+            show_suppressed=show_suppressed,
+            show_self_reference=show_self_reference,
+        )
 
 
 def main(
@@ -681,6 +919,7 @@ def main(
 
     from pywebio.input import (  # pyright: ignore[reportMissingImports]
         actions,
+        checkbox,
         input_group,
         select,
         textarea,
@@ -719,6 +958,20 @@ def main(
                     rows=6,
                     placeholder="每行输入一个目标表，例如：DWM.RESULT",
                 ),
+                checkbox(
+                    "展示选项",
+                    name="display_options",
+                    options=[
+                        {
+                            "label": "显示手工码值 / 静态来源",
+                            "value": SHOW_SUPPRESSED_OPTION,
+                        },
+                        {
+                            "label": "显示自关联",
+                            "value": SHOW_SELF_REFERENCE_OPTION,
+                        },
+                    ],
+                ),
                 actions(
                     "操作",
                     name="action",
@@ -741,6 +994,12 @@ def main(
     except LineageEnvironmentScopeError as error:
         put_red_text(escape(str(error)))
         return
+
+    # The checkboxes only expand audit evidence; the formal summary stays
+    # NORMAL-only regardless of what the user selects here.
+    show_suppressed, show_self_reference = resolve_display_options(
+        form.get("display_options")
+    )
 
     request_connection: Any | None = None
     connection_error: Exception | None = None
@@ -816,9 +1075,17 @@ def main(
         f"TOTAL `{timing.total_ms} ms`。"
     )
     for outcome in outcomes:
-        _render_outcome(outcome)
+        _render_outcome(
+            outcome,
+            show_suppressed=show_suppressed,
+            show_self_reference=show_self_reference,
+        )
 
-    export_rows = build_export_rows(outcomes)
+    export_rows = build_export_rows(
+        outcomes,
+        show_suppressed=show_suppressed,
+        show_self_reference=show_self_reference,
+    )
     if export_rows:
         put_file(
             build_export_filename(
