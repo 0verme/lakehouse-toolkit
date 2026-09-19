@@ -229,6 +229,48 @@ relation 表，也不通过 subprocess 调用 CLI。结果保留正式 `MATCH`�
 并 fail closed。旧 `tools/integrations/schedule_diff.py` 不作为公开工具入口，文件保留
 用于 rollback。
 
+### 对账证据展示开关
+
+页面在「目标表」`textarea` 下方提供一个 checkbox group，默认两项都不勾选：
+
+```text
+展示选项
+[ ] 显示手工码值 / 静态来源
+[ ] 显示自关联
+```
+
+`build_reconciliation_view_model()` 先对 raw rows 做 presentation 分类，一条 row 只分类
+一次：
+
+```text
+NORMAL         参与正式 summary 与页面默认展示
+SUPPRESSED     命中现有 suppression evidence 的 SQL_ONLY 静态来源
+SELF_REFERENCE comparison normalization 后 source_table == target_table
+```
+
+- `SUPPRESSED` 继续只由现有 suppression evidence 判定（scope、双侧 profile、双侧
+  batch、`classifier_version`、`raw_status == SQL_ONLY`、
+  `reason == NO_INTERNAL_PROGRAM`）；不引入表名、schema 或关键字猜测。
+- `SELF_REFERENCE` 使用 `normalize_lineage_comparison_table_key()` 规范化后的 identity
+  比较，`DM.A -> DM.A` 与 `DWS_DM.A -> DM.A` 都是自关联。
+- 同时命中 suppression 与 self-reference 时 `SELF_REFERENCE` 优先，row 只展示一次。
+
+正式 summary 与 target status **只统计 NORMAL rows**；checkbox 只决定是否展开
+`SUPPRESSED` / `SELF_REFERENCE` 证据，不改变 raw `MATCH` / `SQL_ONLY` /
+`SCHEDULE_ONLY` contract，也不改变 `CONSISTENT` / `DIFFERENT` 判断。
+
+- 默认：`SUPPRESSED` 与 `SELF_REFERENCE` 不显示、不计入 summary。
+- 勾选后：证据行以中性灰色样式展开，`SQL实际调用` 保留真实值，`调度已配置` 显示
+  `—`，`差异类型` 分别显示 `手工码值/静态来源（不参与对账）`、
+  `自关联（不参与调度对账）`；不计入 summary，也不是 `SQL_ONLY` /
+  `SCHEDULE_ONLY` 差异。
+- 默认隐藏且确实存在证据时，目标结果下方提示
+  `已隐藏（不参与对账）：静态来源 N 条，自关联 M 条。`
+
+XLSX 导出与页面使用同一 `visible_rows` 口径：默认不导出两类证据；勾选后按同一业务
+文案与 `—` 导出，列结构保持 `目标表 / 上游表 / SQL实际调用 / 调度已配置 / 对账结果`
+不变。
+
 ## Raw Status 与 Presentation Suppression
 
 Raw reconciliation 的事实三态保持不变：
