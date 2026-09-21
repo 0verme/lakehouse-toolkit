@@ -54,6 +54,12 @@ from shared.lineage.evolution import (
 )
 from shared.lineage.materialization import MaterializationBatch, _canonical_json
 from shared.lineage.physical_dag import ProgramPhysicalDAG
+from shared.lineage.program_boundary import (
+    ProgramBoundaryBusinessEdge,
+    ProgramBoundaryProgram,
+    ProgramBoundaryProjection,
+    build_program_boundary_projections,
+)
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
     ReconciliationFactProjection,
@@ -209,6 +215,17 @@ BUSINESS_RECONCILIATION_PROJECTION_SQL = """
      AND e.is_active = TRUE
      AND e.environment = ?
      AND e.source_profile = ?
+"""
+PROGRAM_BOUNDARY_EDGE_SELECT_SQL = """
+    SELECT e.program_key, e.program_name, e.source_table, e.target_table
+    FROM dwp.lineage_business_edge AS e
+    JOIN dwp.lineage_batch AS b
+      ON b.batch_id = e.batch_id
+     AND b.is_active = TRUE
+    WHERE e.batch_id = ?
+      AND e.is_active = TRUE
+      AND e.environment = ?
+      AND e.source_profile = ?
 """
 ISSUE_SELECT_SQL = f"""
     SELECT i.row_key, i.stable_issue_key, i.environment, i.source_profile,
@@ -467,7 +484,9 @@ def _key_text(value: object, field_name: str) -> str:
 def _normalize_target_tables(
     target_tables: Iterable[object],
 ) -> tuple[str, ...]:
-    values = (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    values = (
+        (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    )
     if not values:
         raise ValueError("target_tables must contain at least one table")
     normalized: list[str] = []
@@ -949,7 +968,9 @@ def _business_row_from_edge(
     pipeline_version: str,
     previous: DWSBusinessEdgeRow | None,
 ) -> DWSBusinessEdgeRow:
-    if not is_business_asset(edge.source_table, environment=edge.environment) or not is_business_asset(
+    if not is_business_asset(
+        edge.source_table, environment=edge.environment
+    ) or not is_business_asset(
         edge.target_table,
         environment=edge.environment,
     ):
@@ -1633,6 +1654,7 @@ class DWSMaterializationStore:
         batch_id: str | None,
         active_only: bool,
         environment: str | None = None,
+        source_profile: str | None = None,
         target_tables: Iterable[object] | None = None,
     ) -> tuple[str, tuple[object, ...]]:
         conditions: list[str] = []
@@ -1656,9 +1678,10 @@ class DWSMaterializationStore:
         if environment is not None:
             conditions.append(f"{alias}.environment = ?")
             params.append(_required_text(environment, "environment"))
-        target_condition, target_params = _target_table_condition(
-            alias, target_tables
-        )
+        if source_profile is not None:
+            conditions.append(f"{alias}.source_profile = ?")
+            params.append(_required_text(source_profile, "source_profile"))
+        target_condition, target_params = _target_table_condition(alias, target_tables)
         if target_condition:
             conditions.append(target_condition)
             params.extend(target_params)
@@ -1673,12 +1696,14 @@ class DWSMaterializationStore:
         batch_id: str | None = None,
         active_only: bool = False,
         environment: str | None = None,
+        source_profile: str | None = None,
     ) -> tuple[tuple[Any, ...], ...]:
         where, params = self._where_for_batch_and_active(
             "s",
             batch_id=batch_id,
             active_only=active_only,
             environment=environment,
+            source_profile=source_profile,
         )
         join = ACTIVE_STATE_JOIN if active_only else ""
         return self._fetch_rows(
@@ -1698,6 +1723,7 @@ class DWSMaterializationStore:
         batch_id: str | None = None,
         active_only: bool = False,
         environment: str | None = None,
+        source_profile: str | None = None,
     ) -> tuple[ProgramState, ...]:
         states: list[ProgramState] = []
         seen_row_keys: set[str] = set()
@@ -1707,6 +1733,7 @@ class DWSMaterializationStore:
             batch_id=batch_id,
             active_only=active_only,
             environment=environment,
+            source_profile=source_profile,
         ):
             row_key = _key_text(
                 _stored_required_text(raw[0], "row_key"),
@@ -1780,6 +1807,89 @@ class DWSMaterializationStore:
             _business_from_row_or_none,
         )
         return tuple(row for row in rows if row is not None)
+
+    def _fetch_program_boundary_edges(
+        self,
+        connection: Any,
+        *,
+        batch_id: str,
+        environment: str,
+        source_profile: str,
+        target_tables: tuple[str, ...] | None,
+        program_keys: tuple[str, ...],
+        timing: ReconciliationTiming | None = None,
+    ) -> tuple[ProgramBoundaryBusinessEdge, ...]:
+        """Read only candidate Program rows and direct target rows.
+
+        For a target-scoped request the predicate is an OR of the requested
+        target and the resolved Program keys.  This is the bounded edge read:
+        it never falls back to the whole active business snapshot merely to
+        discover intermediate nodes.
+        """
+
+        params: list[object] = [batch_id, environment, source_profile]
+        selectors: list[str] = []
+        if target_tables is not None:
+            placeholders = ", ".join("?" for _ in target_tables)
+            selectors.append(f"e.target_table IN ({placeholders})")
+            params.extend(target_tables)
+            if program_keys:
+                key_placeholders = ", ".join("?" for _ in program_keys)
+                selectors.append(f"e.program_key IN ({key_placeholders})")
+                params.extend(program_keys)
+        selection_sql = " AND (" + " OR ".join(selectors) + ")" if selectors else ""
+        sql = PROGRAM_BOUNDARY_EDGE_SELECT_SQL + selection_sql
+        with self._cursor_scope(connection) as cursor:
+            execute_started = perf_counter() if timing is not None else None
+            try:
+                self._execute(cursor, sql, params)
+            finally:
+                if timing is not None and execute_started is not None:
+                    timing.record_dws_phase(
+                        "sql",
+                        "execute",
+                        int((perf_counter() - execute_started) * 1000),
+                    )
+            fetch_started = perf_counter() if timing is not None else None
+            try:
+                raw_rows = cursor.fetchall()
+            finally:
+                if timing is not None and fetch_started is not None:
+                    timing.record_dws_phase(
+                        "sql",
+                        "fetch",
+                        int((perf_counter() - fetch_started) * 1000),
+                    )
+        conversion_started = perf_counter() if timing is not None else None
+        try:
+            values: list[ProgramBoundaryBusinessEdge] = []
+            for raw in raw_rows:
+                row = tuple(raw)
+                if len(row) != 4:
+                    raise ValueError("DWS Program Boundary edge row has invalid shape")
+                values.append(
+                    ProgramBoundaryBusinessEdge(
+                        environment=_stored_required_text(environment, "environment"),
+                        source_profile=_stored_required_text(
+                            source_profile, "source_profile"
+                        ),
+                        program_key=_key_text(
+                            _stored_required_text(row[0], "program_key"),
+                            "program_key",
+                        ),
+                        program_name=_stored_required_text(row[1], "program_name"),
+                        source_table=_stored_required_text(row[2], "source_table"),
+                        target_table=_stored_required_text(row[3], "target_table"),
+                    )
+                )
+            return tuple(values)
+        finally:
+            if timing is not None and conversion_started is not None:
+                timing.record_dws_phase(
+                    "sql",
+                    "conversion",
+                    int((perf_counter() - conversion_started) * 1000),
+                )
 
     def _fetch_issue_rows(
         self,
@@ -2773,6 +2883,7 @@ class DWSMaterializationStore:
         batch_id: str | None = None,
         active_only: bool = False,
         environment: str | None = None,
+        source_profile: str | None = None,
     ) -> tuple[ProgramState, ...]:
         with self._connection_scope() as connection:
             return self._fetch_program_states(
@@ -2780,6 +2891,7 @@ class DWSMaterializationStore:
                 batch_id=batch_id,
                 active_only=active_only,
                 environment=environment,
+                source_profile=source_profile,
             )
 
     def read_physical_edges(
@@ -2795,6 +2907,98 @@ class DWSMaterializationStore:
                 active_only=active_only,
             )
 
+    def read_program_boundary_projection(
+        self,
+        *,
+        batch_id: str,
+        environment: str,
+        source_profile: str,
+        target_tables: Iterable[object] | None = None,
+        timing: ReconciliationTiming | None = None,
+    ) -> tuple[ProgramBoundaryProjection, ...]:
+        """Read a bounded Program Boundary projection for one active scope.
+
+        ProgramState is the small lookup relation for authoritative 005
+        logical targets.  Only the matching Program keys and direct requested
+        target rows are then read from ``lineage_business_edge``; the existing
+        direct fact table is not changed.
+        """
+
+        batch_id = _required_text(batch_id, "batch_id")
+        environment = _required_text(environment, "environment")
+        source_profile = _required_text(source_profile, "source_profile")
+        targets = (
+            None if target_tables is None else _normalize_target_tables(target_tables)
+        )
+        with self._connection_scope(timing) as connection:
+            lookup_started = perf_counter() if timing is not None else None
+            states = self._fetch_program_states(
+                connection,
+                batch_id=batch_id,
+                active_only=True,
+                environment=environment,
+                source_profile=source_profile,
+            )
+            programs = tuple(
+                ProgramBoundaryProgram(
+                    environment=state.environment,
+                    source_profile=state.source_profile,
+                    program_key=program_key(state),
+                    program_name=state.program_name,
+                )
+                for state in states
+            )
+            if timing is not None:
+                timing.sql_program_rows_read += len(programs)
+                if lookup_started is not None:
+                    timing.sql_program_lookup_ms += int(
+                        (perf_counter() - lookup_started) * 1000
+                    )
+
+            candidate_keys = tuple(
+                sorted(
+                    program.program_key
+                    for program in programs
+                    if program.is_authoritative
+                    and (targets is None or program.logical_target in targets)
+                )
+            )
+            edge_started = perf_counter() if timing is not None else None
+            edges = self._fetch_program_boundary_edges(
+                connection,
+                batch_id=batch_id,
+                environment=environment,
+                source_profile=source_profile,
+                target_tables=targets,
+                program_keys=candidate_keys,
+                timing=timing,
+            )
+            if timing is not None:
+                timing.sql_program_edge_rows_read += len(edges)
+                if edge_started is not None:
+                    timing.sql_program_boundary_edge_read_ms += int(
+                        (perf_counter() - edge_started) * 1000
+                    )
+
+        projection_started = perf_counter() if timing is not None else None
+        projections = build_program_boundary_projections(
+            programs,
+            edges,
+            target_tables=targets,
+        )
+        if timing is not None:
+            timing.sql_boundary_projection_rows += sum(
+                len(projection.dependencies) for projection in projections
+            )
+            timing.sql_boundary_fallback_count += sum(
+                projection.used_direct_fallback for projection in projections
+            )
+            if projection_started is not None:
+                timing.sql_boundary_projection_ms += int(
+                    (perf_counter() - projection_started) * 1000
+                )
+        return projections
+
     def read_reconciliation_projection(
         self,
         *,
@@ -2804,12 +3008,14 @@ class DWSMaterializationStore:
         target_tables: Iterable[object] | None = None,
         timing: ReconciliationTiming | None = None,
     ) -> tuple[ReconciliationFactProjection, ...]:
-        """Read grouped business facts for one fixed active batch and scope."""
+        """Read grouped direct business facts for one fixed active batch and scope."""
 
         batch_id = _required_text(batch_id, "batch_id")
         environment = _required_text(environment, "environment")
         source_profile = _required_text(source_profile, "source_profile")
-        targets = None if target_tables is None else _normalize_target_tables(target_tables)
+        targets = (
+            None if target_tables is None else _normalize_target_tables(target_tables)
+        )
         conditions = ["b.batch_id = ?", "b.is_active = TRUE"]
         params: list[object] = [environment, source_profile]
         join_target_sql = ""
@@ -2856,13 +3062,17 @@ class DWSMaterializationStore:
             for raw in raw_rows:
                 values = tuple(raw)
                 if len(values) != 4:
-                    raise ValueError("DWS reconciliation projection row has invalid shape")
+                    raise ValueError(
+                        "DWS reconciliation projection row has invalid shape"
+                    )
                 source, target = values[0], values[1]
                 fact_count = _stored_int(values[2], "fact_count")
                 provenance_count = _stored_int(values[3], "provenance_count")
                 if source is None and target is None:
                     if fact_count != 0 or provenance_count != 0:
-                        raise ValueError("empty DWS reconciliation projection is invalid")
+                        raise ValueError(
+                            "empty DWS reconciliation projection is invalid"
+                        )
                     continue
                 if source is None or target is None:
                     raise ValueError("DWS reconciliation projection identity is NULL")
@@ -3093,6 +3303,7 @@ def _rollback(connection: Any) -> None:
 
 __all__ = [
     "BUSINESS_RECONCILIATION_PROJECTION_SQL",
+    "PROGRAM_BOUNDARY_EDGE_SELECT_SQL",
     "DWSActiveSnapshotMetadata",
     "DWSBusinessEdgeRow",
     "DWSIssueRow",

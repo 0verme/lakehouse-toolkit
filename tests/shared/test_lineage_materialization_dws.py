@@ -10,6 +10,8 @@ from typing import Any
 from shared.lineage.domain import (
     IssueDisposition,
     LineageIssue,
+    PhysicalEdge,
+    PhysicalNode,
     ProgramState,
     ProgramSource,
 )
@@ -200,9 +202,7 @@ class _FakeJDBCCursor:
     def _normalized(sql: str) -> str:
         return " ".join(sql.split())
 
-    def _assert_timestamp_contract(
-        self, sql: str, row: tuple[Any, ...]
-    ) -> None:
+    def _assert_timestamp_contract(self, sql: str, row: tuple[Any, ...]) -> None:
         normalized = self._normalized(sql)
         if normalized not in _WRITE_SQL_BY_NORMALIZED:
             return
@@ -272,9 +272,7 @@ class _FakeJDBCCursor:
         translated = sql.replace(TIMESTAMPTZ_PARAM_SQL, "?")
         return self._cursor.execute(translated, row)
 
-    def executemany(
-        self, sql: str, rows: tuple[tuple[Any, ...], ...]
-    ) -> Any:
+    def executemany(self, sql: str, rows: tuple[tuple[Any, ...], ...]) -> Any:
         materialized_rows = tuple(tuple(row) for row in rows)
         for row in materialized_rows:
             self._assert_timestamp_contract(sql, row)
@@ -400,9 +398,7 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         self.assertIsNone(_timestamp_param(None, "disposition_updated_at"))
 
     def test_parse_datetime_supports_python_310_dws_offsets(self) -> None:
-        expected_utc = datetime(
-            2026, 1, 15, 3, 4, 5, 123456, tzinfo=timezone.utc
-        )
+        expected_utc = datetime(2026, 1, 15, 3, 4, 5, 123456, tzinfo=timezone.utc)
         expected_shanghai = expected_utc.astimezone(timezone(timedelta(hours=8)))
         expected_minus_5 = datetime(
             2026,
@@ -447,9 +443,7 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timezone offset"):
             _parse_datetime("2026-01-15 03:04:05", "observed_at")
 
-        same_instant = _parse_datetime(
-            "2026-01-15 03:04:05.123456+00", "observed_at"
-        )
+        same_instant = _parse_datetime("2026-01-15 03:04:05.123456+00", "observed_at")
         same_instant_local = _parse_datetime(
             "2026-01-15 11:04:05.123456+08", "observed_at"
         )
@@ -505,9 +499,7 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             snapshot_scopes=(("DEV", "fixture"),),
         )
 
-        observed_sql = {
-            " ".join(sql.split()) for _, sql, _ in self.jdbc_boundary.calls
-        }
+        observed_sql = {" ".join(sql.split()) for _, sql, _ in self.jdbc_boundary.calls}
         for sql in _WRITE_SQL:
             with self.subTest(sql=sql.splitlines()[1].strip()):
                 self.assertIn(" ".join(sql.split()), observed_sql)
@@ -530,7 +522,9 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         batch_columns, _ = _insert_contract(batch_call[1])
         self.assertIsNone(batch_call[2][batch_columns.index("published_at")])
 
-    def test_dws_read_round_trip_preserves_aware_instants_for_all_entities(self) -> None:
+    def test_dws_read_round_trip_preserves_aware_instants_for_all_entities(
+        self,
+    ) -> None:
         source = ProgramSource(
             "DEV",
             "fixture",
@@ -747,7 +741,9 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             target_tables=("DWS_DWM.RESULT_A", "DWM.RESULT_A"),
         )
 
-        self.assertEqual({edge.target_table for edge in all_edges}, {"DWM.RESULT_A", "DWM.RESULT_B"})
+        self.assertEqual(
+            {edge.target_table for edge in all_edges}, {"DWM.RESULT_A", "DWM.RESULT_B"}
+        )
         self.assertEqual(
             {(edge.source_table, edge.target_table) for edge in filtered},
             {("DWF.SOURCE_A", "DWM.RESULT_A")},
@@ -800,6 +796,101 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         self.assertIn("target_table IN (?)", projection_sql)
         self.assertIn("batch_id = ?", projection_sql)
         self.assertIn("sql_execute_ms", timing.as_dict())
+
+    def test_program_boundary_projection_reads_program_scoped_edges(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "005:DWM.RESULT:1:00",
+            "synthetic program boundary fixture",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:program-boundary",
+        )
+        names = (
+            "DWF.A",
+            "DWF.B",
+            "DWF.C",
+            "DWF.D",
+            "DWM.TMP_X",
+            "DWM.ABC_Y",
+            "DWM.WORK_Z",
+            "DWM.RESULT",
+        )
+        physical_edges = (
+            PhysicalEdge("DWF.A", "DWM.TMP_X"),
+            PhysicalEdge("DWF.B", "DWM.TMP_X"),
+            PhysicalEdge("DWF.C", "DWM.ABC_Y"),
+            PhysicalEdge("DWM.TMP_X", "DWM.ABC_Y"),
+            PhysicalEdge("DWM.ABC_Y", "DWM.WORK_Z"),
+            PhysicalEdge("DWF.D", "DWM.WORK_Z"),
+            PhysicalEdge("DWM.WORK_Z", "DWM.RESULT"),
+        )
+        dag = ProgramPhysicalDAG(
+            program_source=source,
+            nodes=tuple(PhysicalNode(name, name) for name in names),
+            edges=physical_edges,
+            steps=(),
+            sinks=("DWM.RESULT",),
+            expected_target="DWM.RESULT",
+        )
+        materialization = materialize_program(
+            dag,
+            batch_id="batch-program-boundary",
+            observed_at=OBSERVED_AT,
+        )
+        state = ProgramState(
+            environment="DEV",
+            source_profile="fixture",
+            program_name=source.program_name,
+            source_hash=source.source_hash,
+            first_seen_at=OBSERVED_AT,
+            last_seen_at=OBSERVED_AT,
+            last_changed_at=OBSERVED_AT,
+            batch_id="batch-program-boundary",
+            pipeline_version=LINEAGE_PIPELINE_VERSION,
+        )
+        batch = MaterializationBatch(
+            batch_id="batch-program-boundary",
+            observed_at=OBSERVED_AT,
+            edges=materialization.edges,
+            issues=materialization.issues,
+            program_states=(state,),
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        timing = ReconciliationTiming()
+        projections = self.store.read_program_boundary_projection(
+            batch_id="batch-program-boundary",
+            environment="DEV",
+            source_profile="fixture",
+            target_tables=("DWM.RESULT",),
+            timing=timing,
+        )
+
+        self.assertEqual(len(projections), 1)
+        self.assertFalse(projections[0].used_direct_fallback)
+        self.assertEqual(
+            {dependency.source_table for dependency in projections[0].dependencies},
+            {"DWF.A", "DWF.B", "DWF.C", "DWF.D"},
+        )
+        self.assertEqual(timing.sql_program_rows_read, 1)
+        self.assertEqual(timing.sql_program_edge_rows_read, 7)
+        self.assertEqual(timing.sql_boundary_projection_rows, 4)
+        self.assertEqual(timing.sql_boundary_fallback_count, 0)
+        boundary_sql = next(
+            sql
+            for operation, sql, _ in self.jdbc_boundary.calls
+            if operation == "execute" and "SELECT e.program_key" in sql
+        )
+        self.assertIn("target_table IN (?)", boundary_sql)
+        self.assertIn("program_key IN (?)", boundary_sql)
+        self.assertIn("batch_id = ?", boundary_sql)
+        self.assertNotIn("ORDER BY", boundary_sql.upper())
 
     def test_business_boundary_keeps_technical_physical_rows_out_of_business_rows(
         self,
@@ -899,8 +990,7 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         )
         self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM dwp.lineage_business_edge "
-                "WHERE is_active = TRUE"
+                "SELECT COUNT(*) FROM dwp.lineage_business_edge WHERE is_active = TRUE"
             ).fetchone()[0],
             1,
         )

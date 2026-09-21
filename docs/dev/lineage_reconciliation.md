@@ -344,6 +344,55 @@ ReconciliationSuppressionError
 
 没有 `:` 的 program name 不是 inventory declaration，不提供 inventory 证据。
 
+## Program Boundary Dependency Projection
+
+SQL 侧对账在存在 `read_program_boundary_projection()` 的 DWS reader 时，使用
+**Program Boundary Dependency Projection**；Schedule 侧仍按原有配置 edge 语义读取。
+这只改变 reconciliation 的 SQL read model，不改变 `lineage_business_edge` 的事实
+语义：该表继续保存每个 Program 的 direct business lineage，既不回写 projection，
+也不新增 DWS 表。
+
+对每个请求 target，projection 先读取同一 active batch、environment、SQL
+source profile 下的 `lineage_program_state`，复用 `parse_program_name()` 的固定
+`005` grammar 和 `logical_target`。同一 logical target 下的多个 `program_key`
+组成一个 logical Program group；`program_key` 仍是 raw Program identity，不能
+单独代表 group。随后 DWS edge read 只取：
+
+```text
+requested target 的 direct rows
+OR
+candidate logical Program group 的 program_key rows
+```
+
+因此不会为了一个 target 读取整个 active business snapshot，也不会把两个不同
+Program 的同名 intermediate dataset 做 graph-wide cross join。没有明确 target 时
+才允许显式 scope aggregate read。
+
+对一个无异常的 Program group，使用该 group 的 direct business edges 计算：
+
+```text
+external input = source set - target set
+projected dependency = external input -> authoritative Program Result
+```
+
+authoritative result 只来自已解析的 `005:<qualified_schema_table>:<step>:...`
+logical target；`TMP`、`TEMP`、`STG`、`TEST` 等名称不参与分类或 fallback。DLO/DWO
+仍由既有 Business Asset Boundary 排除，不能通过 projection 绕过边界。Program
+内部存在 cycle、重复 step、缺失 result、edge provenance 不一致、ambiguous
+Program identity，或 Program Result 在后续 step 被再次作为 source 读取时，projection
+会 fail-open 到该 target 的 persisted direct rows，并保留 diagnostic；不会猜测
+新的 Program identity，也不会制造无意义的 `RESULT -> RESULT` dependency。
+
+真实 raw self-reference（规范化后 `source_table == target_table`）仍作为 evidence
+保留，交给 #128 的 presentation contract：默认隐藏，勾选后以中性 evidence 行
+展示，不作为正常 configured dependency 计入 summary。projection 不会因表名含
+`TMP` 等 token 而删除或折叠任何 direct fact。
+
+DWS adapter 的 bounded read 与 projection 计算分别记录 `ReconciliationTiming`
+中的 `sql_program_lookup_ms`、`sql_program_boundary_edge_read_ms`、
+`sql_boundary_projection_ms`、读取行数和 direct-fallback 数；这些是非敏感诊断，
+不包含 SQL 文本、表名列表或凭据。
+
 ## Suppression Audit 与生命周期
 
 纯函数 `classify_reconciliation_suppressions()` 消费
