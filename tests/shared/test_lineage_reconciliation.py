@@ -637,10 +637,7 @@ class ReconciliationDomainTests(unittest.TestCase):
             target_table="DWF.RESULT_A",
         )
         self.assertEqual(
-            [
-                (row.target_table, row.source_table, row.status)
-                for row in result.rows
-            ],
+            [(row.target_table, row.source_table, row.status) for row in result.rows],
             [("DWF.RESULT_A", "DWF.TMP_1", ReconciliationStatus.SCHEDULE_ONLY)],
         )
 
@@ -967,6 +964,13 @@ class ActiveReaderContractTests(unittest.TestCase):
                 "sql_fact_rows_read",
                 "schedule_rows_read",
                 "schedule_fact_rows_read",
+                "sql_program_lookup_ms",
+                "sql_program_boundary_edge_read_ms",
+                "sql_boundary_projection_ms",
+                "sql_program_rows_read",
+                "sql_program_edge_rows_read",
+                "sql_boundary_projection_rows",
+                "sql_boundary_fallback_count",
                 "reconciliation_rows",
             },
         )

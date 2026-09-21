@@ -21,6 +21,7 @@ from shared.lineage.domain import (
     is_business_asset,
     normalize_lineage_comparison_table_key as _normalize_lineage_comparison_table_key,
 )
+from shared.lineage.program_boundary import ProgramBoundaryProjection
 from shared.lineage.schedule import ScheduleLineageEdge
 
 SQL_ACTIVE_SNAPSHOT_NOT_FOUND = "SQL_ACTIVE_SNAPSHOT_NOT_FOUND"
@@ -88,6 +89,13 @@ class ReconciliationTiming:
     schedule_conversion_ms: int = 0
     sql_fact_rows_read: int = 0
     schedule_fact_rows_read: int = 0
+    sql_program_lookup_ms: int = 0
+    sql_program_boundary_edge_read_ms: int = 0
+    sql_boundary_projection_ms: int = 0
+    sql_program_rows_read: int = 0
+    sql_program_edge_rows_read: int = 0
+    sql_boundary_projection_rows: int = 0
+    sql_boundary_fallback_count: int = 0
 
     def record_dws_phase(self, side: str, phase: str, elapsed_ms: int) -> None:
         """Receive phase timings from DWS adapters without exposing SQL values."""
@@ -119,6 +127,13 @@ class ReconciliationTiming:
             "sql_fact_rows_read": self.sql_fact_rows_read,
             "schedule_rows_read": self.schedule_rows_read,
             "schedule_fact_rows_read": self.schedule_fact_rows_read,
+            "sql_program_lookup_ms": self.sql_program_lookup_ms,
+            "sql_program_boundary_edge_read_ms": self.sql_program_boundary_edge_read_ms,
+            "sql_boundary_projection_ms": self.sql_boundary_projection_ms,
+            "sql_program_rows_read": self.sql_program_rows_read,
+            "sql_program_edge_rows_read": self.sql_program_edge_rows_read,
+            "sql_boundary_projection_rows": self.sql_boundary_projection_rows,
+            "sql_boundary_fallback_count": self.sql_boundary_fallback_count,
             "reconciliation_rows": self.reconciliation_rows,
         }
 
@@ -162,7 +177,9 @@ def normalize_lineage_comparison_target_tables(
 ) -> tuple[str, ...]:
     """Normalize targets once and remove duplicates while preserving order."""
 
-    values = (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    values = (
+        (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    )
     if not values:
         raise ValueError("target_tables must contain at least one table")
     normalized: list[str] = []
@@ -576,6 +593,20 @@ class ReconciliationProjectionReader(Protocol):
     ) -> Iterable[ReconciliationFactProjection]: ...
 
 
+class ProgramBoundaryProjectionReader(Protocol):
+    """Optional SQL reader for Program Boundary dependency facts."""
+
+    def read_program_boundary_projection(
+        self,
+        *,
+        batch_id: str,
+        environment: str,
+        source_profile: str,
+        target_tables: Iterable[object] | None = None,
+        timing: ReconciliationTiming | None = None,
+    ) -> Iterable[ProgramBoundaryProjection]: ...
+
+
 def _call_with_optional_timing(
     method: Any,
     kwargs: dict[str, object],
@@ -590,8 +621,7 @@ def _call_with_optional_timing(
     except (TypeError, ValueError):
         return method(**kwargs)
     accepts_timing = any(
-        parameter.name == "timing"
-        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        parameter.name == "timing" or parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
     if accepts_timing:
@@ -700,7 +730,12 @@ def _resolve_active_schedule_snapshot_metadata(
 
     if not isinstance(active_batch_id, str) or not active_batch_id.strip():
         raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
-    return active_batch_id.strip(), declared_observed_at, snapshot_scope, metadata_available
+    return (
+        active_batch_id.strip(),
+        declared_observed_at,
+        snapshot_scope,
+        metadata_available,
+    )
 
 
 def _read_reconciliation_projections(
@@ -731,6 +766,55 @@ def _read_reconciliation_projections(
             "reconciliation projection reader must return grouped fact projections"
         )
     return rows
+
+
+def _read_program_boundary_projections(
+    reader: ProgramBoundaryProjectionReader,
+    *,
+    batch_id: str,
+    environment: str,
+    source_profile: str,
+    target_tables: tuple[str, ...] | None,
+    timing: ReconciliationTiming | None,
+) -> tuple[ReconciliationFactProjection, ...]:
+    kwargs: dict[str, object] = {
+        "batch_id": batch_id,
+        "environment": environment,
+        "source_profile": source_profile,
+    }
+    if target_tables is not None:
+        kwargs["target_tables"] = target_tables
+    projections = tuple(
+        _call_with_optional_timing(
+            reader.read_program_boundary_projection,
+            kwargs,
+            timing,
+        )
+    )
+    if any(not isinstance(value, ProgramBoundaryProjection) for value in projections):
+        raise TypeError(
+            "program boundary reader must return ProgramBoundaryProjection values"
+        )
+    facts = tuple(
+        ReconciliationFactProjection(
+            source_table=dependency.source_table,
+            target_table=dependency.target_table,
+            fact_count=dependency.fact_count,
+            provenance_count=dependency.provenance_count,
+        )
+        for projection in projections
+        for dependency in projection.dependencies
+    )
+    if timing is not None:
+        timing.sql_boundary_projection_rows = max(
+            timing.sql_boundary_projection_rows,
+            len(facts),
+        )
+        timing.sql_boundary_fallback_count = max(
+            timing.sql_boundary_fallback_count,
+            sum(projection.used_direct_fallback for projection in projections),
+        )
+    return facts
 
 
 def read_active_sql_business_snapshot(
@@ -765,9 +849,7 @@ def read_active_sql_business_snapshot(
     }
     if resolved_targets is not None:
         read_kwargs["target_tables"] = resolved_targets
-    edges = tuple(
-        _call_with_optional_timing(reader.read_edges, read_kwargs, timing)
-    )
+    edges = tuple(_call_with_optional_timing(reader.read_edges, read_kwargs, timing))
     if any(not isinstance(edge, LineageEdge) for edge in edges):
         raise TypeError("SQL active reader must return LineageEdge values")
     if any(
@@ -783,8 +865,7 @@ def read_active_sql_business_snapshot(
         and edge.source_profile == scope[1]
         and (
             target_set is None
-            or _normalize_lineage_comparison_table_key(edge.target_table)
-            in target_set
+            or _normalize_lineage_comparison_table_key(edge.target_table) in target_set
         )
     )
     return SQLBusinessLineageSnapshot(
@@ -856,8 +937,7 @@ def read_active_schedule_snapshot(
             raise ActiveSnapshotNotFoundError(SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND)
         if edge.scope == scope and (
             target_set is None
-            or _normalize_lineage_comparison_table_key(edge.target_table)
-            in target_set
+            or _normalize_lineage_comparison_table_key(edge.target_table) in target_set
         ):
             scoped_rows.append(row)
             observed_values.add(observed_at)
@@ -912,8 +992,9 @@ def reconcile_active_dws_lineage(
         schedule_source_profile=schedule_source_profile,
     )
     started = perf_counter() if timing is not None else None
-    sql_projection_reader = getattr(
-        sql_reader, "read_reconciliation_projection", None
+    sql_projection_reader = getattr(sql_reader, "read_reconciliation_projection", None)
+    sql_boundary_projection_reader = getattr(
+        sql_reader, "read_program_boundary_projection", None
     )
     schedule_projection_reader = getattr(
         schedule_reader, "read_reconciliation_projection", None
@@ -927,6 +1008,9 @@ def reconcile_active_dws_lineage(
             getattr(schedule_reader, "get_active_snapshot_metadata", None),
         )
     )
+    use_program_boundary_projection = use_projection and callable(
+        sql_boundary_projection_reader
+    )
 
     if use_projection:
         sql_started = perf_counter() if timing is not None else None
@@ -936,22 +1020,30 @@ def reconcile_active_dws_lineage(
             source_profile=sql_profile,
             timing=timing,
         )
-        sql_projections = _read_reconciliation_projections(
-            sql_reader,  # type: ignore[arg-type]
-            batch_id=sql_batch_id,
-            environment=environment,
-            source_profile=sql_profile,
-            target_tables=resolved_targets,
-            timing=timing,
-        )
+        if use_program_boundary_projection:
+            sql_projections = _read_program_boundary_projections(
+                sql_reader,  # type: ignore[arg-type]
+                batch_id=sql_batch_id,
+                environment=environment,
+                source_profile=sql_profile,
+                target_tables=resolved_targets,
+                timing=timing,
+            )
+        else:
+            sql_projections = _read_reconciliation_projections(
+                sql_reader,  # type: ignore[arg-type]
+                batch_id=sql_batch_id,
+                environment=environment,
+                source_profile=sql_profile,
+                target_tables=resolved_targets,
+                timing=timing,
+            )
         if timing is not None and sql_started is not None:
             timing.sql_target_scoped_read_ms = int(
                 (perf_counter() - sql_started) * 1000
             )
             timing.sql_rows_read = len(sql_projections)
-            timing.sql_fact_rows_read = sum(
-                row.fact_count for row in sql_projections
-            )
+            timing.sql_fact_rows_read = sum(row.fact_count for row in sql_projections)
 
         schedule_started = perf_counter() if timing is not None else None
         schedule_batch_id, schedule_observed_at, _, _ = (
@@ -1197,7 +1289,9 @@ def _result_from_comparison_values(
         sql_source_profile=sql_source_profile,
         schedule_source_profile=schedule_source_profile,
         target_table=(
-            target_tables[0] if target_tables is not None and len(target_tables) == 1 else None
+            target_tables[0]
+            if target_tables is not None and len(target_tables) == 1
+            else None
         ),
         target_tables=target_tables,
     )

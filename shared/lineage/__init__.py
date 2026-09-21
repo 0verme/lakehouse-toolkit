@@ -173,6 +173,14 @@ from .dws_query import (
     LINEAGE_ACTIVE_SNAPSHOT_INVALID,
     LINEAGE_ACTIVE_SNAPSHOT_NOT_FOUND,
 )
+from .program_boundary import (
+    ProgramBoundaryBusinessEdge,
+    ProgramBoundaryDependency,
+    ProgramBoundaryProgram,
+    ProgramBoundaryProjection,
+    build_program_boundary_projections,
+    project_program_boundary_dependencies,
+)
 from .reconciliation import (
     ActiveSnapshotNotFoundError,
     LineageReconciliationError,
@@ -182,6 +190,7 @@ from .reconciliation import (
     LineageReconciliationTargetSummary,
     ReconciliationStatus,
     ReconciliationTargetStatus,
+    ProgramBoundaryProjectionReader,
     ReconciliationProjectionReader,
     ReconciliationTiming,
     SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
@@ -398,6 +407,12 @@ __all__ = [
     "DWSPublishMetrics",
     "DWSPublishResult",
     "DWSPhysicalEdgeRow",
+    "ProgramBoundaryBusinessEdge",
+    "ProgramBoundaryDependency",
+    "ProgramBoundaryProgram",
+    "ProgramBoundaryProjection",
+    "build_program_boundary_projections",
+    "project_program_boundary_dependencies",
     "LINEAGE_ACTIVE_SNAPSHOT_INVALID",
     "LINEAGE_ACTIVE_SNAPSHOT_NOT_FOUND",
     "business_edge_key",
@@ -422,6 +437,7 @@ __all__ = [
     "LineageReconciliationTargetSummary",
     "ReconciliationStatus",
     "ReconciliationTargetStatus",
+    "ProgramBoundaryProjectionReader",
     "ReconciliationProjectionReader",
     "ReconciliationTiming",
     "SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND",
