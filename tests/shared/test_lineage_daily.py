@@ -173,7 +173,9 @@ class LineageDailyDependencyTests(unittest.TestCase):
     def test_sql_failure_skips_suppression_but_schedule_still_runs(self):
         sql_calls: list[str] = []
         schedule_calls: list[str] = []
-        suppression = Mock()
+        suppression = Mock(
+            return_value=SimpleNamespace(affected_targets=())
+        )
         result = self._run(
             sql_runner=failing_runner("SQL", sql_calls, {"DEV214"}),
             schedule_runner=successful_runner("SCHEDULE", schedule_calls),
@@ -231,6 +233,62 @@ class LineageDailyDependencyTests(unittest.TestCase):
             environment.suppression.status, imp_lineage_daily.StepStatus.SKIPPED
         )
         suppression.assert_not_called()
+
+    def test_changed_target_union_is_reconciled_after_suppression(self):
+        calls: list[tuple[str, object]] = []
+
+        def sql(scope):
+            calls.append(("SQL", scope.environment))
+            return SimpleNamespace(
+                batch_id="batch-sql-dev214",
+                affected_targets=("DWM.TARGET_A", "DWM.TARGET_B"),
+            )
+
+        def schedule(scope):
+            calls.append(("SCHEDULE", scope.environment))
+            return SimpleNamespace(
+                batch_id="batch-schedule-dev214",
+                affected_targets=("DWM.TARGET_B", "DWM.TARGET_C"),
+            )
+
+        def suppression(scope):
+            calls.append(("SUPPRESSION", scope.environment))
+            return (
+                SimpleNamespace(
+                    suppression_count=1,
+                    affected_targets=("DWM.TARGET_C", "DWM.TARGET_D"),
+                ),
+            )
+
+        def reconciliation(scope, targets):
+            calls.append(("RECONCILIATION", targets))
+            return SimpleNamespace(rows=("result-a", "result-d"))
+
+        result = imp_lineage_daily.run(
+            (self.dev214,),
+            observed_at=OBSERVED_AT,
+            sql_runner=sql,
+            schedule_runner=schedule,
+            suppression_runner=suppression,
+            reconciliation_runner=reconciliation,
+        )
+
+        environment = result.environments[0]
+        self.assertTrue(environment.succeeded)
+        self.assertEqual(
+            calls,
+            [
+                ("SQL", "DEV214"),
+                ("SCHEDULE", "DEV214"),
+                ("SUPPRESSION", "DEV214"),
+                (
+                    "RECONCILIATION",
+                    ("DWM.TARGET_A", "DWM.TARGET_B", "DWM.TARGET_C", "DWM.TARGET_D"),
+                ),
+            ],
+        )
+        self.assertEqual(environment.reconciliation.rows, 2)
+        self.assertEqual(len(environment.reconciliation.affected_targets), 4)
 
     def test_suppression_failure_marks_environment_failed(self):
         result = imp_lineage_daily.run(
@@ -368,6 +426,29 @@ class LineageDailyDefaultRunnerTests(unittest.TestCase):
             result.environments[0].schedule.batch_id, "batch-schedule-default"
         )
         self.assertEqual(result.environments[0].suppression.rows, 4)
+
+    def test_default_reconciliation_runner_targets_latest_changed_range(self):
+        scope = make_scope("DEV214")
+        expected = SimpleNamespace(rows=("current-row",))
+
+        with patch.object(
+            imp_lineage_daily,
+            "run_reconciliation",
+            return_value=expected,
+        ) as reconcile:
+            result = imp_lineage_daily._build_reconciliation_runner()(
+                scope,
+                ("DWM.TARGET_A", "DWM.TARGET_B"),
+            )
+
+        self.assertIs(result, expected)
+        reconcile.assert_called_once_with(
+            dws_profile="dws_dev214",
+            environment="DEV214",
+            sql_source_profile="sql_dev214",
+            schedule_source_profile="schedule_dev214",
+            target_tables=("DWM.TARGET_A", "DWM.TARGET_B"),
+        )
 
     def test_main_returns_nonzero_for_failed_environment(self):
         code = imp_lineage_daily.main(

@@ -60,6 +60,7 @@ class SuppressionMaterializationSummary:
     actionable_sql_only_count: int
     dry_run: bool
     error: str | None = None
+    affected_targets: tuple[str, ...] = ()
 
 
 ScopeStoreFactory = Callable[[LineageEnvironmentScope], Any]
@@ -215,13 +216,17 @@ def run(
                 sql_store_factory=sql_store_factory,
                 schedule_store_factory=schedule_store_factory,
             )
+            affected_targets: tuple[str, ...] = ()
             if not dry_run:
-                suppression_store_factory(scope).publish(
+                published = suppression_store_factory(scope).publish(
                     suppressions,
                     environment=scope.environment,
                     sql_source_profile=scope.sql_source_profile,
                     schedule_source_profile=scope.schedule_source_profile,
                     observed_at=effective_observed_at,
+                )
+                affected_targets = tuple(
+                    getattr(published, "affected_targets", ())
                 )
         except Exception as error:  # noqa: BLE001 - preserve fail-open per scope
             failure = _describe_failure(error)
@@ -251,6 +256,7 @@ def run(
                 suppressed_count=len(suppressions),
                 actionable_sql_only_count=result.sql_only_count - len(suppressions),
                 dry_run=dry_run,
+                affected_targets=affected_targets,
             )
         )
 
@@ -294,6 +300,7 @@ def _emit_summary(summary: SuppressionMaterializationSummary) -> None:
         f"suppressed_count={summary.suppressed_count}",
         f"actionable_sql_only_count={summary.actionable_sql_only_count}",
         f"dry_run={summary.dry_run}",
+        f"affected_target_count={len(summary.affected_targets)}",
     ]
     if summary.error is not None:
         values.append(f"error={summary.error}")

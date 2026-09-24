@@ -385,6 +385,25 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         self.assertTrue(row.is_active)
         self.assertEqual(self.store.get_active_batch_id(), "batch-schedule-1")
 
+    def test_publish_reports_changed_and_deleted_relationship_targets(self):
+        edge = make_edge(target="DWS_DWM.TARGET_A")
+        first = self.publish((edge,), "batch-schedule-delta-1")
+        repeated = self.publish(
+            (edge,),
+            "batch-schedule-delta-2",
+            observed_at=OBSERVED_AT + timedelta(minutes=1),
+        )
+        deleted = self.publish(
+            (),
+            "batch-schedule-delta-3",
+            observed_at=OBSERVED_AT + timedelta(minutes=2),
+        )
+
+        self.assertEqual(first.affected_targets, ("DWM.TARGET_A",))
+        self.assertEqual(repeated.affected_targets, ())
+        self.assertEqual(deleted.affected_targets, ("DWM.TARGET_A",))
+        self.assertEqual(self.store.read_rows(active_only=True), ())
+
     def _insert_legacy_active_row(self, edge, *, batch_id, source_table, target_table):
         legacy_key = hashlib.sha256(
             (

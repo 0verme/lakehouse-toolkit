@@ -14,6 +14,7 @@ from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
     LineageReconciliationResult,
     ReconciliationStatus,
+    apply_reconciliation_suppressions,
     ScheduleLineageSnapshot,
     SQLBusinessLineageSnapshot,
     TargetSummaryStatus,
@@ -23,6 +24,7 @@ from shared.lineage.reconciliation_suppression import (
     SUPPRESSION_CLASSIFIER_VERSION,
     DWSReconciliationSuppressionRow,
     ReconciliationSuppression,
+    load_usable_suppressed_edge_keys,
     ReconciliationSuppressionReason,
 )
 from shared.lineage.schedule import ScheduleLineageEdge
@@ -256,10 +258,19 @@ def run_with_suppression(
     reader_error: Exception | None = None,
 ):
     reader = _SuppressionReader(rows, error=reader_error)
+    suppressed_edge_keys = load_usable_suppressed_edge_keys(
+        result,
+        reader,
+        target_tables=(result.target_summaries[0].target_table,),
+    )
+    finalized_result = apply_reconciliation_suppressions(
+        result,
+        suppressed_edge_keys,
+    )
     outcomes = reconcile_targets(
         make_scope(),
         (result.target_summaries[0].target_table,),
-        runner=lambda **kwargs: result,
+        runner=lambda **kwargs: finalized_result,
         suppression_store=reader,
     )
     return outcomes[0], reader
@@ -275,6 +286,13 @@ def require_view_model(
 
 def visible_sources(view_model: ReconciliationViewModel) -> list[str]:
     return [row.source_table for row in view_model.visible_rows()]
+
+
+def suppress_result(
+    result: LineageReconciliationResult,
+    *edge_keys: tuple[str, str],
+) -> LineageReconciliationResult:
+    return apply_reconciliation_suppressions(result, edge_keys)
 
 
 class ReconcileSqlScheduleWebTests(unittest.TestCase):
@@ -310,6 +328,10 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         self.assertEqual(
             status_to_label(ReconciliationStatus.SCHEDULE_ONLY),
             "调度已配置但SQL未调用",
+        )
+        self.assertEqual(
+            status_to_label(ReconciliationStatus.SUPPRESSED),
+            "手工码值/静态来源（不参与对账）",
         )
 
     def test_view_model_sorts_differences_first_and_builds_summary(self):
@@ -387,28 +409,28 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             ],
         )
 
-    def test_match_is_not_hidden_by_a_suppression_identity(self):
-        result = make_result()
-
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.A", "DWM.RESULT")},
+    def test_suppression_overrides_match_in_the_final_reconciliation_state(self):
+        result = suppress_result(
+            make_result(),
+            ("DWF.A", "DWM.RESULT"),
         )
 
-        self.assertIn("DWF.A", visible_sources(view_model))
-        matched_row = next(
+        view_model = build_reconciliation_view_model(result)
+
+        suppressed_row = next(
             row for row in view_model.rows if row.source_table == "DWF.A"
         )
-        self.assertIs(matched_row.kind, ReconciliationRowKind.NORMAL)
-        self.assertEqual(view_model.summary.match_count, 1)
+        self.assertIs(suppressed_row.status, ReconciliationStatus.SUPPRESSED)
+        self.assertIs(suppressed_row.kind, ReconciliationRowKind.SUPPRESSED)
+        self.assertEqual(view_model.summary.match_count, 0)
 
-    def test_actionable_sql_only_is_not_hidden_by_another_identity(self):
-        result = make_result()
-
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.A", "DWM.RESULT")},
+    def test_actionable_sql_only_remains_when_another_relationship_is_suppressed(self):
+        result = suppress_result(
+            make_result(),
+            ("DWF.A", "DWM.RESULT"),
         )
+
+        view_model = build_reconciliation_view_model(result)
 
         self.assertIn("DWF.B", visible_sources(view_model))
         actionable_row = next(
@@ -417,20 +439,20 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         self.assertIs(actionable_row.kind, ReconciliationRowKind.NORMAL)
         self.assertEqual(view_model.summary.sql_only_count, 1)
 
-    def test_schedule_only_is_not_hidden_by_a_suppression_identity(self):
-        result = make_result()
-
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.C", "DWM.RESULT")},
+    def test_suppression_overrides_schedule_only_in_the_final_state(self):
+        result = suppress_result(
+            make_result(),
+            ("DWF.C", "DWM.RESULT"),
         )
 
-        self.assertIn("DWF.C", visible_sources(view_model))
+        view_model = build_reconciliation_view_model(result)
+
         schedule_row = next(
             row for row in view_model.rows if row.source_table == "DWF.C"
         )
-        self.assertIs(schedule_row.kind, ReconciliationRowKind.NORMAL)
-        self.assertEqual(view_model.summary.schedule_only_count, 1)
+        self.assertIs(schedule_row.status, ReconciliationStatus.SUPPRESSED)
+        self.assertIs(schedule_row.kind, ReconciliationRowKind.SUPPRESSED)
+        self.assertEqual(view_model.summary.schedule_only_count, 0)
 
     def test_stale_sql_batch_does_not_hide_sql_only(self):
         result = make_result()
@@ -536,12 +558,9 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             [(row.status, row.source_table) for row in export_rows],
         )
 
-    def test_excel_keeps_actionable_sql_only_when_match_identity_is_supplied(self):
-        result = make_result()
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.A", "DWM.RESULT")},
-        )
+    def test_excel_keeps_actionable_sql_only_when_another_identity_is_suppressed(self):
+        result = suppress_result(make_result(), ("DWF.A", "DWM.RESULT"))
+        view_model = build_reconciliation_view_model(result)
         outcome = TargetReconciliationOutcome(
             target_table=view_model.target_table,
             view_model=view_model,
@@ -554,7 +573,7 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             [(row.status, row.source_table) for row in export_rows],
         )
 
-    def test_raw_result_is_not_mutated_by_presentation_filter(self):
+    def test_core_finalization_does_not_mutate_the_raw_result(self):
         result = make_result()
         original_rows = result.rows
         suppression = make_suppression_row(result)
@@ -570,25 +589,23 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             [row.source_table for row in view_model.rows],
         )
 
-    def test_multi_target_suppression_is_independent_by_target(self):
-        first = make_result("DWM.RESULT_A")
-        reader = _SuppressionReader((make_suppression_row(first),))
-
+    def test_multi_target_final_status_is_independent_by_relationship(self):
         outcomes = reconcile_targets(
             make_scope(),
             ("DWM.RESULT_A", "DWM.RESULT_B"),
-            runner=lambda **kwargs: make_batch_result(kwargs["target_tables"]),
-            suppression_store=reader,
+            runner=lambda **kwargs: suppress_result(
+                make_batch_result(kwargs["target_tables"]),
+                ("DWF.B", "DWM.RESULT_A"),
+            ),
         )
 
         self.assertEqual(len(outcomes), 2)
-        self.assertNotIn("DWF.B", visible_sources(require_view_model(outcomes[0])))
-        self.assertIn("DWF.B", visible_sources(require_view_model(outcomes[1])))
-        self.assertEqual(len(reader.calls), 1)
-        self.assertEqual(
-            reader.calls[0]["target_tables"],
-            ("DWM.RESULT_A", "DWM.RESULT_B"),
-        )
+        first = require_view_model(outcomes[0])
+        second = require_view_model(outcomes[1])
+        self.assertEqual(first.suppressed_count, 1)
+        self.assertEqual(first.summary.sql_only_count, 0)
+        self.assertEqual(second.suppressed_count, 0)
+        self.assertEqual(second.summary.sql_only_count, 1)
 
     def test_ui_suppression_reader_is_read_only(self):
         result = make_result()
@@ -603,14 +620,11 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
 
         self.assertTrue(outcomes[0].succeeded)
         self.assertEqual(reader.publish_calls, 0)
-        self.assertEqual(len(reader.calls), 1)
+        self.assertEqual(reader.calls, [])
 
     def test_display_options_never_change_the_formal_summary(self):
-        result = make_evidence_result()
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.B", "DM.A")},
-        )
+        result = suppress_result(make_evidence_result(), ("DWF.B", "DM.A"))
+        view_model = build_reconciliation_view_model(result)
         baseline_summary = view_model.summary
         baseline_status = view_model.status
         baseline_normal = [
@@ -657,14 +671,15 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         )
 
     def test_only_evidence_rows_keep_target_consistent(self):
-        result = make_result("DM.A", sql_sources=("DM.A", "DWF.B"), schedule_sources=())
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.B", "DM.A")},
+        result = suppress_result(
+            make_result("DM.A", sql_sources=("DM.A", "DWF.B"), schedule_sources=()),
+            ("DWF.B", "DM.A"),
         )
+        view_model = build_reconciliation_view_model(result)
 
-        self.assertEqual(result.sql_only_count, 2)
-        self.assertEqual(result.target_summaries[0].sql_only_count, 2)
+        self.assertEqual(result.sql_only_count, 1)
+        self.assertEqual(result.target_summaries[0].sql_only_count, 1)
+        self.assertEqual(result.aggregate_dict()["suppressed"], 1)
         self.assertEqual(view_model.visible_rows(), ())
         self.assertEqual(
             [row.kind for row in view_model.rows],
@@ -728,12 +743,12 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             ReconciliationRowKind.NORMAL,
         )
 
-    def test_self_reference_wins_over_suppression_and_is_shown_once(self):
-        result = make_result("DM.A", sql_sources=("DM.A",), schedule_sources=())
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DM.A", "DM.A")},
+    def test_self_reference_display_classification_keeps_one_final_row(self):
+        result = suppress_result(
+            make_result("DM.A", sql_sources=("DM.A",), schedule_sources=()),
+            ("DM.A", "DM.A"),
         )
+        view_model = build_reconciliation_view_model(result)
 
         self.assertEqual(len(view_model.rows), 1)
         self.assertIs(view_model.rows[0].kind, ReconciliationRowKind.SELF_REFERENCE)
@@ -816,11 +831,8 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         self.assertNotIn('<tr class="lineage-reconciliation-evidence">', html)
 
     def test_evidence_rows_use_neutral_styling_instead_of_diff_red(self):
-        result = make_evidence_result()
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.B", "DM.A")},
-        )
+        result = suppress_result(make_evidence_result(), ("DWF.B", "DM.A"))
+        view_model = build_reconciliation_view_model(result)
 
         html = _render_rows_html(
             view_model,
@@ -834,11 +846,8 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         self.assertNotIn("SQL实际调用但调度未配置", html)
 
     def test_hidden_evidence_hint_reports_only_hidden_kinds(self):
-        result = make_evidence_result()
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.B", "DM.A")},
-        )
+        result = suppress_result(make_evidence_result(), ("DWF.B", "DM.A"))
+        view_model = build_reconciliation_view_model(result)
 
         self.assertIn(
             "已隐藏（不参与对账）：静态来源 1 条，自关联 1 条。",
@@ -914,11 +923,8 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         )
 
     def test_excel_excludes_both_evidence_kinds_by_default(self):
-        result = make_evidence_result()
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.B", "DM.A")},
-        )
+        result = suppress_result(make_evidence_result(), ("DWF.B", "DM.A"))
+        view_model = build_reconciliation_view_model(result)
         outcome = TargetReconciliationOutcome(
             target_table=view_model.target_table,
             view_model=view_model,
@@ -938,11 +944,8 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         )
 
     def test_excel_exports_expanded_evidence_with_presentation_labels(self):
-        result = make_evidence_result()
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.B", "DM.A")},
-        )
+        result = suppress_result(make_evidence_result(), ("DWF.B", "DM.A"))
+        view_model = build_reconciliation_view_model(result)
         outcome = TargetReconciliationOutcome(
             target_table=view_model.target_table,
             view_model=view_model,
@@ -973,11 +976,8 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
         self.assertNotIn("SQL实际调用但调度未配置", flattened)
 
     def test_excel_display_options_are_independent(self):
-        result = make_evidence_result()
-        view_model = build_reconciliation_view_model(
-            result,
-            suppressed_edge_keys={("DWF.B", "DM.A")},
-        )
+        result = suppress_result(make_evidence_result(), ("DWF.B", "DM.A"))
+        view_model = build_reconciliation_view_model(result)
         outcome = TargetReconciliationOutcome(
             target_table=view_model.target_table,
             view_model=view_model,
@@ -1005,15 +1005,13 @@ class ReconcileSqlScheduleWebTests(unittest.TestCase):
             TargetReconciliationOutcome(
                 target_table="DM.A",
                 view_model=build_reconciliation_view_model(
-                    first,
-                    suppressed_edge_keys={("DWF.B", "DM.A")},
+                    suppress_result(first, ("DWF.B", "DM.A")),
                 ),
             ),
             TargetReconciliationOutcome(
                 target_table="DM.B",
                 view_model=build_reconciliation_view_model(
-                    second,
-                    suppressed_edge_keys={("DWF.X", "DM.B")},
+                    suppress_result(second, ("DM.B", "DM.B")),
                 ),
             ),
         )

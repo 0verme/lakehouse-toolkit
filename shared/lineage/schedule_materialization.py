@@ -34,6 +34,7 @@ from shared.lineage.materialization_dws import (
 from shared.lineage.reconciliation import (
     SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
     ActiveSnapshotNotFoundError,
+    changed_reconciliation_targets,
     ReconciliationFactProjection,
     ReconciliationTiming,
 )
@@ -216,6 +217,7 @@ class DWSSchedulePublishResult:
     batch_id: str
     edge_count: int
     previous_batch_id: str | None
+    affected_targets: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -723,6 +725,26 @@ class DWSScheduleLineageStore:
                     complete_snapshot=complete_snapshot,
                     snapshot_scopes=snapshot_scopes,
                 )
+                affected_targets = changed_reconciliation_targets(
+                    (
+                        (
+                            row.environment,
+                            row.source_profile,
+                            row.source_table,
+                            row.target_table,
+                        )
+                        for row in previous_rows
+                    ),
+                    (
+                        (
+                            row.environment,
+                            row.source_profile,
+                            row.source_table,
+                            row.target_table,
+                        )
+                        for row in candidate.rows
+                    ),
+                )
                 if instrumentation is not None:
                     instrumentation.prepared_edge_rows = len(candidate.rows)
                     if prepare_started is not None:
@@ -765,6 +787,7 @@ class DWSScheduleLineageStore:
             batch_id=candidate.batch_id,
             edge_count=len(candidate.rows),
             previous_batch_id=candidate.previous_batch_id,
+            affected_targets=affected_targets,
         )
 
     publish_batch = publish

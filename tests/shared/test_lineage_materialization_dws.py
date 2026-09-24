@@ -695,6 +695,54 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             2,
         )
 
+    def test_publish_reports_only_relationship_targets_changed_or_deleted(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE;",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:affected-target",
+        )
+        first_batch, first_dag = self.make_batch(
+            source,
+            batch_id="batch-dws-delta-1",
+            observed_at=OBSERVED_AT,
+        )
+        first = self.store.publish(
+            first_batch,
+            physical_dags=(first_dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+        repeated_batch, repeated_dag = self.make_batch(
+            source,
+            batch_id="batch-dws-delta-2",
+            observed_at=OBSERVED_AT + timedelta(minutes=1),
+        )
+        repeated = self.store.publish(
+            repeated_batch,
+            physical_dags=(repeated_dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+        deleted = self.store.publish(
+            MaterializationBatch(
+                batch_id="batch-dws-delta-3",
+                observed_at=OBSERVED_AT + timedelta(minutes=2),
+                edges=(),
+                issues=(),
+                program_states=(),
+            ),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertEqual(first.affected_targets, ("DWM.RESULT",))
+        self.assertEqual(repeated.affected_targets, ())
+        self.assertEqual(deleted.affected_targets, ("DWM.RESULT",))
+        self.assertEqual(self.store.read_edges(active_only=True), ())
+
     def test_authoritative_target_resolution_evidence_round_trips_in_dws(self) -> None:
         source = ProgramSource(
             "DEV",

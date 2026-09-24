@@ -184,6 +184,8 @@ from .program_boundary import (
 from .reconciliation import (
     ActiveSnapshotNotFoundError,
     LineageReconciliationError,
+    apply_reconciliation_suppressions,
+    changed_reconciliation_targets,
     LineageReconciliationResult,
     ReconciliationFactProjection,
     LineageReconciliationRow,
@@ -431,6 +433,8 @@ __all__ = [
     "load_lineage_environment_scope_resolver",
     "load_lineage_environment_scopes",
     "LineageReconciliationError",
+    "apply_reconciliation_suppressions",
+    "changed_reconciliation_targets",
     "LineageReconciliationResult",
     "ReconciliationFactProjection",
     "LineageReconciliationRow",
