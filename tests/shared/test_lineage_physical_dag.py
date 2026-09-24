@@ -70,6 +70,140 @@ class PhysicalDAGTests(unittest.TestCase):
         self.assertNotIn("DWS_DWF.TABLE_A", node_names(dag))
         self.assertNotIn("DWS_DWM.TABLE_B", node_names(dag))
 
+    def test_authoritative_result_binds_exact_unqualified_write_target(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DWM.M_YQDKX:1:01",
+            script_code="INSERT INTO M_YQDKX SELECT * FROM DWF.F_A",
+        )
+
+        dag = build_program_physical_dag(source)
+        step = dag.steps[0]
+        edge = dag.edges[0]
+
+        self.assertEqual(source.resolved_target, "DWM.M_YQDKX")
+        self.assertEqual(step.raw_target, "M_YQDKX")
+        self.assertEqual(step.target, "DWM.M_YQDKX")
+        self.assertEqual(step.sources, ("DWF.F_A",))
+        self.assertEqual(dag.edge_pairs, {("DWF.F_A", "DWM.M_YQDKX")})
+        self.assertNotIn(("DWF.F_A", "M_YQDKX"), dag.edge_pairs)
+        self.assertEqual(edge.evidence["raw_target"], "M_YQDKX")
+        self.assertEqual(
+            edge.evidence["target_resolution"],
+            {
+                "mode": "AUTHORITATIVE_EXACT_BASENAME_BINDING",
+                "authoritative_target": "DWM.M_YQDKX",
+            },
+        )
+
+    def test_authoritative_binding_does_not_rewrite_qualified_or_different_targets(
+        self,
+    ):
+        qualified = build_program_physical_dag(
+            program(
+                "INSERT INTO OTHER_SCHEMA.M_YQDKX SELECT * FROM DWF.F_A",
+                expected_target="DWM.M_YQDKX",
+            )
+        )
+        self.assertEqual(qualified.steps[0].target, "OTHER_SCHEMA.M_YQDKX")
+        self.assertEqual(
+            qualified.edge_pairs,
+            {("DWF.F_A", "OTHER_SCHEMA.M_YQDKX")},
+        )
+        self.assertNotIn("target_resolution", qualified.steps[0].evidence)
+
+        different_targets = build_program_physical_dag(
+            program(
+                "INSERT INTO TEMP_YQDKX SELECT * FROM DWF.F_A; "
+                "INSERT INTO OTHER_TABLE SELECT * FROM DWF.F_B; "
+                "INSERT INTO TEMP_CMS_TO_CBS SELECT * FROM DWF.F_C",
+                expected_target="DWM.M_YQDKX",
+            )
+        )
+        self.assertEqual(
+            {step.target for step in different_targets.steps},
+            {"TEMP_YQDKX", "OTHER_TABLE", "TEMP_CMS_TO_CBS"},
+        )
+        self.assertEqual(
+            different_targets.edge_pairs,
+            {
+                ("DWF.F_A", "TEMP_YQDKX"),
+                ("DWF.F_B", "OTHER_TABLE"),
+                ("DWF.F_C", "TEMP_CMS_TO_CBS"),
+            },
+        )
+
+    def test_authoritative_binding_requires_existing_program_result_authority(self):
+        dag = build_program_physical_dag(
+            ProgramSource(
+                environment="DEV",
+                source_profile="fixture",
+                program_name="PROGRAM_WITHOUT_RESULT",
+                script_code="INSERT INTO M_YQDKX SELECT * FROM DWF.F_A",
+            )
+        )
+
+        self.assertEqual(dag.expected_target, None)
+        self.assertEqual(dag.steps[0].raw_target, "M_YQDKX")
+        self.assertEqual(dag.steps[0].target, "M_YQDKX")
+        self.assertEqual(dag.edge_pairs, {("DWF.F_A", "M_YQDKX")})
+
+    def test_explicit_provider_authority_uses_the_same_write_target_binding(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="PROVIDER_PROGRAM",
+            script_code="INSERT INTO M_YQDKX SELECT * FROM DWF.F_A",
+            expected_target="dwm.m_yqdkx",
+        )
+
+        dag = build_program_physical_dag(source)
+
+        self.assertEqual(source.resolved_target, "dwm.m_yqdkx")
+        self.assertEqual(dag.expected_target, "DWM.M_YQDKX")
+        self.assertEqual(dag.steps[0].target, "DWM.M_YQDKX")
+        self.assertEqual(dag.edge_pairs, {("DWF.F_A", "DWM.M_YQDKX")})
+
+    def test_binding_only_changes_write_targets_for_supported_statement_types(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DWM.M_YQDKX:1:01",
+            script_code="""
+                INSERT INTO M_YQDKX SELECT * FROM DWF.F_A;
+                INSERT OVERWRITE TABLE M_YQDKX SELECT * FROM DWF.F_B;
+                UPDATE M_YQDKX SET value = src.value FROM DWF.F_C src;
+                MERGE INTO M_YQDKX USING DWF.F_D ON M_YQDKX.id = DWF.F_D.id
+                    WHEN MATCHED THEN UPDATE SET value = DWF.F_D.value;
+                CREATE TABLE M_YQDKX AS SELECT * FROM DWF.F_E;
+                CREATE TABLE M_YQDKX (id INTEGER);
+                CREATE VIEW M_YQDKX AS SELECT * FROM SOME_UNQUALIFIED_SOURCE;
+            """,
+        )
+
+        dag = build_program_physical_dag(source)
+
+        self.assertEqual(
+            [step.statement_type for step in dag.steps],
+            [
+                "insert",
+                "insert",
+                "update",
+                "merge",
+                "create_table",
+                "create_table",
+                "create_view",
+            ],
+        )
+        self.assertEqual(
+            {step.target for step in dag.steps},
+            {"DWM.M_YQDKX"},
+        )
+        self.assertTrue(all(step.raw_target == "M_YQDKX" for step in dag.steps))
+        self.assertIn("SOME_UNQUALIFIED_SOURCE", node_names(dag))
+        self.assertNotIn("DWM.SOME_UNQUALIFIED_SOURCE", node_names(dag))
+
     def test_core_fixture_keeps_every_program_step_and_tmp_node(self):
         fixture_path = ROOT_DIR / "tests" / "fixtures" / "lineage" / "phase3_program.py"
         dag = build_program_physical_dag(

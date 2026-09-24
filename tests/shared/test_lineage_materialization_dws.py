@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import unittest
@@ -692,6 +693,52 @@ class DWSMaterializationStoreTests(unittest.TestCase):
                 ("batch-dws-1",),
             ).fetchone()[0],
             2,
+        )
+
+    def test_authoritative_target_resolution_evidence_round_trips_in_dws(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "005:DWS_DWM.M_YQDKX:1:01",
+            "INSERT INTO M_YQDKX SELECT * FROM DWF.F_A",
+            source_hash="sha256:authoritative-target-binding",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-authoritative-target-binding",
+            observed_at=OBSERVED_AT,
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        physical = self.store.read_physical_edges(batch_id=batch.batch_id)
+
+        self.assertEqual(len(physical), 1)
+        self.assertEqual(
+            (physical[0].source_table, physical[0].target_table),
+            ("DWF.F_A", "DWM.M_YQDKX"),
+        )
+        evidence = json.loads(physical[0].evidence_json)
+        self.assertEqual(evidence["raw_target"], "M_YQDKX")
+        self.assertEqual(
+            evidence["target_resolution"],
+            {
+                "mode": "AUTHORITATIVE_EXACT_BASENAME_BINDING",
+                "authoritative_target": "DWM.M_YQDKX",
+            },
+        )
+        self.assertEqual(
+            physical[0].evidence_json,
+            json.dumps(
+                evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
 
     def test_business_edge_reads_push_target_predicate_to_dws(self) -> None:

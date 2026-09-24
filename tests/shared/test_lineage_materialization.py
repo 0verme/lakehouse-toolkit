@@ -378,7 +378,9 @@ class LineageMaterializationTests(unittest.TestCase):
         self.assertEqual(source.logical_target, "DWP.TMP_P_REPORT_KYW_LIST")
         self.assertEqual(source.step_seq, 1)
         self.assertEqual(dag.expected_target, "DWP.TMP_P_REPORT_KYW_LIST")
-        self.assertEqual(audit.selected_materialization_target, "DWP.TMP_P_REPORT_KYW_LIST")
+        self.assertEqual(
+            audit.selected_materialization_target, "DWP.TMP_P_REPORT_KYW_LIST"
+        )
         self.assertEqual(
             edge_pairs(result), {("DWF.SOURCE_A", "DWP.TMP_P_REPORT_KYW_LIST")}
         )
@@ -1250,6 +1252,31 @@ class LineageMaterializationTests(unittest.TestCase):
                 else:
                     self.assertEqual(result.edges, ())
 
+    def test_authoritative_target_binding_materializes_business_lineage(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DWM.M_YQDKX:1:01",
+            script_code="INSERT INTO M_YQDKX SELECT * FROM DWF.F_A",
+            source_hash="sha256:authoritative-target-binding",
+        )
+        dag = build_program_physical_dag(source)
+        audit = audit_dag(dag, batch_id="batch-authoritative-target-binding")
+        result = materialize_program(
+            dag,
+            audit_result=audit,
+            batch_id="batch-authoritative-target-binding",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(dag.edge_pairs, {("DWF.F_A", "DWM.M_YQDKX")})
+        self.assertIn("DWF.F_A", audit.target_reachable_nodes)
+        self.assertNotIn(IssueType.ORPHAN_BRANCH, audit.issue_types)
+        self.assertEqual(
+            edge_pairs(result),
+            {("DWF.F_A", "DWM.M_YQDKX")},
+        )
+
     def test_cycle_and_self_reference_have_visited_protection(self):
         cycle = materialize_program(
             build_dag(CYCLE_PROGRAM, expected_target=None),
@@ -1544,7 +1571,9 @@ class SQLiteMaterializationTests(unittest.TestCase):
             connection.close()
 
     def test_legacy_technical_business_rows_are_hidden_from_sqlite_reads(self):
-        dag = build_dag(SINGLE_TMP_PROGRAM, program_name="DEMO_PROGRAM_LEGACY_TECHNICAL")
+        dag = build_dag(
+            SINGLE_TMP_PROGRAM, program_name="DEMO_PROGRAM_LEGACY_TECHNICAL"
+        )
         batch = materialize_batch(
             [audit_dag(dag)], batch_id="batch-legacy-technical", observed_at=OBSERVED_AT
         )

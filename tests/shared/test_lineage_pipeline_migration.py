@@ -20,7 +20,7 @@ from shared.lineage.incremental import SnapshotScope
 from tests.fixtures.lineage.phase7_evolution import source
 
 OBSERVED_AT = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
-STALE_PIPELINE_VERSION = "lineage-pipeline-v8-program-target-hint-selection"
+STALE_PIPELINE_VERSION = "lineage-pipeline-v11-asset-naming-semantics"
 
 
 class PipelineVersionMigrationPreflightTests(unittest.TestCase):
@@ -87,10 +87,7 @@ class PipelineVersionMigrationPreflightTests(unittest.TestCase):
     def _active_program_names(db_path: Path):
         store = SQLiteMaterializationStore(db_path)
         try:
-            return {
-                edge.program_name
-                for edge in store.read_edges(active_only=True)
-            }
+            return {edge.program_name for edge in store.read_edges(active_only=True)}
         finally:
             store.close()
 
@@ -100,6 +97,21 @@ class PipelineVersionMigrationPreflightTests(unittest.TestCase):
             sources = self._seed_snapshot(
                 db_path,
                 stale_profiles=("profile_a", "profile_b"),
+            )
+            previous_states = self._active_states(db_path)
+            self.assertEqual(
+                {state.pipeline_version for state in previous_states.values()},
+                {STALE_PIPELINE_VERSION},
+            )
+            self.assertEqual(
+                {
+                    profile: state.source_hash
+                    for profile, state in previous_states.items()
+                },
+                {
+                    program_source.source_profile: program_source.source_hash
+                    for program_source in sources
+                },
             )
             output = io.StringIO()
             with (
@@ -146,6 +158,21 @@ class PipelineVersionMigrationPreflightTests(unittest.TestCase):
                 self.assertIsNone(store.get_batch_metadata("batch-rejected"))
             finally:
                 store.close()
+            retained_states = self._active_states(db_path)
+            self.assertEqual(
+                {state.pipeline_version for state in retained_states.values()},
+                {STALE_PIPELINE_VERSION},
+            )
+            self.assertEqual(
+                {
+                    profile: state.source_hash
+                    for profile, state in retained_states.items()
+                },
+                {
+                    profile: state.source_hash
+                    for profile, state in previous_states.items()
+                },
+            )
 
     def test_all_stale_scopes_can_migrate_in_one_complete_snapshot(self):
         with TemporaryDirectory() as directory:

@@ -11,7 +11,7 @@ import io
 import re
 import tokenize
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from string import Formatter
 from textwrap import dedent
@@ -85,6 +85,9 @@ _MERGE_TARGET_PATTERN = re.compile(
 _UPDATE_TARGET_PATTERN = re.compile(
     rf"\bUPDATE\s+(?:ONLY\s+)?(?P<target>{_QUALIFIED_IDENTIFIER})",
     re.IGNORECASE,
+)
+_WRITE_STATEMENT_TYPES = frozenset(
+    {"insert", "update", "merge", "create_table", "create_view"}
 )
 _CTE_PATTERN = re.compile(
     rf"(?:\bWITH\b|,)\s*(?:RECURSIVE\s+)?(?P<name>{_IDENTIFIER_PART})"
@@ -183,8 +186,9 @@ class SQLExtractionReason(str, Enum):
 class SQLStep:
     """一个可静态确认的程序 SQL statement。
 
-    ``target`` 与 ``sources`` 都是已复用 legacy normalizer 的名称；``raw_*``
-    只保留 statement 中的标识符 token，方便解释边的来源，不保存整段代码。
+    ``target`` 与 ``sources`` 都是已复用 legacy normalizer 的名称；构建 Physical DAG
+    时 target 可在满足 authoritative exact-basename contract 后绑定到 Program Result。
+    ``raw_*`` 始终只保留 statement 中的标识符 token，方便解释边的来源，不保存整段代码。
     ``statement_index`` 从零开始，按程序中实际提取到的 SQL statement 排序。
     """
 
@@ -1218,6 +1222,9 @@ def _edge_occurrence(
         occurrence["column_number"] = step.column_number
     if step.insert_mode is not None:
         occurrence["insert_mode"] = step.insert_mode
+    target_resolution = step.evidence.get("target_resolution")
+    if isinstance(target_resolution, Mapping):
+        occurrence["target_resolution"] = dict(target_resolution)
     return occurrence
 
 
@@ -1231,6 +1238,47 @@ def _normalized_expected_target(program_source: ProgramSource) -> str | None:
     return normalized or None
 
 
+def _resolve_authoritative_write_target(
+    sql_target: str | None,
+    authoritative_target: str | None,
+) -> str | None:
+    """Bind only an exact unqualified write-target basename to qualified authority."""
+
+    normalized_sql_target = _normalize_asset(sql_target)
+    normalized_authority = _normalize_asset(authoritative_target)
+    if normalized_sql_target is None or normalized_authority is None:
+        return sql_target
+    if "." in normalized_sql_target or normalized_authority.count(".") != 1:
+        return sql_target
+
+    schema, authority_basename = normalized_authority.split(".", 1)
+    if schema and authority_basename == normalized_sql_target:
+        return normalized_authority
+    return sql_target
+
+
+def _bind_authoritative_write_target(
+    step: SQLStep,
+    authoritative_target: str | None,
+) -> SQLStep:
+    if step.statement_type not in _WRITE_STATEMENT_TYPES:
+        return step
+
+    resolved_target = _resolve_authoritative_write_target(
+        step.target,
+        authoritative_target,
+    )
+    if resolved_target is None or resolved_target == step.target:
+        return step
+
+    evidence = dict(step.evidence)
+    evidence["target_resolution"] = {
+        "mode": "AUTHORITATIVE_EXACT_BASENAME_BINDING",
+        "authoritative_target": resolved_target,
+    }
+    return replace(step, target=resolved_target, evidence=evidence)
+
+
 def build_program_physical_dag(
     program_source: ProgramSource,
     *,
@@ -1242,7 +1290,11 @@ def build_program_physical_dag(
         raise TypeError("program_source must be a ProgramSource")
 
     analysis = analyze_sql(program_source.script_code, backend=backend)
-    steps = analysis.steps
+    expected_target = _normalized_expected_target(program_source)
+    steps = tuple(
+        _bind_authoritative_write_target(step, expected_target)
+        for step in analysis.steps
+    )
     nodes: dict[str, PhysicalNode] = {}
     edges: dict[tuple[str, str], PhysicalEdge] = {}
     written_targets: list[str] = []
@@ -1300,7 +1352,6 @@ def build_program_physical_dag(
     sinks = tuple(
         target for target in written_targets if target not in outgoing_sources
     )
-    expected_target = _normalized_expected_target(program_source)
     return ProgramPhysicalDAG(
         program_source=program_source,
         nodes=tuple(nodes.values()),

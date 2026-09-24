@@ -118,15 +118,16 @@ Audit → Materialization 链路，比较 sources、target、statement type、pa
 edge 和 issue 结果。
 
 `LINEAGE_PIPELINE_VERSION` 当前为
-`lineage-pipeline-v11-asset-naming-semantics`。本次（Issue #121）修正的是 core lineage
-的资产语义：`TMP` / `TEMP` / `STG` / `TEST` 命名不再产生 temporary classification，非
-`005` program_name 不再进入 Program Inventory，`DLO`/`DWO` 仍不进入正式 lineage。
-因此同一 source hash 的 v10 facts 必须 coherent rebuild，不能复用旧的 Physical/Business
-projection。`ParserBackend` abstraction、production default 和 downstream adapter 边界
-保持不变；`legacy-parser-v2-relation-context` 只标识该 backend 的修正后 parser
-contract；真正控制持久化事实 cache invalidation 的仍是 pipeline version。未知但语法
-有效的 relation 不因 schema 未登记而删除。shadow backend 的结果不应写入 production
-facts 或 cache。
+`lineage-pipeline-v12-authoritative-target-binding`。Issue #121 将 `TMP` / `TEMP` / `STG` /
+`TEST` 命名从 temporary classification 中移除、收口 `005` Program Inventory，并明确
+`DLO`/`DWO` 不进入正式 lineage；因此同一 source hash 的 v10 facts 必须 coherent rebuild。
+Issue #133 在 parser 确认的 SQLStep write target 上新增窄范围 authority binding：只有
+qualified `ProgramSource.resolved_target` 与 unqualified SQL target 的 canonical basename
+精确一致才绑定。v11 facts 因 target identity 可能改变而必须完整 rebuild；partial replay
+仍由 migration preflight 阻止。`ParserBackend` abstraction、production default 和 parser
+contract 保持不变，binding 在 parser 分析之后的 Physical DAG 层执行；未知但语法有效的
+relation 不因 schema 未登记而删除。shadow backend 的结果不应写入 production facts 或
+cache。
 
 adapter 只增加一次轻量 `SqlAnalysis` 对象和 metadata，不进行第二次 SQL parse，也
 不保存源码。默认 backend 不引入 SQLGlot/SQLLineage；因此预期性能影响为微小的
