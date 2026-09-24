@@ -52,9 +52,14 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v11-asset-naming-semantics`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v12-authoritative-target-binding`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
-bump 到新的语义版本，并在本文记录原因。v11 在 v10 relation-context 的基础上废除
+bump 到新的语义版本，并在本文记录原因。v12 在 v11 上新增 authoritative unqualified
+write-target binding：qualified `ProgramSource.resolved_target` 与 unqualified SQL write
+target 只有在 canonical basename 精确一致时才绑定。相同 `source_hash` 在 v11 下可能
+persist 为 `M_YQDKX`、在 v12 下变为 `DWM.M_YQDKX`，所以所有 v11 active facts 都必须经
+完整快照 rebuild；partial replay 仍由 `PipelineVersionMigrationRequired` preflight 阻止。
+v11 在 v10 relation-context 的基础上废除
 表名式临时表推断、把 Program Inventory 收口为单一 `005` authority，并明确 `DLO`/`DWO`
 不进入正式 lineage；因此所有 v10 active facts 都必须整体 rebuild（partial replay 会被
 preflight 阻止）。v7 在 v6 audit target semantics 的基础上

@@ -25,8 +25,8 @@ physical_dag = build_program_physical_dag(program_source)
 - `edges`：去重后的 `PhysicalEdge` tuple；方向固定为
   `source=upstream`、`target=downstream`；
 - `sinks`：实际写入 target 中出度为零的标准化资产名；
-- `expected_target`：从 `ProgramSource.expected_target` 标准化得到的值，未知时
-  为 `None`。
+- `expected_target`：从 `ProgramSource.resolved_target` 标准化得到的 authority；该 contract
+  优先使用 explicit/provider target，其次使用 canonical program-name target，未知时为 `None`。
 
 `node_map` 和 `edge_pairs` 是只读访问便利属性。图对象不要求严格无环，
 因此可以表达自引用和 cycle。
@@ -104,6 +104,40 @@ normalization 只清理格式，不改写 SQL 中观察到的物理 schema；例
 或 Physical 节点的 canonical 改写。Physical 节点不会用短名 alias 去合并节点，
 否则会错误合并 `ODS.A` 和 `DWM.A`。不同 schema 的资产始终按不同 canonical
 名称保留。
+
+### Authoritative unqualified write-target binding
+
+`build_program_physical_dag` 可以使用已有的 `ProgramSource.resolved_target`，将某个
+SQLStep 的 write target 解析到 qualified Program Result，但只在以下条件同时成立时：
+
+1. authority 是 qualified 的两段名称 `schema.table`；
+2. parser 已确认 SQLStep 有 write target，且 SQL target 自身 unqualified；
+3. 两者 basename 经现有 canonical normalization 后完全一致。
+
+例如：
+
+```text
+program: 005:DWS_DWM.M_YQDKX:1:01
+authority: DWM.M_YQDKX
+SQL: INSERT INTO M_YQDKX ...
+
+raw_target: M_YQDKX
+resolved SQLStep / Physical target: DWM.M_YQDKX
+```
+
+Physical edge evidence 同时保留 `raw_target`，并记录
+`target_resolution.mode = AUTHORITATIVE_EXACT_BASENAME_BINDING`。这一规则仅作用于
+write target，不修改 FROM/JOIN/USING source relations。明确 qualified 的 SQL target
+始终优先于 authority；basename 不一致或不存在 authority 时也保持 SQL target 原样。
+
+```text
+authority DWM.M_YQDKX + target TEMP_YQDKX             => TEMP_YQDKX
+authority DWM.M_YQDKX + target OTHER_TABLE             => OTHER_TABLE
+authority DWM.M_YQDKX + target OTHER_SCHEMA.M_YQDKX    => OTHER_SCHEMA.M_YQDKX
+```
+
+这不是 default schema inference：没有默认 DWM schema、schema whitelist、TMP/TEMP/STG/TEST
+名称 heuristic、suffix matching 或人工 mapping；不对所有 unqualified table 补 schema。
 
 SQL comment 使用共享的 `strip_sql_comments`。该 helper 会忽略引号中的
 `--`、`/*` 文本；SQL literal 还会在 `FROM/JOIN/USING` 扫描前被遮盖。source

@@ -203,6 +203,22 @@ C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe -B -m jobs.crontab.imp_
 `PipelineVersionMigrationRequired` preflight 直接拒绝（不进入 build/publish），这是预期
 保护，不要用 `--limit` 绕过。
 
+### v12：Authoritative unqualified write-target binding（Issue #133）
+
+`LINEAGE_PIPELINE_VERSION` 从 `lineage-pipeline-v11-asset-naming-semantics` 升级到
+`lineage-pipeline-v12-authoritative-target-binding`。qualified authoritative Program Result
+与同 basename 的 unqualified SQL write target 绑定后，Physical / Business target identity
+会变化；例如同一 `source_hash` 在 v11 是 `M_YQDKX`，v12 是 `DWM.M_YQDKX`。因此 v11 active
+ProgramState 必须判 stale 并完整 rebuild，不能复用旧 cache。只处理 exact canonical basename
+match 的 write target，不推断默认 schema；qualified target、basename 不同的 target、source
+relations 均保持原样。
+
+```text
+必须完整重算 SQL lineage，不得使用 --limit；migration preflight 继续阻止 partial replay。
+是否刷新 Schedule / suppression / reconciliation downstream，按日批 orchestration 与验收范围决定；
+不得为本次 target identity 变化修改 Schedule lineage 本身。
+```
+
 黄金样本：
 
 ```text

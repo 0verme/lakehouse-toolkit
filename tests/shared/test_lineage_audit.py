@@ -104,6 +104,21 @@ class LineageAuditTests(unittest.TestCase):
         )
         self.assertEqual(result.orphan_branch_sinks, ())
 
+    def test_authoritative_target_binding_restores_expected_target_reachability(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="005:DWS_DWM.M_YQDKX:1:01",
+            script_code="INSERT INTO M_YQDKX SELECT * FROM DWF.F_A",
+        )
+        dag = build_program_physical_dag(source)
+
+        result = audit_program_physical_dag(dag)
+
+        self.assertIn("DWF.F_A", result.target_reachable_nodes)
+        self.assertIn("DWM.M_YQDKX", result.target_reachable_nodes)
+        self.assertNotIn(IssueType.ORPHAN_BRANCH, result.issue_types)
+
     def test_orphan_branch_is_aggregated_by_terminal_sink(self):
         result = audit_program_physical_dag(build_dag(ORPHAN_BRANCH_PROGRAM))
 
