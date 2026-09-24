@@ -5,6 +5,8 @@ import re
 import unittest
 from pathlib import Path
 
+from shared.lineage.reconciliation_suppression import UPDATE_SUPPRESSION_SQL
+
 ROOT = Path(__file__).resolve().parents[2]
 DDL_PATH = ROOT / "docs" / "research" / "issue-39-dws-materialization-v0.1.sql"
 DOC_PATH = ROOT / "docs" / "research" / "issue-39-dws-materialization-schema.md"
@@ -120,6 +122,24 @@ class DwsSchemaContractTests(unittest.TestCase):
             self.ddl,
         )
         self.assertNotRegex(suppression, r"(?i)\b(?:PRIMARY|UNIQUE|CHECK)\b")
+
+    def test_suppression_writer_never_updates_distribution_or_identity_columns(self):
+        set_clause = UPDATE_SUPPRESSION_SQL.split("SET", 1)[1].split("WHERE", 1)[0]
+        self.assertNotRegex(set_clause, r"(?i)\bsuppression_key\s*=")
+        for field in (
+            "environment",
+            "sql_source_profile",
+            "schedule_source_profile",
+            "source_table",
+            "target_table",
+            "raw_status",
+            "suppression_reason",
+            "sql_batch_id",
+            "schedule_batch_id",
+            "classifier_version",
+        ):
+            with self.subTest(field=field):
+                self.assertNotRegex(set_clause, rf"(?i)\b{field}\s*=")
 
     def test_schedule_edge_preserves_raw_comparison_and_history_contract(self):
         schedule = table_block(self.ddl, "lineage_schedule_edge")

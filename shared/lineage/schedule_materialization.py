@@ -32,10 +32,10 @@ from shared.lineage.materialization_dws import (
     _rollback,
 )
 from shared.lineage.reconciliation import (
+    SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
     ActiveSnapshotNotFoundError,
     ReconciliationFactProjection,
     ReconciliationTiming,
-    SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
 )
 from shared.lineage.schedule import (
     ScheduleLineageEdge,
@@ -127,7 +127,9 @@ def _key_text(value: object, field_name: str) -> str:
 def _normalize_target_tables(
     target_tables: Iterable[object],
 ) -> tuple[str, ...]:
-    values = (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    values = (
+        (target_tables,) if isinstance(target_tables, str) else tuple(target_tables)
+    )
     if not values:
         raise ValueError("target_tables must contain at least one table")
     normalized: list[str] = []
@@ -411,6 +413,19 @@ def _active_batch_id(rows: Iterable[DWSScheduleLineageRow]) -> str | None:
     return next(iter(batch_ids), None)
 
 
+def _validate_previous_row_identity(row: DWSScheduleLineageRow) -> None:
+    """Require an active history row to satisfy the current comparison contract."""
+
+    if row.schedule_edge_key != schedule_edge_key(row.edge):
+        raise ValueError("stored schedule stable identity is inconsistent")
+    if row.row_key != schedule_row_key(row.batch_id, row.schedule_edge_key):
+        raise ValueError("stored schedule row_key is inconsistent")
+    if row.source_table != normalize_schedule_table_key(row.raw_source_table):
+        raise ValueError("stored schedule source comparison identity is inconsistent")
+    if row.target_table != normalize_schedule_table_key(row.raw_target_table):
+        raise ValueError("stored schedule target comparison identity is inconsistent")
+
+
 class DWSScheduleLineageStore:
     """Atomic repository for ``dwp.lineage_schedule_edge``.
 
@@ -535,16 +550,23 @@ class DWSScheduleLineageStore:
             raise ValueError("schedule edge is outside the declared snapshot scope")
 
         previous_by_key: dict[str, DWSScheduleLineageRow] = {}
+        seen_previous_keys: set[str] = set()
         for row in previous_rows:
-            if row.schedule_edge_key in previous_by_key:
+            if row.schedule_edge_key in seen_previous_keys:
                 raise ValueError("active schedule rows contain duplicate identity")
-            if row.schedule_edge_key != schedule_edge_key(row.edge):
-                raise ValueError("stored schedule stable identity is inconsistent")
-            if row.row_key != schedule_row_key(row.batch_id, row.schedule_edge_key):
-                raise ValueError("stored schedule row_key is inconsistent")
+            seen_previous_keys.add(row.schedule_edge_key)
+            try:
+                _validate_previous_row_identity(row)
+            except ValueError:
+                if not (complete_snapshot and row.scope in scopes):
+                    raise
+                # An authoritative complete replacement can retire a legacy row
+                # in its declared scope. It is deliberately excluded from key
+                # matching so its historical identity is never rebased or reused.
+                continue
             previous_by_key[row.schedule_edge_key] = row
         previous_batch_id = _active_batch_id(previous_rows)
-        previous_active_keys = frozenset(previous_by_key)
+        previous_active_keys = frozenset(seen_previous_keys)
 
         incoming_by_key = {edge.schedule_edge_key: edge for edge in incoming}
         prepared: dict[str, DWSScheduleLineageRow] = {}
@@ -823,7 +845,9 @@ class DWSScheduleLineageStore:
             if len(batch_ids) != 1:
                 raise ValueError("schedule active rows contain more than one batch")
             if len(observed_values) != 1:
-                raise ValueError("schedule active rows contain more than one observation")
+                raise ValueError(
+                    "schedule active rows contain more than one observation"
+                )
             return DWSScheduleActiveSnapshotMetadata(
                 batch_id=next(iter(batch_ids)),
                 snapshot_scope=tuple(sorted(scopes)),
@@ -859,7 +883,9 @@ class DWSScheduleLineageStore:
         batch_id = _key_text(batch_id, "batch_id")
         environment = _required_text(environment, "environment")
         source_profile = _required_text(source_profile, "source_profile")
-        targets = None if target_tables is None else _normalize_target_tables(target_tables)
+        targets = (
+            None if target_tables is None else _normalize_target_tables(target_tables)
+        )
         params: list[object] = [batch_id, environment, source_profile]
         join_target_sql = ""
         if targets is not None:
