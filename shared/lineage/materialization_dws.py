@@ -62,6 +62,7 @@ from shared.lineage.program_boundary import (
 )
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
+    changed_reconciliation_targets,
     ReconciliationFactProjection,
     ReconciliationTiming,
     SQL_ACTIVE_SNAPSHOT_NOT_FOUND,
@@ -404,6 +405,7 @@ class DWSPublishResult:
     previous_batch_id: str | None
     program_count: int = 0
     business_edge_count: int = 0
+    affected_targets: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -2698,6 +2700,26 @@ class DWSMaterializationStore:
                     instrumentation.insert_ms = int(
                         (perf_counter() - insert_started) * 1000
                     )
+                affected_targets = changed_reconciliation_targets(
+                    (
+                        (
+                            row.environment,
+                            row.source_profile,
+                            row.source_table,
+                            row.target_table,
+                        )
+                        for row in previous_business
+                    ),
+                    (
+                        (
+                            row.environment,
+                            row.source_profile,
+                            row.source_table,
+                            row.target_table,
+                        )
+                        for row in candidate.business_rows
+                    ),
+                )
                 self._call_stage_hook(stage_hook, "after_candidate_insert")
                 validate_started = (
                     perf_counter() if instrumentation is not None else None
@@ -2738,6 +2760,7 @@ class DWSMaterializationStore:
             previous_batch_id=candidate.previous_batch_id,
             program_count=len(candidate.program_state_rows),
             business_edge_count=len(candidate.business_rows),
+            affected_targets=affected_targets,
         )
 
     publish_batch = publish

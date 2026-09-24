@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from time import perf_counter
@@ -34,6 +34,7 @@ class ReconciliationStatus(str, Enum):
     MATCH = "MATCH"
     SQL_ONLY = "SQL_ONLY"
     SCHEDULE_ONLY = "SCHEDULE_ONLY"
+    SUPPRESSED = "SUPPRESSED"
 
 
 class TargetSummaryStatus(str, Enum):
@@ -172,6 +173,39 @@ def normalize_lineage_comparison_table_key(value: object) -> str:
     return _normalize_lineage_comparison_table_key(value)
 
 
+def changed_reconciliation_targets(
+    previous_relationships: Iterable[tuple[str, str, str, str]],
+    current_relationships: Iterable[tuple[str, str, str, str]],
+) -> tuple[str, ...]:
+    """Return target tables whose current source relationship set changed.
+
+    Each relationship is ``(environment, source_profile, source, target)``.
+    Profiles participate in delta identity, while the returned target set is
+    suitable for a scope-local full reconciliation rebuild.
+    """
+
+    def normalized(
+        values: Iterable[tuple[str, str, str, str]],
+    ) -> set[tuple[str, str, str, str]]:
+        relationships: set[tuple[str, str, str, str]] = set()
+        for value in values:
+            if not isinstance(value, (tuple, list)) or len(value) != 4:
+                raise ValueError("relationships must contain environment/profile/source/target")
+            environment, source_profile, source_table, target_table = value
+            relationships.add(
+                (
+                    _required_text(environment, "environment"),
+                    _required_text(source_profile, "source_profile"),
+                    normalize_lineage_comparison_table_key(source_table),
+                    normalize_lineage_comparison_table_key(target_table),
+                )
+            )
+        return relationships
+
+    changed = normalized(previous_relationships) ^ normalized(current_relationships)
+    return tuple(sorted({relationship[3] for relationship in changed}))
+
+
 def normalize_lineage_comparison_target_tables(
     target_tables: Iterable[object] | str,
 ) -> tuple[str, ...]:
@@ -252,6 +286,7 @@ class LineageReconciliationRow:
     schedule_fact_count: int
     sql_program_count: int = 0
     schedule_process_count: int = 0
+    suppressed: bool = False
 
     def __post_init__(self) -> None:
         _required_text(self.environment, "environment")
@@ -272,7 +307,13 @@ class LineageReconciliationRow:
             self.schedule_present, bool
         ):
             raise TypeError("presence flags must be booleans")
-        status = _resolve_status(self.sql_present, self.schedule_present)
+        if not isinstance(self.suppressed, bool):
+            raise TypeError("suppressed must be a boolean")
+        status = _resolve_status(
+            self.sql_present,
+            self.schedule_present,
+            suppressed=self.suppressed,
+        )
         if not isinstance(self.status, ReconciliationStatus):
             try:
                 object.__setattr__(self, "status", ReconciliationStatus(self.status))
@@ -316,6 +357,7 @@ class LineageReconciliationRow:
             "schedule_fact_count": self.schedule_fact_count,
             "sql_program_count": self.sql_program_count,
             "schedule_process_count": self.schedule_process_count,
+            "suppressed": self.suppressed,
         }
 
 
@@ -530,6 +572,7 @@ class LineageReconciliationResult:
             "match": self.match_count,
             "sql_only": self.sql_only_count,
             "schedule_only": self.schedule_only_count,
+            "suppressed": sum(row.suppressed for row in self.rows),
             "targets": len(self.target_summaries),
             "consistent_targets": self.consistent_target_count,
             "different_targets": self.different_target_count,
@@ -972,6 +1015,7 @@ def reconcile_active_dws_lineage(
     target_table: str | None = None,
     target_tables: Iterable[object] | str | None = None,
     timing: ReconciliationTiming | None = None,
+    suppression_store: Any | None = None,
 ) -> LineageReconciliationResult:
     """Reconcile verified DWS snapshots with one batched target predicate."""
 
@@ -1130,8 +1174,32 @@ def reconcile_active_dws_lineage(
     if timing is not None and cpu_started is not None:
         timing.reconciliation_cpu_ms = int((perf_counter() - cpu_started) * 1000)
         timing.reconciliation_rows = len(result.rows)
-        if started is not None:
-            timing.total_ms = int((perf_counter() - started) * 1000)
+
+    if suppression_store is not None:
+        from shared.lineage.reconciliation_suppression import (
+            load_usable_suppressed_edge_keys,
+        )
+
+        suppression_started = perf_counter() if timing is not None else None
+        suppressed_edge_keys = load_usable_suppressed_edge_keys(
+            result,
+            suppression_store,
+            target_tables=resolved_targets,
+        )
+        if timing is not None and suppression_started is not None:
+            timing.suppression_lookup_ms = int(
+                (perf_counter() - suppression_started) * 1000
+            )
+        apply_started = perf_counter() if timing is not None else None
+        result = apply_reconciliation_suppressions(result, suppressed_edge_keys)
+        if timing is not None and apply_started is not None:
+            timing.reconciliation_cpu_ms += int(
+                (perf_counter() - apply_started) * 1000
+            )
+            timing.reconciliation_rows = len(result.rows)
+
+    if timing is not None and started is not None:
+        timing.total_ms = int((perf_counter() - started) * 1000)
     return result
 
 
@@ -1145,6 +1213,7 @@ def reconcile_lineage_snapshots(
     source_profile: str | None = None,
     target_table: str | None = None,
     target_tables: Iterable[object] | str | None = None,
+    suppressed_edge_keys: Iterable[tuple[str, str]] = (),
 ) -> LineageReconciliationResult:
     """Perform deterministic set reconciliation for one strict environment."""
 
@@ -1212,7 +1281,7 @@ def reconcile_lineage_snapshots(
         aggregate.schedule_fact_count += 1
         aggregate.schedule_processes.add(edge.process_name)
 
-    return _result_from_comparison_values(
+    result = _result_from_comparison_values(
         sql_values,
         schedule_values,
         environment=sql_scope[0],
@@ -1224,6 +1293,7 @@ def reconcile_lineage_snapshots(
         sql_observed_at=sql_snapshot.observed_at,
         schedule_observed_at=schedule_snapshot.observed_at,
     )
+    return apply_reconciliation_suppressions(result, suppressed_edge_keys)
 
 
 @dataclass(slots=True)
@@ -1444,7 +1514,74 @@ def _build_target_summaries(
     return tuple(sorted(summaries, key=lambda item: item.target_table))
 
 
-def _resolve_status(sql_present: bool, schedule_present: bool) -> ReconciliationStatus:
+def apply_reconciliation_suppressions(
+    result: LineageReconciliationResult,
+    suppressed_edge_keys: Iterable[tuple[str, str]],
+) -> LineageReconciliationResult:
+    """Apply current relationship suppression before deriving final statuses.
+
+    This is a pure replacement of the row state, not an extra presentation row.
+    Only relationships already present in SQL or schedule facts are retained;
+    stale suppression keys cannot resurrect deleted relationships.
+    """
+
+    if not isinstance(result, LineageReconciliationResult):
+        raise TypeError("result must be a LineageReconciliationResult")
+    normalized_keys: set[tuple[str, str]] = set()
+    for value in suppressed_edge_keys:
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise ValueError("suppressed edge keys must be source/target pairs")
+        source = normalize_lineage_comparison_table_key(value[0])
+        target = normalize_lineage_comparison_table_key(value[1])
+        normalized_keys.add((source, target))
+
+    rows = tuple(
+        replace(
+            row,
+            suppressed=(row.source_table, row.target_table) in normalized_keys,
+            status=_resolve_status(
+                row.sql_present,
+                row.schedule_present,
+                suppressed=(row.source_table, row.target_table) in normalized_keys,
+            ),
+        )
+        for row in result.rows
+    )
+    if rows == result.rows:
+        return result
+    summaries = _build_target_summaries(
+        rows,
+        environment=result.environment,
+        sql_source_profile=result.sql_source_profile,
+        schedule_source_profile=result.schedule_source_profile,
+        target_table=None,
+        target_tables=(summary.target_table for summary in result.target_summaries),
+    )
+    return LineageReconciliationResult(
+        environment=result.environment,
+        sql_source_profile=result.sql_source_profile,
+        schedule_source_profile=result.schedule_source_profile,
+        rows=rows,
+        target_summaries=summaries,
+        sql_batch_id=result.sql_batch_id,
+        schedule_batch_id=result.schedule_batch_id,
+        sql_observed_at=result.sql_observed_at,
+        schedule_observed_at=result.schedule_observed_at,
+        sql_edge_count=result.sql_edge_count,
+        schedule_edge_count=result.schedule_edge_count,
+    )
+
+
+def _resolve_status(
+    sql_present: bool,
+    schedule_present: bool,
+    *,
+    suppressed: bool = False,
+) -> ReconciliationStatus:
+    if suppressed:
+        if not sql_present and not schedule_present:
+            raise ValueError("suppressed relationship must exist in current facts")
+        return ReconciliationStatus.SUPPRESSED
     if sql_present and schedule_present:
         return ReconciliationStatus.MATCH
     if sql_present:
@@ -1545,6 +1682,8 @@ def _timestamp_value(value: datetime | None) -> str | None:
 __all__ = [
     "ActiveSnapshotNotFoundError",
     "LineageReconciliationError",
+    "apply_reconciliation_suppressions",
+    "changed_reconciliation_targets",
     "LineageReconciliationResult",
     "ReconciliationFactProjection",
     "LineageReconciliationRow",

@@ -48,7 +48,7 @@ guessing 和 `value.replace("DWS_", "")`。该 helper 不调用来改写物理
 
 ## Row Status
 
-每个业务 table edge 固定为三态：
+未应用 suppression 时，每个业务 table edge 的原始比较固定为三态：
 
 | Status | 含义 |
 | --- | --- |
@@ -56,8 +56,9 @@ guessing 和 `value.replace("DWS_", "")`。该 helper 不调用来改写物理
 | `SQL_ONLY` | SQL 实际调用但调度未配置 |
 | `SCHEDULE_ONLY` | 调度已配置但 SQL 未调用 |
 
-只使用 qualified `schema.table` identity。相同 basename 的不同 schema，例如
-`SCHEMA_A.TABLE_X` 与 `SCHEMA_B.TABLE_X`，永远是不同 edge。
+有效 suppression evidence 会将对应当前关系的最终 status 覆盖为 `SUPPRESSED`；suppression
+不增加第二条 edge。只使用 qualified `schema.table` identity。相同 basename 的不同 schema，
+例如 `SCHEMA_A.TABLE_X` 与 `SCHEMA_B.TABLE_X`，永远是不同 edge。
 
 DLO/DWO/TMP technical-only endpoint 不会由 reconciliation 从 physical facts 中
 重新引入。SQL reader 只读取 `lineage_business_edge`；schedule technical-only
@@ -197,8 +198,8 @@ DEMO_DWF.C         NO           YES         SCHEDULE_ONLY
 
 不带 `--target` 时 `table` 输出只给整个 scope 的 aggregate，避免默认把全量真实
 identity 打到日志；`json` 和 `csv` 可用于显式本地 report/artifact。全 scope aggregate
-包括 environment、SQL/Schedule 两侧 profile、edge 数、row 数、三态计数、target
-数、consistent/different target 数、两个 batch id 和 elapsed time。JSON 顶层与每个
+包括 environment、SQL/Schedule 两侧 profile、edge 数、row 数、三态计数与 `suppressed`
+计数、target 数、consistent/different target 数、两个 batch id 和 elapsed time。JSON 顶层与每个
 row/target summary 都使用 `sql_source_profile` 和 `schedule_source_profile`；CSV
 每行也同时输出这两个字段，不再输出单一 `SOURCE_PROFILE`。
 
@@ -224,10 +225,10 @@ resolver 和 daily job 在缺少或结构非法时返回 `LINEAGE_SCOPE_CONFIG_I
 
 每个目标表独立调用 `tools.lineage.reconcile_sql_schedule.run()`，该函数继续进入
 `reconcile_active_dws_lineage()`。页面不读取源 metadata、不解析 SQL、不读取旧调度
-relation 表，也不通过 subprocess 调用 CLI。结果保留正式 `MATCH`、`SQL_ONLY`、
-`SCHEDULE_ONLY` status，并将差异行优先展示；缺少任一 active snapshot 时保留正式错误码
-并 fail closed。旧 `tools/integrations/schedule_diff.py` 不作为公开工具入口，文件保留
-用于 rollback。
+relation 表，也不通过 subprocess 调用 CLI。核心先比较 `MATCH`、`SQL_ONLY`、
+`SCHEDULE_ONLY`，再将有效 suppression 应用为唯一的关系级 `SUPPRESSED` 最终状态；差异行
+优先展示。缺少任一 active snapshot 时保留正式错误码并 fail closed。旧
+`tools/integrations/schedule_diff.py` 不作为公开工具入口，文件保留用于 rollback。
 
 ### 对账证据展示开关
 
@@ -239,25 +240,25 @@ relation 表，也不通过 subprocess 调用 CLI。结果保留正式 `MATCH`�
 [ ] 显示自关联
 ```
 
-`build_reconciliation_view_model()` 先对 raw rows 做 presentation 分类，一条 row 只分类
-一次：
+`build_reconciliation_view_model()` 消费核心已完成 suppression 的 rows，再对每条 row 做
+presentation 分类，一条 row 只分类一次：
 
 ```text
 NORMAL         参与正式 summary 与页面默认展示
-SUPPRESSED     命中现有 suppression evidence 的 SQL_ONLY 静态来源
+SUPPRESSED     核心最终状态为 SUPPRESSED 的关系级 suppression evidence
 SELF_REFERENCE comparison normalization 后 source_table == target_table
 ```
 
-- `SUPPRESSED` 继续只由现有 suppression evidence 判定（scope、双侧 profile、双侧
-  batch、`classifier_version`、`raw_status == SQL_ONLY`、
-  `reason == NO_INTERNAL_PROGRAM`）；不引入表名、schema 或关键字猜测。
+- 核心只接受 scope、双侧 profile、双侧 batch、`classifier_version`、
+  `raw_status == SQL_ONLY`、`reason == NO_INTERNAL_PROGRAM` 全部匹配的现有 suppression
+  evidence；不引入表名、schema 或关键字猜测。
 - `SELF_REFERENCE` 使用 `normalize_lineage_comparison_table_key()` 规范化后的 identity
   比较，`DM.A -> DM.A` 与 `DWS_DM.A -> DM.A` 都是自关联。
 - 同时命中 suppression 与 self-reference 时 `SELF_REFERENCE` 优先，row 只展示一次。
 
 正式 summary 与 target status **只统计 NORMAL rows**；checkbox 只决定是否展开
-`SUPPRESSED` / `SELF_REFERENCE` 证据，不改变 raw `MATCH` / `SQL_ONLY` /
-`SCHEDULE_ONLY` contract，也不改变 `CONSISTENT` / `DIFFERENT` 判断。
+`SUPPRESSED` / `SELF_REFERENCE` 证据，不重新计算或覆盖核心最终状态，也不改变
+`CONSISTENT` / `DIFFERENT` 判断。
 
 - 默认：`SUPPRESSED` 与 `SELF_REFERENCE` 不显示、不计入 summary。
 - 勾选后：证据行以中性灰色样式展开，`SQL实际调用` 保留真实值，`调度已配置` 显示
@@ -271,16 +272,17 @@ XLSX 导出与页面使用同一 `visible_rows` 口径：默认不导出两类�
 文案与 `—` 导出，列结构保持 `目标表 / 上游表 / SQL实际调用 / 调度已配置 / 对账结果`
 不变。
 
-## Raw Status 与 Presentation Suppression
+## Raw Fact Status 与最终 Suppression Status
 
-Raw reconciliation 的事实三态保持不变：
+未应用 suppression 前，raw reconciliation 的事实三态为：
 
 - `MATCH`：SQL 与 Schedule 都存在；
 - `SQL_ONLY`：SQL 实际存在、Schedule 未配置；
 - `SCHEDULE_ONLY`：Schedule 存在、SQL 未观察到。
 
-`NO_INTERNAL_PRODUCER` 不是第四个 `ReconciliationStatus`，而是只附着在原始
-`SQL_ONLY` 之上的 Presentation Suppression classification。它只能表示：在本次
+`NO_INTERNAL_PROGRAM` 是只附着在原始 `SQL_ONLY` 之上的 suppression classifier reason；
+只有全部 provenance 条件通过校验后，它才把该关系的最终 `ReconciliationStatus` 置为第四态
+`SUPPRESSED`。它只能表示：在本次
 `environment + sql_source_profile + schedule_source_profile` reconciliation scope
 的已验证 active snapshots 中，没有观察到任何生产该 source 的内部 business edge：
 
@@ -290,7 +292,7 @@ AND
 not exists SQL edge       X -> SOURCE
 AND
 not exists Schedule edge  Y -> SOURCE
-=> suppression_reason = NO_INTERNAL_PRODUCER
+=> suppression_reason = NO_INTERNAL_PROGRAM
 ```
 
 producer 不要求与当前 target 关联；只要 scope 内存在 `X -> SOURCE`，就不能 suppression。
@@ -301,7 +303,7 @@ endpoint 仍由既有 business reconciliation boundary 负责，classifier 不�
 
 **absence of producer != proof of manual table**。该 classification 不声称 source
 是手工维护表、码值表或参考表，只记录当前 scope 内没有观察到内部 producer。
-`MATCH` 与 `SCHEDULE_ONLY` 永不 suppression；有内部 SQL/Schedule producer 的
+classifier 不 suppression `MATCH` 与 `SCHEDULE_ONLY`；有内部 SQL/Schedule producer 的
 `SQL_ONLY` 仍然是 actionable SQL_ONLY。
 
 ### Program Inventory 契约
@@ -440,21 +442,32 @@ UI renderer 不能执行 DWS `INSERT`。
 "C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_daily
 ```
 
+Linux cron 继续使用相同 module entrypoint，不要求新增包装脚本或改变已有 Python 参数；部署时
+替换仓库、解释器和日志路径：
+
+```cron
+0 2 * * * cd /path/to/lakehouse-toolkit && /path/to/venv/bin/python -m jobs.crontab.imp_lineage_daily >> /path/to/log/imp_lineage_daily.log 2>&1
+```
+
 只运行一个已配置 environment：
 
 ```text
 "C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe" -m jobs.crontab.imp_lineage_daily --environment DEV214
 ```
 
-依赖关系固定为 SQL 与 Schedule 两个 sibling 都成功后才执行 Suppression：
+依赖关系固定为 SQL 与 Schedule 两个 sibling 都成功后才执行 Suppression；三者全部成功后，
+日批合并三个 publish 返回的 affected targets，对这些 targets 逐个执行局部全量 reconciliation：
 
 ```text
 SQL lineage ─────┐
-                 ├─ Suppression materialization
+                 ├─ Suppression materialization ── affected-target reconciliation
 Schedule lineage ┘
 ```
 
-daily 会按现有 `scopes` 选择 enabled scope，不新增 daily 配置文件。单任务补跑仍使用
+affected target 由旧/新 relationship 集合差异计算，因此涵盖新增、删除与 suppression 生效/撤销；
+没有关系变化时跳过 reconciliation。每个目标读取当前完整双侧 snapshot 与 suppression evidence，
+不追加重复分类或 audit row。daily 会按现有 `scopes` 选择 enabled scope，不新增 daily 配置文件。
+单任务补跑仍使用
 各自正式 CLI：
 
 ```text

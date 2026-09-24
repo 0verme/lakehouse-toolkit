@@ -1,10 +1,10 @@
-"""Presentation suppression projection for SQL/schedule reconciliation.
+"""Suppression classification and evidence store for SQL/schedule lineage.
 
-The raw reconciliation contract remains the three-state
-``MATCH``/``SQL_ONLY``/``SCHEDULE_ONLY`` result in
-:mod:`shared.lineage.reconciliation`.  This module adds a conservative,
-queryable projection on top of that result.  It never changes a raw row and it
-never infers a table category from a table name.
+The base fact comparison is the three-state ``MATCH``/``SQL_ONLY``/
+``SCHEDULE_ONLY`` result in :mod:`shared.lineage.reconciliation`. This module
+materializes conservative, queryable suppression evidence; the reconciliation
+core applies validated evidence as one final ``SUPPRESSED`` relationship
+status. It never infers a table category from a table name.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from shared.lineage.materialization_dws import (
 from shared.lineage.reconciliation import (
     LineageReconciliationResult,
     ReconciliationStatus,
+    changed_reconciliation_targets,
     ScheduleLineageSnapshot,
     SQLBusinessLineageSnapshot,
     normalize_lineage_comparison_target_tables,
@@ -395,11 +396,11 @@ def classify_reconciliation_suppressions(
 ) -> tuple[ReconciliationSuppression, ...]:
     """Classify SQL_ONLY rows from the verified active program inventory.
 
-    Raw reconciliation remains strictly SQL business edges versus schedule
-    edges.  Program inventory is consulted only for SQL_ONLY presentation
-    suppression.  Missing or malformed inventory raises
-    :class:`ReconciliationSuppressionError`; callers must fail open and keep
-    the raw SQL_ONLY rows visible.
+    The comparison starts from SQL business edges versus schedule edges.
+    Program inventory only creates suppression candidates for SQL_ONLY rows;
+    valid candidates become the final relationship status. Missing or malformed
+    inventory raises :class:`ReconciliationSuppressionError`; callers must fail
+    open and keep those rows actionable as SQL_ONLY.
     """
 
     environment, sql_profile, schedule_profile = _validate_classifier_inputs(
@@ -618,8 +619,8 @@ def load_usable_suppressed_edge_keys(
             cast(Iterable[DWSReconciliationSuppressionRow], rows),
         )
     except Exception:
-        # Suppression is presentation-only.  An unavailable or malformed audit
-        # projection must leave the raw SQL_ONLY row visible.
+        # An unavailable or malformed audit projection must fail open and leave
+        # the raw SQL_ONLY row actionable.
         return frozenset()
 
 
@@ -969,6 +970,26 @@ class DWSReconciliationSuppressionStore:
 
         previous_keys = {row.suppression_key for row in previous_active}
         active_keys = {row.suppression_key for row in prepared}
+        affected_targets = changed_reconciliation_targets(
+            (
+                (
+                    row.environment,
+                    row.sql_source_profile,
+                    row.source_table,
+                    row.target_table,
+                )
+                for row in previous_active
+            ),
+            (
+                (
+                    row.environment,
+                    row.sql_source_profile,
+                    row.source_table,
+                    row.target_table,
+                )
+                for row in prepared
+            ),
+        )
         return DWSSuppressionPublishResult(
             environment=scope[0],
             sql_source_profile=scope[1],
@@ -976,6 +997,7 @@ class DWSReconciliationSuppressionStore:
             suppression_count=len(prepared),
             retired_count=len(previous_keys - active_keys),
             previous_active_count=len(previous_active),
+            affected_targets=affected_targets,
         )
 
     publish_batch = publish
@@ -1018,6 +1040,7 @@ class DWSSuppressionPublishResult:
     suppression_count: int
     retired_count: int
     previous_active_count: int
+    affected_targets: tuple[str, ...] = ()
 
 
 class _StoredSuppressionColumnCountError(ValueError):

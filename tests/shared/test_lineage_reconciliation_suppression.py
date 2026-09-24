@@ -202,6 +202,43 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
         self.assertEqual(candidate.classifier_version, SUPPRESSION_CLASSIFIER_VERSION)
 
+    def test_suppression_candidates_are_relationship_scoped_for_same_source(self):
+        source = "DEMO_DWF.SOURCE_X"
+        sql = make_sql_snapshot(
+            sql_edge(source, "DEMO_DWM.TARGET_A", batch_id="batch-sql-1"),
+            sql_edge(source, "DEMO_DWM.TARGET_B", batch_id="batch-sql-1"),
+        )
+        schedule = make_schedule_snapshot(
+            schedule_edge(source, "DEMO_DWM.TARGET_B")
+        )
+        result = reconcile_lineage_snapshots(
+            sql,
+            schedule,
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+            target_tables=("DEMO_DWM.TARGET_A", "DEMO_DWM.TARGET_B"),
+        )
+
+        suppressions = classify_reconciliation_suppressions(
+            result,
+            sql,
+            schedule,
+            program_states=default_inventory(),
+        )
+
+        self.assertEqual(
+            [(item.source_table, item.target_table) for item in suppressions],
+            [(source, "DEMO_DWM.TARGET_A")],
+        )
+        self.assertEqual(
+            {row.target_table: row.status for row in result.rows},
+            {
+                "DEMO_DWM.TARGET_A": ReconciliationStatus.SQL_ONLY,
+                "DEMO_DWM.TARGET_B": ReconciliationStatus.MATCH,
+            },
+        )
+
     def test_sql_producer_does_not_prevent_suppression(self):
         sql = make_sql_snapshot(
             sql_edge("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),
@@ -871,6 +908,7 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
         published = self.publish(self.candidates)
 
         self.assertEqual(published.suppression_count, 1)
+        self.assertEqual(published.affected_targets, ("DEMO_DWM.RESULT_A",))
         active = self.store.read_rows(active_only=True)
         self.assertEqual(len(active), 1)
         self.assertEqual(active[0].raw_status, ReconciliationStatus.SQL_ONLY)
@@ -904,6 +942,16 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
         self.assertEqual(active[0].last_seen_at, observed_at)
         self.assertEqual(active[0].updated_at, observed_at)
         self.assertTrue(active[0].is_active)
+        self.assertEqual(result.affected_targets, ())
+        removed = self.publish(
+            (),
+            sql_batch="batch-sql-3",
+            schedule_batch="batch-schedule-3",
+            observed_at=observed_at + timedelta(hours=1),
+        )
+        self.assertEqual(removed.suppression_count, 0)
+        self.assertEqual(removed.affected_targets, ("DEMO_DWM.RESULT_A",))
+        self.assertEqual(self.store.read_rows(active_only=True), ())
         set_clause = UPDATE_SUPPRESSION_SQL.split("SET", 1)[1].split("WHERE", 1)[0]
         self.assertNotRegex(set_clause, r"(?i)\bsuppression_key\s*=")
         for identity_field in (
@@ -1138,6 +1186,9 @@ class MaterializationCommandTests(unittest.TestCase):
         )
         self.suppression_factory = Mock()
         self.suppression_store = Mock()
+        self.suppression_store.publish.return_value = SimpleNamespace(
+            affected_targets=()
+        )
         self.suppression_factory.return_value = self.suppression_store
 
     def test_dry_run_classifies_without_writing_dws(self):

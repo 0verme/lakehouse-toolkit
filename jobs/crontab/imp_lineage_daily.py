@@ -30,6 +30,7 @@ from shared.lineage.environment_scope import (  # noqa: E402
     LineageEnvironmentScopeResolver,
     load_lineage_environment_scopes,
 )
+from tools.lineage.reconcile_sql_schedule import run as run_reconciliation  # noqa: E402
 
 
 class StepStatus(str, Enum):
@@ -52,6 +53,7 @@ class StepResult:
     error_code: str | None = None
     message: str | None = None
     rows: int | None = None
+    affected_targets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.step, str) or not self.step.strip():
@@ -75,29 +77,45 @@ class StepResult:
             or self.rows < 0
         ):
             raise ValueError("rows must be a non-negative integer or None")
+        if any(
+            not isinstance(target, str) or not target.strip()
+            for target in self.affected_targets
+        ):
+            raise ValueError("affected_targets must contain non-empty table names")
 
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentRunResult:
-    """Results of the three steps for one configured environment scope."""
+    """Results of the materialization and final reconciliation steps."""
 
     environment: str
     sql: StepResult
     schedule: StepResult
     suppression: StepResult
+    reconciliation: StepResult
 
     @property
     def succeeded(self) -> bool:
         return all(
             result.status is StepStatus.SUCCESS
-            for result in (self.sql, self.schedule, self.suppression)
+            for result in (
+                self.sql,
+                self.schedule,
+                self.suppression,
+                self.reconciliation,
+            )
         )
 
     @property
     def failed(self) -> bool:
         return any(
             result.status is StepStatus.FAILED
-            for result in (self.sql, self.schedule, self.suppression)
+            for result in (
+                self.sql,
+                self.schedule,
+                self.suppression,
+                self.reconciliation,
+            )
         )
 
 
@@ -122,6 +140,7 @@ class LineageDailyResult:
 
 
 StepRunner = Callable[[LineageEnvironmentScope], Any]
+ReconciliationRunner = Callable[[LineageEnvironmentScope, tuple[str, ...]], Any]
 _SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _SAFE_BATCH_ID = re.compile(r"batch-[A-Za-z0-9][A-Za-z0-9._-]{0,121}")
 _SAFE_ERROR_CODE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
@@ -169,7 +188,33 @@ def _result_rows(value: object) -> int | None:
             count = getattr(candidate, field_name, None)
             if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
                 return count
+        rows = getattr(candidate, "rows", None)
+        if isinstance(rows, (tuple, list)):
+            return len(rows)
     return None
+
+
+def _result_affected_targets(value: object) -> tuple[str, ...]:
+    candidates = (value,)
+    if isinstance(value, (tuple, list)):
+        candidates = tuple(value)
+    targets: set[str] = set()
+    for candidate in candidates:
+        raw_targets = getattr(candidate, "affected_targets", ())
+        if raw_targets is None:
+            continue
+        if isinstance(raw_targets, str):
+            values = (raw_targets,)
+        else:
+            try:
+                values = tuple(raw_targets)
+            except TypeError as error:
+                raise ValueError("affected_targets must be iterable") from error
+        for target in values:
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError("affected_targets must contain table names")
+            targets.add(target.strip().upper())
+    return tuple(sorted(targets))
 
 
 def _emit_step(result: StepResult) -> None:
@@ -183,6 +228,8 @@ def _emit_step(result: StepResult) -> None:
         values.append(f"batch={_safe_batch_id(result.batch_id)}")
     if result.rows is not None:
         values.append(f"rows={result.rows}")
+    if result.affected_targets:
+        values.append(f"targets={len(result.affected_targets)}")
     if result.status is StepStatus.SKIPPED:
         values.append(f"reason={result.message or 'unspecified'}")
     elif result.status is StepStatus.FAILED:
@@ -216,6 +263,48 @@ def _execute_step(
             batch_id=_result_batch_id(value),
             elapsed=time.perf_counter() - started_at,
             rows=_result_rows(value),
+            affected_targets=_result_affected_targets(value),
+        )
+    _emit_step(result)
+    return result
+
+
+def _execute_reconciliation_step(
+    scope: LineageEnvironmentScope,
+    runner: ReconciliationRunner,
+    affected_targets: tuple[str, ...],
+) -> StepResult:
+    if not affected_targets:
+        result = StepResult(
+            step="RECONCILIATION",
+            environment=scope.environment,
+            status=StepStatus.SUCCESS,
+            rows=0,
+        )
+        _emit_step(result)
+        return result
+
+    started_at = time.perf_counter()
+    try:
+        value = runner(scope, affected_targets)
+    except Exception as error:  # noqa: BLE001 - isolate one environment step
+        result = StepResult(
+            step="RECONCILIATION",
+            environment=scope.environment,
+            status=StepStatus.FAILED,
+            elapsed=time.perf_counter() - started_at,
+            error_code=_safe_error_code(error),
+            message="runner_failed",
+            affected_targets=affected_targets,
+        )
+    else:
+        result = StepResult(
+            step="RECONCILIATION",
+            environment=scope.environment,
+            status=StepStatus.SUCCESS,
+            elapsed=time.perf_counter() - started_at,
+            rows=_result_rows(value),
+            affected_targets=affected_targets,
         )
     _emit_step(result)
     return result
@@ -280,6 +369,22 @@ def _build_suppression_runner(observed_at: datetime) -> StepRunner:
     return execute
 
 
+def _build_reconciliation_runner() -> ReconciliationRunner:
+    def execute(
+        scope: LineageEnvironmentScope,
+        affected_targets: tuple[str, ...],
+    ) -> object:
+        return run_reconciliation(
+            dws_profile=scope.dws_profile,
+            environment=scope.environment,
+            sql_source_profile=scope.sql_source_profile,
+            schedule_source_profile=scope.schedule_source_profile,
+            target_tables=affected_targets,
+        )
+
+    return execute
+
+
 def run(
     scopes: Iterable[LineageEnvironmentScope],
     *,
@@ -289,8 +394,9 @@ def run(
     sql_runner: StepRunner | None = None,
     schedule_runner: StepRunner | None = None,
     suppression_runner: StepRunner | None = None,
+    reconciliation_runner: ReconciliationRunner | None = None,
 ) -> LineageDailyResult:
-    """Run each enabled scope while isolating failures between environments."""
+    """Run lineage inputs then rebuild only targets whose relationships changed."""
 
     started_at = time.perf_counter()
     selected_scopes = _select_scopes(scopes, environment)
@@ -310,6 +416,9 @@ def run(
     effective_suppression_runner = suppression_runner or _build_suppression_runner(
         effective_observed_at
     )
+    effective_reconciliation_runner = (
+        reconciliation_runner or _build_reconciliation_runner()
+    )
 
     environment_results: list[EnvironmentRunResult] = []
     for scope in selected_scopes:
@@ -321,12 +430,38 @@ def run(
             and schedule_result.status is StepStatus.SUCCESS
             else _skipped_step(scope)
         )
+        if (
+            sql_result.status is StepStatus.SUCCESS
+            and schedule_result.status is StepStatus.SUCCESS
+            and suppression_result.status is StepStatus.SUCCESS
+        ):
+            affected_targets = tuple(
+                sorted(
+                    set(sql_result.affected_targets)
+                    | set(schedule_result.affected_targets)
+                    | set(suppression_result.affected_targets)
+                )
+            )
+            reconciliation_result = _execute_reconciliation_step(
+                scope,
+                effective_reconciliation_runner,
+                affected_targets,
+            )
+        else:
+            reconciliation_result = StepResult(
+                step="RECONCILIATION",
+                environment=scope.environment,
+                status=StepStatus.SKIPPED,
+                message="upstream_failed",
+            )
+            _emit_step(reconciliation_result)
         environment_results.append(
             EnvironmentRunResult(
                 environment=scope.environment,
                 sql=sql_result,
                 schedule=schedule_result,
                 suppression=suppression_result,
+                reconciliation=reconciliation_result,
             )
         )
 
@@ -348,8 +483,8 @@ def run(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run SQL lineage, schedule lineage, and suppression materialization "
-            "for configured lineage scopes."
+            "Run SQL/schedule/suppression materialization and rebuild changed "
+            "reconciliation targets for configured lineage scopes."
         )
     )
     parser.add_argument(
@@ -383,6 +518,7 @@ def main(
     sql_runner: StepRunner | None = None,
     schedule_runner: StepRunner | None = None,
     suppression_runner: StepRunner | None = None,
+    reconciliation_runner: ReconciliationRunner | None = None,
 ) -> int:
     """Daily CLI boundary; return non-zero when any environment failed."""
 
@@ -397,6 +533,7 @@ def main(
         sql_runner=sql_runner,
         schedule_runner=schedule_runner,
         suppression_runner=suppression_runner,
+        reconciliation_runner=reconciliation_runner,
     )
     return result.exit_code
 

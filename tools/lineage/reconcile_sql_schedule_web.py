@@ -43,7 +43,6 @@ from shared.lineage.reconciliation import (
 )
 from shared.lineage.reconciliation_suppression import (
     DWSReconciliationSuppressionStore,
-    load_usable_suppressed_edge_keys,
 )
 from tools.lineage.reconcile_sql_schedule import run as run_reconciliation
 
@@ -51,11 +50,13 @@ _STATUS_LABELS = {
     ReconciliationStatus.MATCH: "两边一致",
     ReconciliationStatus.SQL_ONLY: "SQL实际调用但调度未配置",
     ReconciliationStatus.SCHEDULE_ONLY: "调度已配置但SQL未调用",
+    ReconciliationStatus.SUPPRESSED: "手工码值/静态来源（不参与对账）",
 }
 _STATUS_PRIORITY = {
     ReconciliationStatus.SQL_ONLY: 0,
     ReconciliationStatus.SCHEDULE_ONLY: 1,
     ReconciliationStatus.MATCH: 2,
+    ReconciliationStatus.SUPPRESSED: 3,
 }
 _NOT_APPLICABLE_LABEL = "—"
 SHOW_SUPPRESSED_OPTION = "show_suppressed"
@@ -65,9 +66,9 @@ SHOW_SELF_REFERENCE_OPTION = "show_self_reference"
 class ReconciliationRowKind(str, Enum):
     """Presentation-only classification of one raw reconciliation row.
 
-    The raw ``MATCH`` / ``SQL_ONLY`` / ``SCHEDULE_ONLY`` contract is never
-    changed; this enum only decides whether a row participates in the formal
-    summary and whether the UI expands it as audit evidence.
+    The core final status (including ``SUPPRESSED``) is authoritative; this enum
+    only decides whether a row participates in the formal summary and whether
+    the UI expands it as evidence.
     """
 
     NORMAL = "NORMAL"
@@ -329,21 +330,17 @@ def is_self_reference_row(row: LineageReconciliationRow) -> bool:
 
 def classify_reconciliation_row(
     row: LineageReconciliationRow,
-    suppressed_edge_keys: Iterable[tuple[str, str]] = (),
 ) -> ReconciliationRowKind:
-    """Classify one raw row for presentation without changing its status.
+    """Classify one already-finalized domain row for optional evidence display.
 
-    Only the existing suppression evidence can mark a ``SQL_ONLY`` row as
-    ``SUPPRESSED``; no table-name, schema or keyword guessing is performed.
-    Self-reference wins over suppression so one row is classified at most once.
+    Suppression has already won in the shared reconciliation contract; this
+    function only maps that one row to its display kind. Self-reference remains
+    an independent presentation-only evidence classification.
     """
 
     if is_self_reference_row(row):
         return ReconciliationRowKind.SELF_REFERENCE
-    if (
-        _coerce_status(row.status) is ReconciliationStatus.SQL_ONLY
-        and (row.source_table, row.target_table) in suppressed_edge_keys
-    ):
+    if _coerce_status(row.status) is ReconciliationStatus.SUPPRESSED:
         return ReconciliationRowKind.SUPPRESSED
     return ReconciliationRowKind.NORMAL
 
@@ -508,7 +505,6 @@ def build_reconciliation_view_model(
     result: LineageReconciliationResult,
     *,
     target_table: str | None = None,
-    suppressed_edge_keys: Iterable[tuple[str, str]] | None = None,
 ) -> ReconciliationViewModel:
     """Convert one formal result into the target-centric UI model.
 
@@ -539,7 +535,6 @@ def build_reconciliation_view_model(
     target_rows = tuple(
         row for row in result.rows if row.target_table == resolved_target
     )
-    suppressed_keys = frozenset(suppressed_edge_keys or ())
     ordered_rows = sort_rows(target_rows)
     row_views = tuple(
         ReconciliationRowView(
@@ -547,15 +542,14 @@ def build_reconciliation_view_model(
             sql_actual=row.sql_present,
             schedule_configured=row.schedule_present,
             status=_coerce_status(row.status),
-            kind=classify_reconciliation_row(row, suppressed_keys),
+            kind=classify_reconciliation_row(row),
         )
         for row in ordered_rows
     )
     summary = build_summary(
         row
         for row in ordered_rows
-        if classify_reconciliation_row(row, suppressed_keys)
-        is ReconciliationRowKind.NORMAL
+        if classify_reconciliation_row(row) is ReconciliationRowKind.NORMAL
     )
     target_status = _summary_status(summary)
     visible_row_views = tuple(
@@ -601,6 +595,7 @@ def reconcile_target(
     runner: ReconciliationRunner | None = None,
     connection: Any | None = None,
     timing: ReconciliationTiming | None = None,
+    suppression_store: Any | None = None,
 ) -> LineageReconciliationResult:
     """Call the formal target-scoped reconciliation function."""
 
@@ -621,6 +616,8 @@ def reconcile_target(
         kwargs["connection"] = connection
     if timing is not None and runner is None:
         kwargs["timing"] = timing
+    if runner is None:
+        kwargs["suppression_store"] = suppression_store
     return reconcile(**kwargs)  # type: ignore[arg-type]
 
 
@@ -671,6 +668,7 @@ def reconcile_targets(
                     runner=runner,
                     connection=connection,
                     timing=batch_timing if runner is None else None,
+                    suppression_store=suppression_store,
                 )
             else:
                 reconcile = runner or run_reconciliation
@@ -685,27 +683,14 @@ def reconcile_targets(
                     if connection is not None:
                         kwargs["connection"] = connection
                     kwargs["timing"] = batch_timing
+                    kwargs["suppression_store"] = suppression_store
                 result = reconcile(**kwargs)  # type: ignore[arg-type]
             batch_timing.reconciliation_rows = len(result.rows)
 
-            suppression_started = perf_counter()
-            suppressed_edge_keys = (
-                load_usable_suppressed_edge_keys(
-                    result,
-                    suppression_store,
-                    target_tables=tuple(normalized_targets),
-                )
-                if suppression_store is not None
-                else frozenset()
-            )
-            batch_timing.suppression_lookup_ms = int(
-                (perf_counter() - suppression_started) * 1000
-            )
             for target in normalized_targets:
                 view_model = build_reconciliation_view_model(
                     result,
                     target_table=target,
-                    suppressed_edge_keys=suppressed_edge_keys,
                 )
                 outcomes_by_target[target] = TargetReconciliationOutcome(
                     target_table=target,
@@ -996,8 +981,8 @@ def main(
         put_red_text(escape(str(error)))
         return
 
-    # The checkboxes only expand audit evidence; the formal summary stays
-    # NORMAL-only regardless of what the user selects here.
+    # The checkboxes only expand already-finalized SUPPRESSED/self-reference
+    # evidence; they never deduplicate or alter reconciliation state.
     show_suppressed, show_self_reference = resolve_display_options(
         form.get("display_options")
     )
@@ -1026,8 +1011,8 @@ def main(
                     profile=scope.dws_profile if request_connection is None else None,
                 )
             except Exception:
-                # Suppression is presentation-only; an unavailable store leaves
-                # the raw reconciliation rows visible.
+                # The reconciliation core handles lookup failures fail-open; the
+                # UI never overlays or duplicates suppression rows.
                 suppression_store = None
 
         put_markdown("## SQL / 调度血缘对账结果")

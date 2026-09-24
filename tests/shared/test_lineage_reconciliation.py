@@ -6,12 +6,15 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from shared.lineage.domain import LineageEdge
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
     ReconciliationFactProjection,
     ReconciliationStatus,
+    apply_reconciliation_suppressions,
+    changed_reconciliation_targets,
     ReconciliationTiming,
     SCHEDULE_ACTIVE_SNAPSHOT_NOT_FOUND,
     SQL_ACTIVE_SNAPSHOT_NOT_FOUND,
@@ -307,6 +310,152 @@ class ReconciliationDomainTests(unittest.TestCase):
         self.assertEqual(summary.sql_only_count, 1)
         self.assertEqual(summary.schedule_only_count, 1)
         self.assertEqual(summary.status, TargetSummaryStatus.DIFFERENT)
+
+    def test_suppression_is_the_single_final_status_for_screenshot_relationship(self):
+        target = "DWM.M_AGT_LN_ASSET_WRT_OFF_INFO"
+        source = "DWM.M_PUB_CODE_INFO_NEW"
+        raw = reconcile_lineage_snapshots(
+            sql_snapshot(sql_edge(source, target)),
+            schedule_snapshot(),
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_table=target,
+        )
+
+        result = apply_reconciliation_suppressions(raw, ((source, target),))
+
+        self.assertEqual(len(result.rows), 1)
+        row = result.rows[0]
+        self.assertEqual(row.status, ReconciliationStatus.SUPPRESSED)
+        self.assertTrue(row.sql_present)
+        self.assertFalse(row.schedule_present)
+        self.assertTrue(row.suppressed)
+        self.assertEqual(result.sql_only_count, 0)
+        self.assertEqual(result.schedule_only_count, 0)
+        self.assertEqual(result.aggregate_dict()["suppressed"], 1)
+        self.assertEqual(result.target_summaries[0].status, TargetSummaryStatus.CONSISTENT)
+        self.assertEqual(result.target_summaries[0].sql_only_count, 0)
+        self.assertEqual(result.target_summaries[0].schedule_only_count, 0)
+
+    def test_suppression_is_relationship_scoped_for_same_source(self):
+        source = "DWF.SOURCE_X"
+        result = reconcile_lineage_snapshots(
+            sql_snapshot(
+                sql_edge(source, "DWM.TARGET_A"),
+                sql_edge(source, "DWM.TARGET_B"),
+            ),
+            schedule_snapshot(schedule_edge(source, "DWM.TARGET_B")),
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_tables=("DWM.TARGET_A", "DWM.TARGET_B"),
+            suppressed_edge_keys=((source, "DWM.TARGET_A"),),
+        )
+
+        statuses = {(row.target_table, row.source_table): row.status for row in result.rows}
+        self.assertEqual(
+            statuses,
+            {
+                ("DWM.TARGET_A", source): ReconciliationStatus.SUPPRESSED,
+                ("DWM.TARGET_B", source): ReconciliationStatus.MATCH,
+            },
+        )
+        self.assertEqual(result.sql_only_count, 0)
+        self.assertEqual(result.match_count, 1)
+
+    def test_suppression_addition_and_removal_rebuild_current_state(self):
+        target = "DWM.TARGET_A"
+        source = "DWF.SOURCE_X"
+        raw = reconcile_lineage_snapshots(
+            sql_snapshot(sql_edge(source, target)),
+            schedule_snapshot(),
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_table=target,
+        )
+
+        suppressed = apply_reconciliation_suppressions(raw, ((source, target),))
+        restored = apply_reconciliation_suppressions(suppressed, ())
+
+        self.assertEqual(raw.rows[0].status, ReconciliationStatus.SQL_ONLY)
+        self.assertEqual(suppressed.rows[0].status, ReconciliationStatus.SUPPRESSED)
+        self.assertEqual(restored.rows[0].status, ReconciliationStatus.SQL_ONLY)
+        self.assertEqual(suppressed.sql_only_count, 0)
+        self.assertEqual(restored.sql_only_count, 1)
+
+    def test_deleted_sql_relationship_is_absent_from_rebuilt_current_result(self):
+        target = "DWM.TARGET_A"
+        result = reconcile_lineage_snapshots(
+            sql_snapshot(),
+            schedule_snapshot(),
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_table=target,
+            suppressed_edge_keys=(("DWF.SOURCE_X", target),),
+        )
+
+        self.assertEqual(result.rows, ())
+        self.assertEqual(result.sql_only_count, 0)
+        self.assertEqual(result.target_summaries[0].sql_source_count, 0)
+
+    def test_repeated_reconciliation_is_idempotent_and_order_independent(self):
+        target = "DWM.TARGET_A"
+        source = "DWF.SOURCE_X"
+        sql = sql_snapshot(sql_edge(source, target))
+        schedule = schedule_snapshot()
+        suppression = ((source, target),)
+        first = reconcile_lineage_snapshots(
+            sql,
+            schedule,
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_table=target,
+            suppressed_edge_keys=suppression,
+        )
+        repeated = apply_reconciliation_suppressions(first, suppression)
+        raw_after_inputs = reconcile_lineage_snapshots(
+            sql,
+            schedule,
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_table=target,
+        )
+        suppression_after_inputs = apply_reconciliation_suppressions(
+            raw_after_inputs, suppression
+        )
+        recomputed = reconcile_lineage_snapshots(
+            sql,
+            schedule,
+            environment=ENVIRONMENT,
+            source_profile=PROFILE,
+            target_table=target,
+            suppressed_edge_keys=suppression,
+        )
+
+        self.assertEqual(len(first.rows), 1)
+        self.assertIs(repeated, first)
+        self.assertEqual(first, suppression_after_inputs)
+        self.assertEqual(first, recomputed)
+        self.assertEqual(
+            len(
+                {
+                    (row.environment, row.target_table, row.source_table)
+                    for row in recomputed.rows
+                }
+            ),
+            1,
+        )
+
+    def test_changed_target_delta_includes_deleted_and_normalizes_relationships(self):
+        previous = ((ENVIRONMENT, PROFILE, "DWS_DWF.SOURCE_X", "DWS_DWM.TARGET_A"),)
+
+        self.assertEqual(
+            changed_reconciliation_targets(previous, ()),
+            ("DWM.TARGET_A",),
+        )
+        self.assertEqual(
+            changed_reconciliation_targets(previous, (previous[0],)),
+            (),
+        )
 
     def test_different_source_profiles_keep_three_state_edge_reconciliation(self):
         result = reconcile_lineage_snapshots(
@@ -975,6 +1124,50 @@ class ActiveReaderContractTests(unittest.TestCase):
             },
         )
 
+    def test_active_dws_result_applies_suppression_before_returning_current_state(self):
+        target = "DWM.TARGET_A"
+        source = "DWF.SOURCE_X"
+        schedule_row = FakeScheduleRow(
+            schedule_edge("DWF.OTHER", "DWM.OTHER_TARGET"),
+            "batch-schedule",
+        )
+        schedule_reader = FakeScheduleMetadataReader(
+            (schedule_row,),
+            metadata=SimpleNamespace(
+                batch_id="batch-schedule",
+                snapshot_scope=((ENVIRONMENT, PROFILE),),
+                observed_at=OBSERVED_AT,
+                is_active=True,
+            ),
+        )
+        sql_reader = FakeSQLReader((sql_edge(source, target),))
+        suppression_store = object()
+
+        with patch(
+            "shared.lineage.reconciliation_suppression.load_usable_suppressed_edge_keys",
+            return_value=frozenset({(source, target)}),
+        ) as load_suppressions:
+            result = reconcile_active_dws_lineage(
+                sql_reader,
+                schedule_reader,
+                environment=ENVIRONMENT,
+                source_profile=PROFILE,
+                target_table=target,
+                suppression_store=suppression_store,
+            )
+
+        self.assertEqual(len(result.rows), 1)
+        self.assertEqual(result.rows[0].status, ReconciliationStatus.SUPPRESSED)
+        self.assertEqual(result.sql_only_count, 0)
+        load_suppressions.assert_called_once()
+        raw_result = load_suppressions.call_args.args[0]
+        self.assertEqual(raw_result.rows[0].status, ReconciliationStatus.SQL_ONLY)
+        self.assertIs(load_suppressions.call_args.args[1], suppression_store)
+        self.assertEqual(
+            load_suppressions.call_args.kwargs,
+            {"target_tables": (target,)},
+        )
+
     def test_combined_active_reader_returns_both_snapshot_ids(self):
         sql = sql_edge("DWF.A", "DWM.RESULT_A", batch_id="batch-sql")
         schedule = schedule_edge("DWF.A", "DWM.RESULT_A")
@@ -1141,6 +1334,7 @@ class CliReportTests(unittest.TestCase):
     def test_full_scope_table_is_aggregate_and_json_is_machine_readable(self):
         table = render_table(self.result, elapsed_ms=3)
         self.assertIn("reconciliation_rows=1", table)
+        self.assertIn("suppressed=0", table)
         self.assertIn(f"sql_profile={SQL_PROFILE}", table)
         self.assertIn(f"schedule_profile={SCHEDULE_PROFILE}", table)
         self.assertNotIn("\nprofile=", table)

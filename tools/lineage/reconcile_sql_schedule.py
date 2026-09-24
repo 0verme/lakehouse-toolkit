@@ -23,6 +23,9 @@ from shared.lineage.reconciliation import (
     normalize_lineage_comparison_table_key,
     reconcile_active_dws_lineage,
 )
+from shared.lineage.reconciliation_suppression import (
+    DWSReconciliationSuppressionStore,
+)
 from shared.lineage.schedule_materialization import DWSScheduleLineageStore
 
 _SAFE_BATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -133,6 +136,7 @@ def run(
     target_tables: Iterable[object] | str | None = None,
     sql_store: Any | None = None,
     schedule_store: Any | None = None,
+    suppression_store: Any | None = None,
     connection: Any | None = None,
     timing: ReconciliationTiming | None = None,
 ) -> LineageReconciliationResult:
@@ -158,6 +162,16 @@ def run(
         profile=dws_profile.strip() if isinstance(dws_profile, str) else None,
         connection=connection,
     )
+    resolved_suppression_store = suppression_store
+    if (
+        resolved_suppression_store is None
+        and sql_store is None
+        and schedule_store is None
+    ):
+        resolved_suppression_store = DWSReconciliationSuppressionStore(
+            profile=dws_profile.strip() if isinstance(dws_profile, str) else None,
+            connection=connection,
+        )
     return reconcile_active_dws_lineage(
         resolved_sql_store,
         resolved_schedule_store,
@@ -168,6 +182,7 @@ def run(
         target_table=target_table,
         target_tables=target_tables,
         timing=timing,
+        suppression_store=resolved_suppression_store,
     )
 
 
@@ -193,6 +208,7 @@ def render_table(
             f"match={values['match']}",
             f"sql_only={values['sql_only']}",
             f"schedule_only={values['schedule_only']}",
+            f"suppressed={values['suppressed']}",
             f"targets={values['targets']}",
             f"consistent_targets={values['consistent_targets']}",
             f"different_targets={values['different_targets']}",
