@@ -965,6 +965,7 @@ def main(
                         {
                             "label": "显示手工码值 / 静态来源",
                             "value": SHOW_SUPPRESSED_OPTION,
+                            "selected": True,
                         },
                         {
                             "label": "显示自关联",
@@ -1055,25 +1056,6 @@ def main(
                     pass
         if runner is None:
             timing.total_ms = int((perf_counter() - request_started) * 1000)
-    put_markdown(
-        "查询 timing："
-        f"连接 `{timing.connect_ms} ms`；"
-        f"SQL active batch `{timing.sql_active_batch_resolve_ms} ms`，"
-        f"execute `{timing.sql_execute_ms} ms`，fetch `{timing.sql_fetch_ms} ms`，"
-        f"conversion `{timing.sql_conversion_ms} ms`，"
-        f"target-scoped read `{timing.sql_target_scoped_read_ms} ms / "
-        f"{timing.sql_rows_read} projection rows / {timing.sql_fact_rows_read} facts`；"
-        f"Schedule active batch `{timing.schedule_active_batch_resolve_ms} ms`，"
-        f"execute `{timing.schedule_execute_ms} ms`，fetch `{timing.schedule_fetch_ms} ms`，"
-        f"conversion `{timing.schedule_conversion_ms} ms`，"
-        f"target-scoped read `{timing.schedule_target_scoped_read_ms} ms / "
-        f"{timing.schedule_rows_read} projection rows / "
-        f"{timing.schedule_fact_rows_read} facts`；"
-        f"reconciliation CPU `{timing.reconciliation_cpu_ms} ms / "
-        f"{timing.reconciliation_rows} rows`；"
-        f"suppression lookup `{timing.suppression_lookup_ms} ms`；"
-        f"TOTAL `{timing.total_ms} ms`。"
-    )
     for outcome in outcomes:
         _render_outcome(
             outcome,
