@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import sqlite3
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 
+from shared.lineage.dws_timestamp import TIMESTAMPTZ_PARAM_SQL
 from shared.lineage.providers import (
     MySQLProcessProfile,
     ProviderError,
     ScheduleLineageConfig,
 )
+from shared.lineage.reconciliation import ReconciliationTiming
 from shared.lineage.schedule import (
     MySQLScheduleLineageProvider,
     ScheduleLineageEdge,
@@ -16,14 +21,13 @@ from shared.lineage.schedule import (
     ScheduleLineageLoadStats,
     deduplicate_schedule_edges,
     normalize_schedule_table_key,
+    schedule_row_key,
 )
-from shared.lineage.dws_timestamp import TIMESTAMPTZ_PARAM_SQL
-from shared.lineage.reconciliation import ReconciliationTiming
 from shared.lineage.schedule_materialization import (
-    DWSScheduleLineageStore,
     INSERT_SCHEDULE_EDGE_SQL,
     SCHEDULE_RECONCILIATION_PROJECTION_SQL,
     SELECT_SCHEDULE_EDGE_SQL,
+    DWSScheduleLineageStore,
 )
 
 OBSERVED_AT = datetime(2026, 9, 10, 8, 9, 10, tzinfo=timezone.utc)
@@ -381,6 +385,113 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         self.assertTrue(row.is_active)
         self.assertEqual(self.store.get_active_batch_id(), "batch-schedule-1")
 
+    def _insert_legacy_active_row(self, edge, *, batch_id, source_table, target_table):
+        legacy_key = hashlib.sha256(
+            (
+                f"schedule-edge\x1f{edge.environment.upper()}"
+                f"\x1f{edge.source_profile.upper()}"
+                f"\x1f{edge.process_name.upper()}"
+                f"\x1f{edge.project_version_key.upper()}"
+                f"\x1f{source_table.upper()}\x1f{target_table.upper()}"
+            ).encode()
+        ).hexdigest()
+        timestamp = OBSERVED_AT.isoformat()
+        self.connection.execute(
+            """
+            INSERT INTO dwp.lineage_schedule_edge(
+                row_key, schedule_edge_key, environment, source_profile,
+                process_name, project_version_key, raw_source_table,
+                raw_target_table, source_table, target_table, batch_id,
+                observed_at, first_seen_at, last_seen_at, last_changed_at,
+                is_active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                schedule_row_key(batch_id, legacy_key),
+                legacy_key,
+                edge.environment,
+                edge.source_profile,
+                edge.process_name,
+                edge.project_version_key,
+                edge.raw_source_table,
+                edge.raw_target_table,
+                source_table,
+                target_table,
+                batch_id,
+                *(timestamp for _ in range(4)),
+                1,
+                timestamp,
+                timestamp,
+            ),
+        )
+        self.connection.commit()
+        return legacy_key
+
+    def test_complete_snapshot_retires_legacy_identity_and_publishes_current_keys(self):
+        source = "DWS_DWP.TMP_P_REPROT_KYW_LIST"
+        target = "DWS_DWP.TMP_P_REPROT_KYW_Q_17"
+        edge = make_edge(
+            "005:DWS_DWP.P_REPROT_KYW_Q:1:00",
+            source=source,
+            target=target,
+        )
+        legacy_key = self._insert_legacy_active_row(
+            edge,
+            batch_id="batch-schedule-legacy",
+            source_table=source,
+            target_table=target,
+        )
+
+        result = self.publish(
+            (edge,),
+            "batch-schedule-current",
+            observed_at=OBSERVED_AT + timedelta(minutes=1),
+        )
+
+        active = self.store.read_rows(active_only=True)
+        history = self.store.read_rows()
+        self.assertEqual(result.previous_batch_id, "batch-schedule-legacy")
+        self.assertEqual(len(active), 1)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(active[0].raw_source_table, source)
+        self.assertEqual(active[0].raw_target_table, target)
+        self.assertEqual(active[0].source_table, "DWP.TMP_P_REPROT_KYW_LIST")
+        self.assertEqual(active[0].target_table, "DWP.TMP_P_REPROT_KYW_Q_17")
+        self.assertEqual(active[0].schedule_edge_key, edge.schedule_edge_key)
+        self.assertNotEqual(active[0].schedule_edge_key, legacy_key)
+        self.assertEqual(
+            active[0].row_key,
+            schedule_row_key("batch-schedule-current", edge.schedule_edge_key),
+        )
+        self.assertEqual(active[0].batch_id, "batch-schedule-current")
+        self.assertTrue(active[0].is_active)
+        retired = next(row for row in history if row.schedule_edge_key == legacy_key)
+        self.assertFalse(retired.is_active)
+        self.assertEqual(self.store.get_active_batch_id(), "batch-schedule-current")
+
+    def test_invalid_previous_identity_outside_replacement_scope_fails_closed(self):
+        edge = make_edge(profile="mysql_dev_b")
+        source = "DWS_DWP.TMP_P_REPROT_KYW_LIST"
+        target = "DWS_DWP.TMP_P_REPROT_KYW_Q_17"
+        legacy_key = self._insert_legacy_active_row(
+            edge,
+            batch_id="batch-schedule-legacy-outside",
+            source_table=source,
+            target_table=target,
+        )
+
+        with self.assertRaisesRegex(ValueError, "stable identity is inconsistent"):
+            self.publish(
+                (make_edge(profile="mysql_dev_a"),),
+                "batch-schedule-current",
+                scopes=(("DEV", "mysql_dev_a"),),
+            )
+
+        active = self.store.read_rows(active_only=True)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].schedule_edge_key, legacy_key)
+        self.assertEqual(active[0].batch_id, "batch-schedule-legacy-outside")
+
     def test_repeat_publish_keeps_stable_key_and_updates_history(self):
         edge = make_edge()
         first_observed_at = OBSERVED_AT
@@ -403,6 +514,8 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
         self.assertNotEqual(first.row_key, second.row_key)
         self.assertEqual(first.first_seen_at, second.first_seen_at)
         self.assertEqual(second.first_seen_at, first_observed_at)
+        self.assertEqual(second.created_at, first.created_at)
+        self.assertEqual(second.last_changed_at, first.last_changed_at)
         self.assertEqual(second.last_seen_at, second_observed_at)
         self.assertEqual(first.updated_at, first_observed_at)
         self.assertEqual(second.updated_at, second_observed_at)
@@ -647,6 +760,65 @@ class ScheduleLineageMaterializationTests(unittest.TestCase):
 
 
 class ScheduleSourceFailureTests(unittest.TestCase):
+    def test_cli_reports_safe_schedule_publish_root_cause_and_exit_code(self):
+        from unittest.mock import patch
+
+        from jobs.crontab import imp_schedule_lineage
+
+        output = io.StringIO()
+        with (
+            patch.object(
+                imp_schedule_lineage,
+                "load_mysql_process_profiles",
+                return_value=(make_profile(),),
+            ),
+            patch.object(
+                imp_schedule_lineage,
+                "run",
+                side_effect=ValueError(
+                    "stored schedule stable identity is inconsistent"
+                ),
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = imp_schedule_lineage.cli(["--profile", "mysql_dev_a"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("exception=ValueError", output.getvalue())
+        self.assertIn(
+            "reason=stored_schedule_stable_identity_is_inconsistent",
+            output.getvalue(),
+        )
+
+    def test_cli_redacts_credentials_from_underlying_exception(self):
+        from unittest.mock import patch
+
+        from jobs.crontab import imp_schedule_lineage
+
+        output = io.StringIO()
+        failure = ValueError(
+            "publish failed password=abc123 jdbc:xxx://user:secret@host token=xxxx"
+        )
+        with (
+            patch.object(
+                imp_schedule_lineage,
+                "load_mysql_process_profiles",
+                return_value=(make_profile(),),
+            ),
+            patch.object(imp_schedule_lineage, "run", side_effect=failure),
+            redirect_stdout(output),
+        ):
+            exit_code = imp_schedule_lineage.cli(["--profile", "mysql_dev_a"])
+
+        text = output.getvalue()
+        self.assertEqual(exit_code, 1)
+        self.assertIn("exception=ValueError", text)
+        self.assertNotIn("abc123", text)
+        self.assertNotIn("secret", text)
+        self.assertNotIn("user:secret", text)
+        self.assertNotIn("token=xxxx", text)
+        self.assertNotIn("xxxx", text)
+
     def test_cli_accepts_profile_and_dws_profile(self):
         from jobs.crontab.imp_schedule_lineage import build_parser
 

@@ -4,7 +4,7 @@ import io
 import sqlite3
 import unittest
 from contextlib import redirect_stderr
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -21,13 +21,14 @@ from shared.lineage.reconciliation import (
     reconcile_lineage_snapshots,
 )
 from shared.lineage.reconciliation_suppression import (
-    DWSReconciliationSuppressionStore,
     LEGACY_SUPPRESSION_CLASSIFIER_VERSION,
+    SUPPRESSION_CLASSIFIER_VERSION,
+    UPDATE_SUPPRESSION_SQL,
+    DWSReconciliationSuppressionStore,
     ProgramInventoryStatus,
     ReconciliationSuppression,
     ReconciliationSuppressionError,
     ReconciliationSuppressionReason,
-    SUPPRESSION_CLASSIFIER_VERSION,
     build_active_program_target_inventory,
     classify_program_inventory_status,
     classify_reconciliation_suppressions,
@@ -300,9 +301,7 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            classify_program_inventory_status(
-                "DWF.REFERENCE_A", active_targets
-            ),
+            classify_program_inventory_status("DWF.REFERENCE_A", active_targets),
             ProgramInventoryStatus.HAS_INTERNAL_PROGRAM,
         )
         self.assertEqual(
@@ -311,9 +310,7 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         )
 
     def test_environment_wide_inventory_ignores_sql_profile(self):
-        sql = make_sql_snapshot(
-            sql_edge("DWF.F_NCMS_ALS_CODE_LIBRARY", "DWM.RESULT_A")
-        )
+        sql = make_sql_snapshot(sql_edge("DWF.F_NCMS_ALS_CODE_LIBRARY", "DWM.RESULT_A"))
         schedule = make_schedule_snapshot(
             schedule_edge("DWF.OTHER_A", "DWM.OTHER_RESULT")
         )
@@ -836,7 +833,9 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
         )
         self.database.commit()
         legacy_rows = self.store.read_rows(active_only=True)
-        self.assertEqual(usable_suppressed_edge_keys(self.result, legacy_rows), frozenset())
+        self.assertEqual(
+            usable_suppressed_edge_keys(self.result, legacy_rows), frozenset()
+        )
 
         self.publish(self.candidates)
 
@@ -882,6 +881,93 @@ class ReconciliationSuppressionStoreTests(unittest.TestCase):
         self.assertEqual(active[0].sql_batch_id, "batch-sql-1")
         self.assertEqual(active[0].schedule_batch_id, "batch-schedule-1")
         self.assertTrue(active[0].is_active)
+
+    def test_same_row_key_updates_lifecycle_without_updating_identity(self):
+        self.publish(self.candidates)
+        first = self.store.read_rows(active_only=True)[0]
+        observed_at = OBSERVED_AT + timedelta(hours=1)
+
+        result = self.publish(
+            self.candidates,
+            observed_at=observed_at,
+        )
+
+        active = self.store.read_rows(active_only=True)
+        self.assertEqual(result.suppression_count, 1)
+        self.assertEqual(len(self.store.read_rows()), 1)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].row_key, first.row_key)
+        self.assertEqual(active[0].suppression_key, first.suppression_key)
+        self.assertEqual(active[0].first_seen_at, first.first_seen_at)
+        self.assertEqual(active[0].created_at, first.created_at)
+        self.assertEqual(active[0].observed_at, observed_at)
+        self.assertEqual(active[0].last_seen_at, observed_at)
+        self.assertEqual(active[0].updated_at, observed_at)
+        self.assertTrue(active[0].is_active)
+        set_clause = UPDATE_SUPPRESSION_SQL.split("SET", 1)[1].split("WHERE", 1)[0]
+        self.assertNotRegex(set_clause, r"(?i)\bsuppression_key\s*=")
+        for identity_field in (
+            "environment",
+            "sql_source_profile",
+            "schedule_source_profile",
+            "source_table",
+            "target_table",
+            "raw_status",
+            "suppression_reason",
+            "sql_batch_id",
+            "schedule_batch_id",
+            "classifier_version",
+        ):
+            with self.subTest(field=identity_field):
+                self.assertNotRegex(
+                    set_clause,
+                    rf"(?i)\b{identity_field}\s*=",
+                )
+
+    def test_existing_row_key_with_changed_identity_fails_closed(self):
+        self.publish(self.candidates)
+        existing = self.store.read_rows(active_only=True)[0]
+        corrupted_values = {
+            item.name: getattr(existing, item.name) for item in fields(existing)
+        }
+        corrupted_values["environment"] = OTHER_ENVIRONMENT
+        corrupted = SimpleNamespace(**corrupted_values)
+
+        with self.assertRaisesRegex(
+            ValueError, "row_key collides with another identity"
+        ):
+            self.store._prepare_rows(
+                (existing.as_candidate(),),
+                scope=(ENVIRONMENT, SQL_PROFILE, SCHEDULE_PROFILE),
+                observed_at=OBSERVED_AT + timedelta(hours=1),
+                existing_rows=(corrupted,),
+            )
+
+    def test_suppression_publish_failure_rolls_back_retire_and_activation(self):
+        self.publish(self.candidates)
+        before = self.store.read_rows(active_only=True)
+        self.database.execute(
+            """
+            CREATE TRIGGER dwp.fail_suppression_activation
+            BEFORE UPDATE OF is_active ON lineage_reconciliation_suppression
+            WHEN NEW.is_active = 1
+            BEGIN
+                SELECT RAISE(ABORT, 'controlled activation failure');
+            END
+            """
+        )
+        self.database.commit()
+
+        with self.assertRaisesRegex(Exception, "controlled activation failure"):
+            self.publish(
+                self.candidates,
+                sql_batch="batch-sql-next",
+                schedule_batch="batch-schedule-next",
+                observed_at=OBSERVED_AT + timedelta(days=1),
+            )
+
+        self.assertEqual(self.store.read_rows(active_only=True), before)
+        self.assertEqual(len(self.store.read_rows()), 1)
 
     def test_new_snapshot_reuses_stable_identity_and_retires_old_active_row(self):
         self.publish(self.candidates)

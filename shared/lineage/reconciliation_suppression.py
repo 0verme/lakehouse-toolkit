@@ -123,7 +123,9 @@ class ReconciliationSuppression:
         }
         if (self.classifier_version, reason) not in supported_contract:
             raise ValueError("unsupported reconciliation suppression reason/version")
-        object.__setattr__(self, "suppression_reason", ReconciliationSuppressionReason(reason))
+        object.__setattr__(
+            self, "suppression_reason", ReconciliationSuppressionReason(reason)
+        )
 
         if self.observed_at is not None:
             _validate_timestamp(self.observed_at, "observed_at")
@@ -522,6 +524,24 @@ class DWSReconciliationSuppressionRow:
         )
 
 
+def _suppression_identity(row: DWSReconciliationSuppressionRow) -> tuple[str, ...]:
+    """Return all immutable fields protected by the materialized row key."""
+
+    return (
+        row.suppression_key,
+        row.environment,
+        row.sql_source_profile,
+        row.schedule_source_profile,
+        row.source_table,
+        row.target_table,
+        _status_value(row.raw_status),
+        _reason_value(row.suppression_reason),
+        row.sql_batch_id,
+        row.schedule_batch_id,
+        row.classifier_version,
+    )
+
+
 def usable_suppressed_edge_keys(
     result: LineageReconciliationResult,
     rows: Iterable[DWSReconciliationSuppressionRow],
@@ -618,11 +638,7 @@ INSERT_SUPPRESSION_SQL = """
 """
 UPDATE_SUPPRESSION_SQL = """
     UPDATE dwp.lineage_reconciliation_suppression
-    SET suppression_key = ?, environment = ?, sql_source_profile = ?,
-        schedule_source_profile = ?, source_table = ?, target_table = ?,
-        raw_status = ?, suppression_reason = ?, sql_batch_id = ?,
-        schedule_batch_id = ?, classifier_version = ?,
-        observed_at = CAST(? AS TIMESTAMP WITH TIME ZONE),
+    SET observed_at = CAST(? AS TIMESTAMP WITH TIME ZONE),
         first_seen_at = CAST(? AS TIMESTAMP WITH TIME ZONE),
         last_seen_at = CAST(? AS TIMESTAMP WITH TIME ZONE), is_active = ?,
         created_at = CAST(? AS TIMESTAMP WITH TIME ZONE),
@@ -792,8 +808,8 @@ class DWSReconciliationSuppressionStore:
     @staticmethod
     def _update_values(row: DWSReconciliationSuppressionRow) -> tuple[object, ...]:
         values = DWSReconciliationSuppressionStore._row_values(row)
-        # UPDATE excludes row_key, which is the lookup identity.
-        return (*values[1:], values[0])
+        # Identity columns are immutable; only lifecycle/observation fields update.
+        return (*values[12:], values[0])
 
     def _prepare_rows(
         self,
@@ -864,7 +880,9 @@ class DWSReconciliationSuppressionStore:
                 updated_at=observed_at,
             )
             old = existing_by_row_key.get(row.row_key)
-            if old is not None and old.suppression_key != row.suppression_key:
+            if old is not None and _suppression_identity(old) != _suppression_identity(
+                row
+            ):
                 raise ValueError("suppression row_key collides with another identity")
             prepared.append(row)
         return tuple(prepared)

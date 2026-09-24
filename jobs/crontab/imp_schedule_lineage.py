@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 # ruff: noqa: E402, I001
 ensure_project_root_on_path()
 
+from jobs.crontab.imp_lineage_suppression import _describe_failure
 from shared.lineage.materialization import new_batch_id  # noqa: E402
 from shared.lineage.providers import (  # noqa: E402
     MySQLProcessProfile,
@@ -57,6 +58,15 @@ def _elapsed_ms(started_at: float) -> int:
 
 def _exception_name(error: Exception) -> str:
     return type(error).__name__
+
+
+def _safe_failure_reason(error: Exception) -> str:
+    """Return the existing suppression CLI's sanitized reason as one log token."""
+
+    description = _describe_failure(error)
+    _, separator, detail = description.partition(": ")
+    reason = detail if separator else description
+    return re.sub(r"\s+", "_", reason.strip()) or "unspecified"
 
 
 def _safe_profile(value: str) -> str:
@@ -264,6 +274,7 @@ def run(
             "publish",
             "FAILED",
             exception=_exception_name(error),
+            reason=_safe_failure_reason(error),
             **_publish_metric_fields(metrics),
             elapsed_ms=_elapsed_ms(publish_started),
         )
@@ -324,6 +335,7 @@ def main(
             "job",
             "FAILED",
             exception=_exception_name(error),
+            reason=_safe_failure_reason(error),
             elapsed_ms=_elapsed_ms(started),
         )
         raise
@@ -339,17 +351,17 @@ def main(
 
 def cli(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return main(
-        config_path=args.config,
-        dws_profile=args.dws_profile,
-        selected_profiles=args.profile,
-        limit=args.limit,
-        batch_id=args.batch_id,
-    )
+    try:
+        return main(
+            config_path=args.config,
+            dws_profile=args.dws_profile,
+            selected_profiles=args.profile,
+            limit=args.limit,
+            batch_id=args.batch_id,
+        )
+    except Exception:  # noqa: BLE001 - main() already logs a sanitized failure
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(cli())
-    except Exception:
-        raise SystemExit(1) from None
+    raise SystemExit(cli())
