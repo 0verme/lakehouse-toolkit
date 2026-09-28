@@ -232,6 +232,31 @@ DWP.TMP_P_REPORT_KYW_LIST
   => 必须识别为 Program Result，不得因 TMP 名称判 invalid
 ```
 
+### v13：Static empty Query Block（Issue #143）
+
+`LINEAGE_PIPELINE_VERSION` bump 为 `lineage-pipeline-v13-static-empty-query`。Parser 为 SELECT
+Query Block 生成静态恒假事实，恒假 block 与其子查询不再向 Physical DAG / `lineage_edge` /
+`lineage_business_edge` 贡献 source edge；其它独立 block 保留。Audit 新增 `STATIC_EMPTY_QUERY`
+并复用既有 `dwp.lineage_issue` lifecycle，证据不含 predicate literal 或完整 SQL。
+
+| DWS 对象 | 是否受影响 | 原因 |
+| --- | --- | --- |
+| `dwp.lineage_program_state` | 更新 version | 同 source hash 的 v12 state 会被判定为 CHANGED 并重建 |
+| `dwp.lineage_edge` / `dwp.lineage_business_edge` | **受影响** | 恒假 source edge 不再 active，真实同级/中间 lineage 仍保留 |
+| `dwp.lineage_issue` | **受影响** | 新的 STATIC_EMPTY_QUERY facts 随完整 batch materialize；旧 issue lifecycle 由现有机制处理 |
+| `dwp.lineage_schedule_edge` | 不受影响 | Schedule parser/materialization 与 SQL Query Block evaluator 独立 |
+| `dwp.lineage_reconciliation_suppression` | **必须重跑** | suppression 读取 active SQL 与 Schedule snapshots，新 SQL edge set 可能改变差异分类 |
+
+```text
+必须完整重跑 SQL lineage；不要使用 --limit
+Schedule lineage 不必重跑
+SQL active batch 发布后必须重跑 suppression
+之后 Web/CLI reconciliation 直接读取当前 active snapshots，无独立 persisted daily aggregate 迁移
+```
+
+详细 v1 判定范围、Issue lifecycle 和 DEV214 顺序见
+[`lineage_static_empty_query.md`](lineage_static_empty_query.md)。
+
 ## 6. 回归覆盖
 
 | 场景 | 测试 |

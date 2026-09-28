@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .physical_dag import SQLStep
 
 LEGACY_PARSER_BACKEND = "legacy"
-LEGACY_PARSER_BACKEND_VERSION = "legacy-parser-v2-relation-context"
+LEGACY_PARSER_BACKEND_VERSION = "legacy-parser-v3-static-empty-query"
 
 
 class SqlParseStatus(str, Enum):
@@ -121,6 +121,15 @@ class SqlAnalysis:
                     "sources": tuple(step.sources),
                     "target": step.target,
                     "ctes": ctes,
+                    "query_blocks": tuple(
+                        {
+                            "query_block_index": block.query_block_index,
+                            "parent_query_block_index": block.parent_query_block_index,
+                            "sources": tuple(block.sources),
+                            "static_empty_predicate_kind": block.static_empty_predicate_kind,
+                        }
+                        for block in step.query_blocks
+                    ),
                 }
             )
         return {

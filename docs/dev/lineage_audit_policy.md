@@ -36,7 +36,7 @@ Audit 不修改 Physical DAG，不折叠 TMP，也不决定 `LineageEdge` 是否
 
 `AuditFact` 是 detector 的 canonical 输出，包含：
 
-- `issue_type`：当前冻结的七类事实类型，不因 policy 增加 IssueType；
+- `issue_type`：当前八类事实类型，增加 issue 必须沿用现有 fact/policy/lifecycle contract；
 - `confidence`：`HIGH`、`MEDIUM`、`LOW`、`UNKNOWN` 的离散证据充分性判断，
   不是统计概率，也不表示经过 calibration 的 precision；
 - `rule_version`：解释 detector 规则和 fact 语义的版本；规则语义变化时保留旧
@@ -50,7 +50,7 @@ Audit 不修改 Physical DAG，不折叠 TMP，也不决定 `LineageEdge` 是否
 当前 `compute_lineage_issue_stable_key()` 的 identity contract 为：
 
 - program-level：`environment + source_profile + program_name + issue_type`；
-- `SELF_REFERENCE`：再加 `node_key`；
+- `SELF_REFERENCE` / `STATIC_EMPTY_QUERY`：再加 `node_key`（恒空查询使用 statement/query-block locator）；
 - `ORPHAN_BRANCH` / `LINEAGE_BRANCH_BROKEN`：再加 `branch_sink`；
 - `CYCLE_DETECTED`：再加 canonical sorted SCC node set。
 
@@ -127,6 +127,16 @@ store.set_issue_disposition(
 `ACCEPTED` / `FALSE_POSITIVE` 会在后续 policy replay 和 lifecycle reconciliation
 中保留，旧 batch 仍可读取。
 
+## STATIC_EMPTY_QUERY
+
+`STATIC_EMPTY_QUERY` 表示 parser 在一个 SELECT Query Block 上静态证明 predicate 恒假，
+不是对作者意图（结构复制或 SQL bug）的判断。恒假 block 及其子查询 source 不贡献
+Physical/Data Lineage edge；其它独立 Query Block 的 source 不受影响。Audit evidence 只保存
+statement/query-block index、statement type、target/source identifier、normalized false reason
+与 `CONSTANT_FALSE` evaluation，不保存完整 SQL 或 predicate literal。默认置信度为 `HIGH`、
+severity 为 `MEDIUM`、disposition 为 `OPEN`；人工可按现有流程接受/标记，后续完整 snapshot
+不再发现该 block 时沿既有生命周期标记 `RESOLVED`。
+
 ## Golden Corpus boundary
 
 Golden Corpus 的 `TRUE_POSITIVE`、`FALSE_POSITIVE`、`AMBIGUOUS`、`NO_ISSUE` 是
@@ -168,8 +178,8 @@ materialization 语义均未改变。
 
 ## Non-goals
 
-- 不新增大量 IssueType；
-- 不修改 parser、DatasetIdentity、ProgramIdentity 或 LineageEdge materialization；
+- 不引入第二套 issue/disposition、schema lineage 或 reconciliation table；
+- 不扩展为完整 SQL optimizer、arithmetic/function evaluator 或 SQL NULL 三值逻辑推导；
 - 不建设 DWS DDL、UI、通知或工单系统；
 - 不把 confidence 当成统计概率；
 - 不把 Audit 变成 materialization gate；

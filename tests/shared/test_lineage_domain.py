@@ -608,6 +608,7 @@ class LineageDomainTests(unittest.TestCase):
                 "CYCLE_DETECTED",
                 "SELF_REFERENCE",
                 "LINEAGE_BRANCH_BROKEN",
+                "STATIC_EMPTY_QUERY",
             },
         )
 

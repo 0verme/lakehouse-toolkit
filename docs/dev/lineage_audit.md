@@ -7,7 +7,9 @@ Phase 4 只消费 Phase 3 的 `ProgramPhysicalDAG`，把已经确认的程序事
 完整的 Fact / Policy / lifecycle contract 见
 [`lineage_audit_policy.md`](lineage_audit_policy.md)。Business Asset Boundary（DLO/DWO
 仅保留 Physical、Business sink 分类和 coverage 解释）见
-[`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。核心边界是：
+[`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。恒假 Query Block 的判定、
+证据脱敏和 pipeline migration 见
+[`lineage_static_empty_query.md`](lineage_static_empty_query.md)。核心边界是：
 
 ```text
 Physical DAG → AuditFact → AuditPolicy → LineageIssue projection → persistence/history
@@ -51,7 +53,7 @@ adjacency 都是调用期间建立的内部索引，PhysicalEdge 的方向仍然
 
 ## 当前 IssueType
 
-当前 `IssueType` 枚举共有七类。`ProgramLineageAuditor` 直接生成前六类；
+当前 `IssueType` 枚举共有八类。`ProgramLineageAuditor` 直接生成七类；
 `LINEAGE_BRANCH_BROKEN` 是现有 evolution/history transition 在旧分支曾到达
 expected target、当前变成 orphan 时生成的派生 issue，不是本次 Audit detector 新增的
 规则：
@@ -64,6 +66,7 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 | `TARGET_MISMATCH` | expected target 未被实际写入，且存在其它明确正式 sink 替代它 | `HIGH` |
 | `CYCLE_DETECTED` | 一个多节点 strongly connected component（SCC） | `HIGH` |
 | `SELF_REFERENCE` | 存在 `A → A` 的 PhysicalEdge | `HIGH` |
+| `STATIC_EMPTY_QUERY` | SELECT Query Block 的 predicate 可被静态证明恒假；source 不计入数据血缘，最小定位证据进入 `lineage_issue` | `MEDIUM` |
 | `LINEAGE_BRANCH_BROKEN` | 既有有效 target 分支在后续 snapshot 中断裂，由 evolution/history 派生 | `HIGH` |
 
 默认 severity 由兼容用的 `ISSUE_SEVERITY_POLICY` 集中定义，并通过

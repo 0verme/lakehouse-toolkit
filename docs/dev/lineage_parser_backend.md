@@ -36,7 +36,7 @@ Protocol 的语义化别名，不维护第二套接口。backend 必须提供：
 `SqlAnalysis` 的最小字段为：
 
 - `steps`：现有 `SQLStep` tuple；因此 `statement_type`、`sources`、`target`、
-  raw token、位置和 edge evidence 继续沿用当前 parser 输出；
+  raw token、位置和 edge evidence 继续沿用当前 parser 输出，并新增轻量 `query_blocks` facts；
 - `ctes`：与 `steps` 一一对应的 CTE 名称 tuple。CTE 仅是 parser evidence，
   不创建 Physical 节点或边；
 - `candidate_count`：保持现有 coverage 语义，不等同于 step 数量；
@@ -51,7 +51,7 @@ Protocol 的语义化别名，不维护第二套接口。backend 必须提供：
 ```json
 {
   "backend": "legacy",
-  "backend_version": "legacy-parser-v2-relation-context",
+  "backend_version": "legacy-parser-v3-static-empty-query",
   "parse_status": "success",
   "confidence": "high",
   "extraction_reason": "CANDIDATE_FOUND",
@@ -62,7 +62,15 @@ Protocol 的语义化别名，不维护第二套接口。backend 必须提供：
       "statement_type": "insert",
       "sources": ["ODS.DEMO_A"],
       "target": "DWA.DEMO_RESULT",
-      "ctes": ["BASE"]
+      "ctes": ["BASE"],
+      "query_blocks": [
+        {
+          "query_block_index": 0,
+          "parent_query_block_index": null,
+          "sources": ["ODS.DEMO_A"],
+          "static_empty_predicate_kind": null
+        }
+      ]
     }
   ]
 }
@@ -107,18 +115,21 @@ exception 不做静默 fallback，避免把错误误报成“无血缘”。
 
 ## 行为与 cache 兼容性
 
-本 PR 不修改：
+本次只扩展 legacy `SQLStep` 的 Query Block facts，并在 Physical DAG builder 中排除
+静态恒假的 block source；ProgramSource、target authority、TMP collapse、DatasetIdentity、
+column/runtime lineage 与 backend 选择 contract 保持不变。`SQLStep.sources` 保留解析到的
+引用供诊断，`lineage_sources` 只包含实际贡献 source-to-target data flow 的 source。
 
-- `ProgramSource`、`SQLStep`、Physical DAG、Audit、`LineageEdge`、Materialization；
-- target authority、TMP collapse、DWS、DatasetIdentity、column/runtime lineage；
-- legacy parser 的 candidate、statement、source/target、failure reason 和 edge evidence。
+每个 SELECT block 记录稳定的 block index、父 block、source identifier 与 normalized false
+reason；Audit 生成 `STATIC_EMPTY_QUERY` 时只持久化最小脱敏字段，不持久化谓词/完整 SQL。
+Fake backend contract test 仍验证旧 backend facade 的 SQLStep → Physical DAG → Audit →
+Materialization 链路。
 
-Fake backend contract test 对同一个 `SqlAnalysis` 走完整的 SQLStep → Physical DAG →
-Audit → Materialization 链路，比较 sources、target、statement type、parse reason、
-edge 和 issue 结果。
-
-`LINEAGE_PIPELINE_VERSION` 当前为
-`lineage-pipeline-v12-authoritative-target-binding`。Issue #121 将 `TMP` / `TEMP` / `STG` /
+Legacy adapter 的 compare contract 从 `legacy-parser-v2-relation-context` bump 到
+`legacy-parser-v3-static-empty-query`。`LINEAGE_PIPELINE_VERSION` 当前为
+`lineage-pipeline-v13-static-empty-query`。v13 使恒假 Query Block 的 source 不再进入已持久化
+Physical/Business lineage，同时保留现有 Audit lifecycle issue；同 source hash 的 v12 facts
+必须完整 rebuild。Issue #121 将 `TMP` / `TEMP` / `STG` /
 `TEST` 命名从 temporary classification 中移除、收口 `005` Program Inventory，并明确
 `DLO`/`DWO` 不进入正式 lineage；因此同一 source hash 的 v10 facts 必须 coherent rebuild。
 Issue #133 在 parser 确认的 SQLStep write target 上新增窄范围 authority binding：只有

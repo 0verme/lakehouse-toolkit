@@ -52,13 +52,20 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v12-authoritative-target-binding`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v13-static-empty-query`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
 bump 到新的语义版本，并在本文记录原因。v12 在 v11 上新增 authoritative unqualified
 write-target binding：qualified `ProgramSource.resolved_target` 与 unqualified SQL write
 target 只有在 canonical basename 精确一致时才绑定。相同 `source_hash` 在 v11 下可能
 persist 为 `M_YQDKX`、在 v12 下变为 `DWM.M_YQDKX`，所以所有 v11 active facts 都必须经
 完整快照 rebuild；partial replay 仍由 `PipelineVersionMigrationRequired` preflight 阻止。
+v13 对每个 SELECT Query Block 有界地识别可静态证明恒假的布尔字面量/字面量相等式。
+此类 block 及其子查询不贡献 Physical/Data Lineage source edge；独立的其它 Query Block
+仍分别保留。Audit 同时新增 `STATIC_EMPTY_QUERY`，在现有 `lineage_issue` 中保留
+statement/query-block 定位、source/target identifier 和归一化 false reason，不存谓词原文。
+这是 persisted lineage fact semantics 变化，因此所有 v12 active facts 都必须由完整 SQL
+snapshot rebuild；partial replay 由既有 pipeline-version preflight 阻止。Schedule facts 不受
+SQL parser/version 影响，但 SQL active facts 变化后必须重新运行 suppression。
 v11 在 v10 relation-context 的基础上废除
 表名式临时表推断、把 Program Inventory 收口为单一 `005` authority，并明确 `DLO`/`DWO`
 不进入正式 lineage；因此所有 v10 active facts 都必须整体 rebuild（partial replay 会被
