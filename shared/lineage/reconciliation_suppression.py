@@ -271,11 +271,26 @@ def _snapshot_observation_time(
 
 def _validate_classifier_inputs(
     result: LineageReconciliationResult,
-    sql_snapshot: SQLBusinessLineageSnapshot,
-    schedule_snapshot: ScheduleLineageSnapshot,
+    sql_snapshot: SQLBusinessLineageSnapshot | None = None,
+    schedule_snapshot: ScheduleLineageSnapshot | None = None,
 ) -> tuple[str, str, str]:
     if not isinstance(result, LineageReconciliationResult):
         raise TypeError("result must be a LineageReconciliationResult")
+    if (sql_snapshot is None) != (schedule_snapshot is None):
+        raise ReconciliationSuppressionError(
+            "SQL and schedule snapshots must be supplied together"
+        )
+
+    scope = (
+        result.environment,
+        result.sql_source_profile,
+        result.schedule_source_profile,
+    )
+    if sql_snapshot is None or schedule_snapshot is None:
+        # The raw active reconciliation result is the shared boundary and
+        # carries both active batch IDs plus both normalized scopes.
+        return scope
+
     if not isinstance(sql_snapshot, SQLBusinessLineageSnapshot):
         raise TypeError("sql_snapshot must be a SQLBusinessLineageSnapshot")
     if not isinstance(schedule_snapshot, ScheduleLineageSnapshot):
@@ -287,11 +302,6 @@ def _validate_classifier_inputs(
             "schedule snapshot batch provenance is stale"
         )
 
-    scope = (
-        result.environment,
-        result.sql_source_profile,
-        result.schedule_source_profile,
-    )
     sql_scope = (scope[0], scope[1])
     if not sql_snapshot.snapshot_scope or sql_scope not in sql_snapshot.snapshot_scope:
         raise ReconciliationSuppressionError(
@@ -388,24 +398,28 @@ def classify_program_inventory_status(
 
 def classify_reconciliation_suppressions(
     result: LineageReconciliationResult,
-    sql_snapshot: SQLBusinessLineageSnapshot,
-    schedule_snapshot: ScheduleLineageSnapshot,
+    sql_snapshot: SQLBusinessLineageSnapshot | None = None,
+    schedule_snapshot: ScheduleLineageSnapshot | None = None,
     *,
     program_states: Iterable[ProgramState] | None = None,
     observed_at: datetime | None = None,
 ) -> tuple[ReconciliationSuppression, ...]:
-    """Classify SQL_ONLY rows from the verified active program inventory.
+    """Classify raw SQL_ONLY rows from the active Program Inventory.
 
-    The comparison starts from SQL business edges versus schedule edges.
-    Program inventory only creates suppression candidates for SQL_ONLY rows;
-    valid candidates become the final relationship status. Missing or malformed
-    inventory raises :class:`ReconciliationSuppressionError`; callers must fail
-    open and keep those rows actionable as SQL_ONLY.
+    New callers pass the shared raw active reconciliation result directly;
+    optional paired snapshots remain supported for existing callers that also
+    need the legacy batch/scope cross-check. Missing or malformed inventory
+    raises :class:`ReconciliationSuppressionError`; callers must fail open and
+    keep those rows actionable as SQL_ONLY.
     """
 
     environment, sql_profile, schedule_profile = _validate_classifier_inputs(
         result, sql_snapshot, schedule_snapshot
     )
+    if any(row.status is ReconciliationStatus.SUPPRESSED for row in result.rows):
+        raise ReconciliationSuppressionError(
+            "suppression classifier requires a raw reconciliation result"
+        )
     effective_observed_at = _snapshot_observation_time(result, observed_at)
     if program_states is None:
         raise ReconciliationSuppressionError(

@@ -448,6 +448,7 @@ class LineageDailyDefaultRunnerTests(unittest.TestCase):
             sql_source_profile="sql_dev214",
             schedule_source_profile="schedule_dev214",
             target_tables=("DWM.TARGET_A", "DWM.TARGET_B"),
+            apply_suppression=True,
         )
 
     def test_main_returns_nonzero_for_failed_environment(self):
@@ -467,9 +468,21 @@ class LineageDailyCompatibilityTests(unittest.TestCase):
         args = imp_lineage_suppression.build_parser().parse_args(
             ["--environment", "DEV214", "--dry-run"]
         )
+        target_args = imp_lineage_suppression.build_parser().parse_args(
+            [
+                "--environment",
+                "DEV214",
+                "--target",
+                "DWM.TARGET_A",
+                "--target",
+                "DWM.TARGET_B",
+                "--dry-run",
+            ]
+        )
 
         self.assertEqual(args.environment, "DEV214")
         self.assertTrue(args.dry_run)
+        self.assertEqual(target_args.target, ["DWM.TARGET_A", "DWM.TARGET_B"])
 
     def test_daily_parser_has_no_ambiguous_dry_run_option(self):
         parser = imp_lineage_daily.build_parser()

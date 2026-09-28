@@ -380,6 +380,7 @@ def _build_reconciliation_runner() -> ReconciliationRunner:
             sql_source_profile=scope.sql_source_profile,
             schedule_source_profile=scope.schedule_source_profile,
             target_tables=affected_targets,
+            apply_suppression=True,
         )
 
     return execute

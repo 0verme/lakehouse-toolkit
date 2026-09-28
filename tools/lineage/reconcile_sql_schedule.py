@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
+from shared.lineage.environment_scope import load_lineage_environment_scope_resolver
 from shared.lineage.materialization_dws import DWSMaterializationStore
 from shared.lineage.reconciliation import (
     ActiveSnapshotNotFoundError,
@@ -46,14 +47,23 @@ class _ReconciliationArgumentParser(argparse.ArgumentParser):
         if parsed is None:
             self.error("argument parser returned no namespace")
         parsed_namespace = cast(argparse.Namespace, parsed)
-        try:
-            sql_profile, schedule_profile = _resolve_source_profiles(
-                source_profile=parsed_namespace.source_profile,
-                sql_source_profile=parsed_namespace.sql_source_profile,
-                schedule_source_profile=parsed_namespace.schedule_source_profile,
-            )
-        except ValueError as error:
-            self.error(str(error))
+        if (
+            parsed_namespace.source_profile is None
+            and parsed_namespace.sql_source_profile is None
+            and parsed_namespace.schedule_source_profile is None
+        ):
+            # Let the CLI resolve all profiles from the configured environment
+            # scope when the operator intentionally omits profile arguments.
+            sql_profile, schedule_profile = None, None
+        else:
+            try:
+                sql_profile, schedule_profile = _resolve_source_profiles(
+                    source_profile=parsed_namespace.source_profile,
+                    sql_source_profile=parsed_namespace.sql_source_profile,
+                    schedule_source_profile=parsed_namespace.schedule_source_profile,
+                )
+            except ValueError as error:
+                self.error(str(error))
         parsed_namespace.sql_source_profile = sql_profile
         parsed_namespace.schedule_source_profile = schedule_profile
         return cast(argparse.Namespace, parsed)
@@ -69,7 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dws-profile",
         default=os.getenv("PYTOOLS_LINEAGE_DWS_PROFILE") or None,
         metavar="DWS_PROFILE",
-        help="database profile used by the existing DWS connection boundary",
+        help=(
+            "database profile; when omitted, resolve it from the configured "
+            "environment scope"
+        ),
     )
     parser.add_argument(
         "--environment",
@@ -139,6 +152,7 @@ def run(
     suppression_store: Any | None = None,
     connection: Any | None = None,
     timing: ReconciliationTiming | None = None,
+    apply_suppression: bool = True,
 ) -> LineageReconciliationResult:
     """Read two DWS active snapshots and return their reconciliation report.
 
@@ -146,6 +160,10 @@ def run(
     connection across SQL, schedule and suppression reads.
     """
 
+    if not isinstance(apply_suppression, bool):
+        raise TypeError("apply_suppression must be a boolean")
+    if not apply_suppression and suppression_store is not None:
+        raise ValueError("raw reconciliation cannot receive a suppression store")
     if sql_store is None or schedule_store is None:
         if connection is None and (
             not isinstance(dws_profile, str) or not dws_profile.strip()
@@ -164,7 +182,8 @@ def run(
     )
     resolved_suppression_store = suppression_store
     if (
-        resolved_suppression_store is None
+        apply_suppression
+        and resolved_suppression_store is None
         and sql_store is None
         and schedule_store is None
     ):
@@ -183,6 +202,7 @@ def run(
         target_tables=target_tables,
         timing=timing,
         suppression_store=resolved_suppression_store,
+        apply_suppression=apply_suppression,
     )
 
 
@@ -369,11 +389,25 @@ def cli(argv: list[str] | None = None) -> int:
         target_table = target_values[0] if len(target_values) == 1 else None
         target_tables = target_values if len(target_values) > 1 else None
         timing = ReconciliationTiming()
+        dws_profile = args.dws_profile
+        sql_source_profile = args.sql_source_profile
+        schedule_source_profile = args.schedule_source_profile
+        if (
+            args.source_profile is None
+            and sql_source_profile is None
+            and schedule_source_profile is None
+        ):
+            scope = load_lineage_environment_scope_resolver().resolve(
+                args.environment
+            )
+            dws_profile = dws_profile or scope.dws_profile
+            sql_source_profile = scope.sql_source_profile
+            schedule_source_profile = scope.schedule_source_profile
         result = run(
-            dws_profile=args.dws_profile,
+            dws_profile=dws_profile,
             environment=args.environment,
-            sql_source_profile=args.sql_source_profile,
-            schedule_source_profile=args.schedule_source_profile,
+            sql_source_profile=sql_source_profile,
+            schedule_source_profile=schedule_source_profile,
             source_profile=args.source_profile,
             target_table=target_table,
             target_tables=target_tables,

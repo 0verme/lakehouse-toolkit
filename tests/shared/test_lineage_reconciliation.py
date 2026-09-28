@@ -1168,6 +1168,38 @@ class ActiveReaderContractTests(unittest.TestCase):
             {"target_tables": (target,)},
         )
 
+    def test_raw_active_dws_path_never_reads_suppression_evidence(self):
+        target = "DWM.TARGET_A"
+        source = "DWF.SOURCE_X"
+        schedule_row = FakeScheduleRow(
+            schedule_edge("DWF.OTHER", "DWM.OTHER_TARGET"),
+            "batch-schedule",
+        )
+        schedule_reader = FakeScheduleMetadataReader(
+            (schedule_row,),
+            metadata=SimpleNamespace(
+                batch_id="batch-schedule",
+                snapshot_scope=((ENVIRONMENT, PROFILE),),
+                observed_at=OBSERVED_AT,
+                is_active=True,
+            ),
+        )
+        with patch(
+            "shared.lineage.reconciliation_suppression.load_usable_suppressed_edge_keys"
+        ) as load_suppressions:
+            result = reconcile_active_dws_lineage(
+                FakeSQLReader((sql_edge(source, target),)),
+                schedule_reader,
+                environment=ENVIRONMENT,
+                source_profile=PROFILE,
+                target_table=target,
+                apply_suppression=False,
+            )
+
+        self.assertEqual(len(result.rows), 1)
+        self.assertIs(result.rows[0].status, ReconciliationStatus.SQL_ONLY)
+        load_suppressions.assert_not_called()
+
     def test_combined_active_reader_returns_both_snapshot_ids(self):
         sql = sql_edge("DWF.A", "DWM.RESULT_A", batch_id="batch-sql")
         schedule = schedule_edge("DWF.A", "DWM.RESULT_A")
@@ -1283,9 +1315,16 @@ class CliReportTests(unittest.TestCase):
         self.assertEqual(args.sql_source_profile, SQL_PROFILE)
         self.assertEqual(args.schedule_source_profile, SCHEDULE_PROFILE)
 
-    def test_cli_parser_rejects_missing_profile_scope(self):
+    def test_cli_parser_resolves_scope_but_rejects_partial_profiles(self):
+        args = build_parser().parse_args(["--environment", ENVIRONMENT])
+        self.assertIsNone(args.dws_profile)
+        self.assertIsNone(args.sql_source_profile)
+        self.assertIsNone(args.schedule_source_profile)
+
         with self.assertRaises(SystemExit):
-            build_parser().parse_args(["--environment", ENVIRONMENT])
+            build_parser().parse_args(
+                ["--environment", ENVIRONMENT, "--sql-profile", SQL_PROFILE]
+            )
 
     def test_cli_parser_rejects_conflicting_legacy_profile(self):
         with self.assertRaises(SystemExit):
