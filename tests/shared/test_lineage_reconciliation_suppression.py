@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import sqlite3
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -12,10 +12,18 @@ from unittest.mock import Mock, patch
 import jobs.crontab.imp_lineage_suppression as imp_lineage_suppression
 from jobs.crontab.imp_lineage_suppression import run
 from shared.lineage.domain import LineageEdge, ProgramState
+from shared.lineage.materialization_dws import program_key
+from shared.lineage.program_boundary import (
+    ProgramBoundaryBusinessEdge,
+    ProgramBoundaryProgram,
+    build_program_boundary_projections,
+)
 from shared.lineage.dws_timestamp import TIMESTAMPTZ_PARAM_SQL
 from shared.lineage.environment_scope import LineageEnvironmentScope
 from shared.lineage.reconciliation import (
+    ReconciliationFactProjection,
     ReconciliationStatus,
+    apply_reconciliation_suppressions,
     ScheduleLineageSnapshot,
     SQLBusinessLineageSnapshot,
     reconcile_lineage_snapshots,
@@ -37,6 +45,7 @@ from shared.lineage.reconciliation_suppression import (
     usable_suppressed_edge_keys,
 )
 from shared.lineage.schedule import ScheduleLineageEdge
+from tools.lineage.reconcile_sql_schedule import run as run_reconciliation
 
 ENVIRONMENT = "DEMO_DEV"
 OTHER_ENVIRONMENT = "DEMO_OTHER"
@@ -651,6 +660,19 @@ class ReconciliationSuppressionClassifierTests(unittest.TestCase):
         self.assertEqual(result.rows, original_rows)
         self.assertEqual(result.rows[0].status, ReconciliationStatus.SQL_ONLY)
 
+    def test_classifier_rejects_final_rows_to_prevent_self_reference(self):
+        _, _, result = make_no_producer_result()
+        final = apply_reconciliation_suppressions(
+            result,
+            (("DEMO_DWF.REFERENCE_A", "DEMO_DWM.RESULT_A"),),
+        )
+
+        with self.assertRaisesRegex(Exception, "raw reconciliation result"):
+            classify_reconciliation_suppressions(
+                final,
+                program_states=default_inventory(),
+            )
+
     def test_missing_scope_or_batch_provenance_fails_open(self):
         sql, schedule, result = make_no_producer_result()
         incomplete_sql = SQLBusinessLineageSnapshot(
@@ -1152,6 +1174,291 @@ class _FakeScheduleReader:
         return self.rows
 
 
+class _ProgramBoundarySQLStore:
+    def __init__(self, *, program_states, edge_specs):
+        self.program_states = tuple(program_states)
+        self.edge_specs = tuple(edge_specs)
+        self.program_state_calls = []
+
+    def get_active_snapshot_metadata(self):
+        return SimpleNamespace(
+            batch_id="batch-sql-command",
+            observed_at=OBSERVED_AT,
+            snapshot_scope=((ENVIRONMENT, SQL_PROFILE),),
+            is_active=True,
+        )
+
+    def read_reconciliation_projection(self, **_kwargs):
+        raise AssertionError("SQL must use Program Boundary projection")
+
+    def read_program_boundary_projection(
+        self, *, batch_id, environment, source_profile, target_tables=None
+    ):
+        self.asserted_batch_id = batch_id
+        states = tuple(
+            state
+            for state in self.program_states
+            if state.batch_id == batch_id
+            and state.environment == environment
+            and state.source_profile == source_profile
+            and state.is_active
+        )
+        programs = tuple(
+            ProgramBoundaryProgram(
+                environment=state.environment,
+                source_profile=state.source_profile,
+                program_key=program_key(state),
+                program_name=state.program_name,
+            )
+            for state in states
+        )
+        keys_by_name = {item.program_name: item.program_key for item in programs}
+        edges = tuple(
+            ProgramBoundaryBusinessEdge(
+                environment=environment,
+                source_profile=source_profile,
+                program_key=keys_by_name[program_name],
+                program_name=program_name,
+                source_table=source,
+                target_table=target,
+            )
+            for program_name, source, target in self.edge_specs
+        )
+        return build_program_boundary_projections(
+            programs,
+            edges,
+            target_tables=target_tables,
+        )
+
+    def read_program_states(
+        self, *, batch_id=None, active_only=False, environment=None
+    ):
+        self.program_state_calls.append(
+            {
+                "batch_id": batch_id,
+                "active_only": active_only,
+                "environment": environment,
+            }
+        )
+        return tuple(
+            state
+            for state in self.program_states
+            if (batch_id is None or state.batch_id == batch_id)
+            and (environment is None or state.environment == environment)
+            and (not active_only or state.is_active)
+        )
+
+
+class _ProgramBoundaryScheduleStore:
+    def get_active_snapshot_metadata(self):
+        return SimpleNamespace(
+            batch_id="batch-schedule-command",
+            observed_at=OBSERVED_AT,
+            snapshot_scope=((ENVIRONMENT, SCHEDULE_PROFILE),),
+            is_active=True,
+        )
+
+    def read_reconciliation_projection(self, *, target_tables=None, **_kwargs):
+        unrelated = ReconciliationFactProjection(
+            "DEMO_DWF.SCHEDULE_SOURCE", "DEMO_DWM.UNRELATED", 1, 1
+        )
+        if target_tables is not None and unrelated.target_table not in target_tables:
+            return ()
+        return (unrelated,)
+
+
+class ProgramBoundarySuppressionMaterializationTests(unittest.TestCase):
+    TARGET = "DWM.M_AGT_LN_ASSET_WRT_OFF_INFO"
+    STEP_ONE = f"005:{TARGET}:1:xx"
+    STEP_TWO = f"005:{TARGET}:2:xx"
+    EDGE_SPECS = (
+        (STEP_ONE, "DWF.PARA_CODE_MAP", "DWM.TMP_A"),
+        (STEP_ONE, "DWM.M_PUB_CODE_INFO_NEW", "DWM.TMP_PUB"),
+        (STEP_TWO, "DWM.TMP_A", "DWM.TMP_B"),
+        (STEP_TWO, "DWM.TMP_PUB", "DWM.TMP_B"),
+        (STEP_TWO, "DWM.TMP_B", TARGET),
+    )
+
+    def setUp(self) -> None:
+        self.scope = LineageEnvironmentScope(
+            name="demo_dev",
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+            label="synthetic program-boundary scope",
+            dws_profile="demo",
+        )
+
+    def _stores(self, *, internal_program_source: bool = False):
+        states = list(
+            inventory(
+                self.STEP_ONE,
+                self.STEP_TWO,
+                batch_id="batch-sql-command",
+            )
+        )
+        if internal_program_source:
+            states.append(
+                program_state(
+                    "005:DWF.PARA_CODE_MAP:1:xx",
+                    batch_id="batch-sql-command",
+                )
+            )
+        return (
+            _ProgramBoundarySQLStore(
+                program_states=states,
+                edge_specs=self.EDGE_SPECS,
+            ),
+            _ProgramBoundaryScheduleStore(),
+        )
+
+    def test_program_boundary_raw_relationships_are_classifier_input(self):
+        sql_store, schedule_store = self._stores()
+        result, suppressions = imp_lineage_suppression._reconcile_scope(
+            self.scope,
+            observed_at=OBSERVED_AT,
+            sql_store_factory=lambda _scope: sql_store,
+            schedule_store_factory=lambda _scope: schedule_store,
+        )
+        formal_raw = run_reconciliation(
+            dws_profile=self.scope.dws_profile,
+            environment=self.scope.environment,
+            sql_source_profile=self.scope.sql_source_profile,
+            schedule_source_profile=self.scope.schedule_source_profile,
+            sql_store=sql_store,
+            schedule_store=schedule_store,
+            apply_suppression=False,
+        )
+
+        expected = {
+            ("DWF.PARA_CODE_MAP", self.TARGET),
+            ("DWM.M_PUB_CODE_INFO_NEW", self.TARGET),
+        }
+        self.assertEqual(result, formal_raw)
+        target_rows = tuple(
+            row for row in result.rows if row.target_table == self.TARGET
+        )
+        self.assertEqual(
+            {
+                (row.source_table, row.target_table)
+                for row in target_rows
+                if row.status is ReconciliationStatus.SQL_ONLY
+            },
+            expected,
+        )
+        self.assertFalse(any("TMP_" in row.source_table for row in target_rows))
+        self.assertEqual(
+            {
+                (item.source_table, item.target_table)
+                for item in suppressions
+                if item.target_table == self.TARGET
+            },
+            expected,
+        )
+        self.assertTrue(
+            all(
+                item.suppression_reason
+                is ReconciliationSuppressionReason.NO_INTERNAL_PROGRAM
+                for item in suppressions
+            )
+        )
+        final = apply_reconciliation_suppressions(
+            result, (item.edge_identity for item in suppressions)
+        )
+        self.assertEqual(
+            {
+                (row.source_table, row.target_table): row.status
+                for row in final.rows
+                if (row.source_table, row.target_table) in expected
+            },
+            {edge: ReconciliationStatus.SUPPRESSED for edge in expected},
+        )
+        self.assertEqual(len(final.rows), len(result.rows))
+
+    def test_target_dry_run_shows_candidates_without_publishing(self):
+        sql_store, schedule_store = self._stores()
+        suppression_factory = Mock()
+        summaries = run(
+            (self.scope,),
+            environment=ENVIRONMENT,
+            target_tables=(self.TARGET,),
+            dry_run=True,
+            observed_at=OBSERVED_AT,
+            sql_store_factory=Mock(return_value=sql_store),
+            schedule_store_factory=Mock(return_value=schedule_store),
+            suppression_store_factory=suppression_factory,
+        )
+
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
+        self.assertEqual(summary.target_tables, (self.TARGET,))
+        self.assertEqual(summary.raw_sql_only_count, 2)
+        self.assertEqual(summary.suppressed_count, 2)
+        self.assertEqual(summary.actionable_sql_only_count, 0)
+        self.assertEqual(
+            {
+                row.source_table: (
+                    row.raw_status,
+                    row.final_classification,
+                    row.reason,
+                )
+                for row in summary.target_rows
+            },
+            {
+                "DWF.PARA_CODE_MAP": (
+                    ReconciliationStatus.SQL_ONLY,
+                    "SUPPRESSED_CANDIDATE",
+                    "NO_INTERNAL_PROGRAM",
+                ),
+                "DWM.M_PUB_CODE_INFO_NEW": (
+                    ReconciliationStatus.SQL_ONLY,
+                    "SUPPRESSED_CANDIDATE",
+                    "NO_INTERNAL_PROGRAM",
+                ),
+            },
+        )
+        self.assertEqual(
+            sql_store.program_state_calls,
+            [
+                {
+                    "batch_id": "batch-sql-command",
+                    "active_only": True,
+                    "environment": ENVIRONMENT,
+                }
+            ],
+        )
+        suppression_factory.assert_not_called()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            imp_lineage_suppression._emit_summary(summary)
+        self.assertIn("DWF.PARA_CODE_MAP", output.getvalue())
+        self.assertIn("DWM.M_PUB_CODE_INFO_NEW", output.getvalue())
+        self.assertIn("SUPPRESSED_CANDIDATE", output.getvalue())
+
+    def test_authoritative_source_program_stays_actionable(self):
+        sql_store, schedule_store = self._stores(internal_program_source=True)
+        result, suppressions = imp_lineage_suppression._reconcile_scope(
+            self.scope,
+            observed_at=OBSERVED_AT,
+            sql_store_factory=lambda _scope: sql_store,
+            schedule_store_factory=lambda _scope: schedule_store,
+            target_tables=(self.TARGET,),
+        )
+
+        para_row = next(
+            row for row in result.rows if row.source_table == "DWF.PARA_CODE_MAP"
+        )
+        self.assertIs(para_row.status, ReconciliationStatus.SQL_ONLY)
+        self.assertNotIn(
+            ("DWF.PARA_CODE_MAP", self.TARGET),
+            {item.edge_identity for item in suppressions},
+        )
+        self.assertIn(
+            ("DWM.M_PUB_CODE_INFO_NEW", self.TARGET),
+            {item.edge_identity for item in suppressions},
+        )
+
+
 class MaterializationCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.scope = LineageEnvironmentScope(
@@ -1207,6 +1514,25 @@ class MaterializationCommandTests(unittest.TestCase):
         self.assertEqual(summaries[0].actionable_sql_only_count, 0)
         self.suppression_factory.assert_not_called()
 
+    def test_target_scope_requires_dry_run_before_opening_stores(self):
+        sql_factory = Mock()
+        schedule_factory = Mock()
+        suppression_factory = Mock()
+
+        with self.assertRaisesRegex(ValueError, "requires --dry-run"):
+            run(
+                (self.scope,),
+                environment=ENVIRONMENT,
+                target_tables=("DEMO_DWM.RESULT_A",),
+                sql_store_factory=sql_factory,
+                schedule_store_factory=schedule_factory,
+                suppression_store_factory=suppression_factory,
+            )
+
+        sql_factory.assert_not_called()
+        schedule_factory.assert_not_called()
+        suppression_factory.assert_not_called()
+
     def test_inventory_failure_is_fail_open_and_does_not_publish(self):
         bad_sql_factory = Mock(
             return_value=_FakeSQLReader(
@@ -1250,7 +1576,7 @@ class MaterializationCommandTests(unittest.TestCase):
             sql_reader.program_state_calls,
             [
                 {
-                    "batch_id": None,
+                    "batch_id": "batch-sql-command",
                     "active_only": True,
                     "environment": ENVIRONMENT,
                 }

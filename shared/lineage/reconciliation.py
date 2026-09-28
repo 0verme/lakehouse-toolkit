@@ -1016,11 +1016,22 @@ def reconcile_active_dws_lineage(
     target_tables: Iterable[object] | str | None = None,
     timing: ReconciliationTiming | None = None,
     suppression_store: Any | None = None,
+    apply_suppression: bool = True,
 ) -> LineageReconciliationResult:
-    """Reconcile verified DWS snapshots with one batched target predicate."""
+    """Reconcile verified DWS snapshots, optionally applying final evidence.
+
+    Set ``apply_suppression=False`` for the raw MATCH/SQL_ONLY/SCHEDULE_ONLY
+    contract used by suppression materialization. This path never reads
+    suppression evidence and still uses the same active snapshots and Program
+    Boundary projection as the final reconciliation.
+    """
 
     if timing is not None and not isinstance(timing, ReconciliationTiming):
         raise TypeError("timing must be ReconciliationTiming or None")
+    if not isinstance(apply_suppression, bool):
+        raise TypeError("apply_suppression must be a boolean")
+    if not apply_suppression and suppression_store is not None:
+        raise ValueError("raw reconciliation cannot receive a suppression store")
     if target_table is not None and target_tables is not None:
         raise ValueError("target_table and target_tables are mutually exclusive")
     resolved_targets = (
@@ -1175,7 +1186,7 @@ def reconcile_active_dws_lineage(
         timing.reconciliation_cpu_ms = int((perf_counter() - cpu_started) * 1000)
         timing.reconciliation_rows = len(result.rows)
 
-    if suppression_store is not None:
+    if apply_suppression and suppression_store is not None:
         from shared.lineage.reconciliation_suppression import (
             load_usable_suppressed_edge_keys,
         )

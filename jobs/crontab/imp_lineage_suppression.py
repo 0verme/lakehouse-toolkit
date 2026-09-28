@@ -1,9 +1,10 @@
 """Materialize conservative reconciliation suppression audit rows.
 
-The command is intentionally separate from the PyWebIO page.  It reads the
-same configured environment scopes and the same active DWS snapshots, then
-writes only the explicit suppression audit projection.  A snapshot or
-classifier error never retires an existing scope's active suppression rows.
+The command is intentionally separate from the PyWebIO page. It reads the
+same configured environment scopes and raw active reconciliation result,
+including Program Boundary projection, then writes only the explicit
+suppression audit projection. A snapshot or classifier error never retires an
+existing scope's active suppression rows.
 """
 
 from __future__ import annotations
@@ -35,9 +36,8 @@ from shared.lineage.environment_scope import (  # noqa: E402
 from shared.lineage.materialization_dws import DWSMaterializationStore
 from shared.lineage.reconciliation import (
     LineageReconciliationResult,
-    read_active_schedule_snapshot,
-    read_active_sql_business_snapshot,
-    reconcile_lineage_snapshots,
+    ReconciliationStatus,
+    normalize_lineage_comparison_target_tables,
 )
 from shared.lineage.reconciliation_suppression import (
     DWSReconciliationSuppressionStore,
@@ -46,6 +46,18 @@ from shared.lineage.reconciliation_suppression import (
     classify_reconciliation_suppressions,
 )
 from shared.lineage.schedule_materialization import DWSScheduleLineageStore
+from tools.lineage.reconcile_sql_schedule import run as run_reconciliation
+
+
+@dataclass(frozen=True, slots=True)
+class SuppressionDryRunRelationship:
+    """One raw relationship and its non-published classifier outcome."""
+
+    target_table: str
+    source_table: str
+    raw_status: ReconciliationStatus
+    final_classification: str
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +73,8 @@ class SuppressionMaterializationSummary:
     dry_run: bool
     error: str | None = None
     affected_targets: tuple[str, ...] = ()
+    target_tables: tuple[str, ...] = ()
+    target_rows: tuple[SuppressionDryRunRelationship, ...] = ()
 
 
 ScopeStoreFactory = Callable[[LineageEnvironmentScope], Any]
@@ -141,13 +155,19 @@ def _reconcile_scope(
     observed_at: datetime,
     sql_store_factory: ScopeStoreFactory,
     schedule_store_factory: ScopeStoreFactory,
+    target_tables: tuple[str, ...] | None = None,
 ) -> tuple[LineageReconciliationResult, tuple[ReconciliationSuppression, ...]]:
     sql_store = sql_store_factory(scope)
     schedule_store = schedule_store_factory(scope)
-    sql_snapshot = read_active_sql_business_snapshot(
-        sql_store,
+    result = run_reconciliation(
+        dws_profile=scope.dws_profile,
         environment=scope.environment,
-        source_profile=scope.sql_source_profile,
+        sql_source_profile=scope.sql_source_profile,
+        schedule_source_profile=scope.schedule_source_profile,
+        target_tables=target_tables,
+        sql_store=sql_store,
+        schedule_store=schedule_store,
+        apply_suppression=False,
     )
     read_program_states = getattr(sql_store, "read_program_states", None)
     if not callable(read_program_states):
@@ -157,26 +177,13 @@ def _reconcile_scope(
     program_states = cast(
         Iterable[ProgramState],
         read_program_states(
+            batch_id=result.sql_batch_id,
             active_only=True,
             environment=scope.environment,
         ),
     )
-    schedule_snapshot = read_active_schedule_snapshot(
-        schedule_store,
-        environment=scope.environment,
-        source_profile=scope.schedule_source_profile,
-    )
-    result = reconcile_lineage_snapshots(
-        sql_snapshot,
-        schedule_snapshot,
-        environment=scope.environment,
-        sql_source_profile=scope.sql_source_profile,
-        schedule_source_profile=scope.schedule_source_profile,
-    )
     suppressions = classify_reconciliation_suppressions(
         result,
-        sql_snapshot,
-        schedule_snapshot,
         program_states=program_states,
         observed_at=observed_at,
     )
@@ -187,6 +194,7 @@ def run(
     scopes: Iterable[LineageEnvironmentScope],
     *,
     environment: str | None = None,
+    target_tables: Iterable[str] | str | None = None,
     dry_run: bool = False,
     observed_at: datetime | None = None,
     sql_store_factory: ScopeStoreFactory = _default_sql_store,
@@ -198,6 +206,13 @@ def run(
     resolved_scopes = _select_scopes(scopes, environment)
     if not resolved_scopes:
         raise ValueError("no enabled lineage environment scopes are configured")
+    resolved_targets = (
+        None
+        if target_tables is None
+        else normalize_lineage_comparison_target_tables(target_tables)
+    )
+    if resolved_targets is not None and not dry_run:
+        raise ValueError("target-scoped suppression requires --dry-run")
     effective_observed_at = observed_at or datetime.now(timezone.utc)
     if (
         effective_observed_at.tzinfo is None
@@ -215,6 +230,28 @@ def run(
                 observed_at=effective_observed_at,
                 sql_store_factory=sql_store_factory,
                 schedule_store_factory=schedule_store_factory,
+                target_tables=resolved_targets,
+            )
+            candidate_reasons = {
+                item.edge_identity: item.suppression_reason.value
+                for item in suppressions
+            }
+            target_rows = tuple(
+                SuppressionDryRunRelationship(
+                    target_table=row.target_table,
+                    source_table=row.source_table,
+                    raw_status=row.status,
+                    final_classification=(
+                        "SUPPRESSED_CANDIDATE"
+                        if row.status is ReconciliationStatus.SQL_ONLY
+                        and (row.source_table, row.target_table) in candidate_reasons
+                        else "ACTIONABLE_SQL_ONLY"
+                        if row.status is ReconciliationStatus.SQL_ONLY
+                        else row.status.value
+                    ),
+                    reason=candidate_reasons.get((row.source_table, row.target_table)),
+                )
+                for row in result.rows
             )
             affected_targets: tuple[str, ...] = ()
             if not dry_run:
@@ -243,6 +280,7 @@ def run(
                     actionable_sql_only_count=0,
                     dry_run=dry_run,
                     error=failure,
+                    target_tables=resolved_targets or (),
                 )
             )
             continue
@@ -257,6 +295,8 @@ def run(
                 actionable_sql_only_count=result.sql_only_count - len(suppressions),
                 dry_run=dry_run,
                 affected_targets=affected_targets,
+                target_tables=resolved_targets or (),
+                target_rows=target_rows if resolved_targets is not None else (),
             )
         )
 
@@ -284,6 +324,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="only materialize one enabled environment scope",
     )
     parser.add_argument(
+        "--target",
+        action="append",
+        default=None,
+        metavar="SCHEMA.TABLE",
+        help=(
+            "target-scoped classification; repeat for multiple targets "
+            "(requires --dry-run)"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="read and classify snapshots without writing the DWS audit table",
@@ -292,6 +342,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _emit_summary(summary: SuppressionMaterializationSummary) -> None:
+    if summary.target_tables:
+        rows_by_target: dict[str, list[SuppressionDryRunRelationship]] = {
+            target: [] for target in summary.target_tables
+        }
+        for row in summary.target_rows:
+            rows_by_target.setdefault(row.target_table, []).append(row)
+        for target in summary.target_tables:
+            print(f"environment={summary.environment}")
+            print(f"target={target}")
+            print(
+                f"sql_batch={summary.sql_batch_id or '-'} "
+                f"schedule_batch={summary.schedule_batch_id or '-'}"
+            )
+            print(
+                f"{'SOURCE_TABLE':<36} {'RAW_STATUS':<15} "
+                f"{'FINAL_CLASSIFICATION':<25} REASON"
+            )
+            target_rows = rows_by_target.get(target, [])
+            if not target_rows:
+                print("(no relationships)")
+            for row in target_rows:
+                print(
+                    f"{row.source_table:<36} {row.raw_status.value:<15} "
+                    f"{row.final_classification:<25} {row.reason or '-'}"
+                )
+        if summary.error is not None:
+            print(f"error={summary.error}")
+        return
+
     values = [
         f"environment={summary.environment}",
         f"sql_batch={summary.sql_batch_id or '-'}",
@@ -311,6 +390,7 @@ def main(
     *,
     config_path: str | Path | None = None,
     environment: str | None = None,
+    target_tables: Iterable[str] | str | None = None,
     dry_run: bool = False,
     scopes: Iterable[LineageEnvironmentScope] | None = None,
     observed_at: datetime | None = None,
@@ -324,6 +404,7 @@ def main(
     summaries = run(
         configured_scopes,
         environment=environment,
+        target_tables=target_tables,
         dry_run=dry_run,
         observed_at=observed_at,
         sql_store_factory=sql_store_factory,
@@ -341,6 +422,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
         return main(
             config_path=args.config,
             environment=args.environment,
+            target_tables=args.target,
             dry_run=args.dry_run,
         )
     except (LineageEnvironmentScopeError, ValueError, RuntimeError) as error:
