@@ -149,7 +149,7 @@ Do not modify a production crontab from the source PR. Back up the current user'
 The target form is:
 
 ```cron
-0 0,12 * * * /usr/bin/flock -n /tmp/pytool_lineage_daily.lock -c 'cd "$PYTOOL_ROOT" && "$PYTOOL_PYTHON" -B -m jobs.crontab.imp_lineage_daily --environment "$LINEAGE_ENVIRONMENT"' >> "$PYTOOL_ROOT/logs/lineage_daily.log" 2>&1
+0 0,12 * * * /usr/bin/flock -n /tmp/lineage_daily.lock -c 'cd "$PYTOOL_ROOT" && "$PYTOOL_PYTHON" -B -m jobs.crontab.imp_lineage_daily --environment "$LINEAGE_ENVIRONMENT"' >> "$PYTOOL_ROOT/logs/lineage_daily.log" 2>&1
 ```
 
 Before installing either form, substitute the shell variables with operator-approved absolute values; cron does not guarantee an interactive shell environment. Keep the single-lock behavior and redirect logs into the unified runtime log tree. After installation, confirm no active lineage cron points to the retired runtime.
