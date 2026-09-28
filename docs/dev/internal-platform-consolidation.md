@@ -18,14 +18,14 @@ The inventory has 29,671 union entries (287 tracked repository paths and 29,441 
 | --- | ---: | --- |
 | `SAME` | 8 | Same relative path and identical bytes. |
 | `DIFFERENT` | 48 | Same source path, different bytes; decisions below use imports, behavior, tests, and safety boundaries. |
-| `HOME_ONLY` | 66 | Historical source candidates; not implicitly deleted or copied. |
+| `HOME_ONLY` | 66 | Historical source-path classification only; not a migration scope or cutover blocker by itself. |
 | `LAKEHOUSE_ONLY` | 229 | Keep the current repository implementation, including the complete lineage module. |
 | `DEPLOYMENT_ONLY` | 2,942 | Preserve locally; never publish as source. |
 | `GENERATED` | 26,371 | Virtual environment, bytecode, and caches; do not publish. |
 | `SENSITIVE` | 3 | Historical local configuration files; keep out of Git. |
-| `UNKNOWN` | 4 | Legacy backups or an undecodable filename; retain pending owner review. |
+| `UNKNOWN` | 4 | Classification uncertainty only; owner scope decisions apply, and nothing is automatically deleted. |
 
-Some paths also carry secondary tags. In particular, 48 historical text files triggered a conservative credential/connection/private-address/absolute-path heuristic. A heuristic hit is not itself proof of a live credential, but it is a mandatory source-review and sanitization gate. The detector records only indicator names, never matched values.
+Some paths also carry secondary heuristic tags. In particular, 48 historical text files triggered a conservative credential/connection/private-address/absolute-path detector. A hit is not proof of a live credential. It creates a review gate only for code that is explicitly selected for migration; it does not override `DO_NOT_MIGRATE` or block cutover for excluded capabilities. The detector records indicator names only, never matched values.
 
 The raw machine inventory is an audit artifact, not a deployment list. It is regenerated when either input tree changes.
 
@@ -62,25 +62,96 @@ The two `_bootstrap.py` versions are behaviorally equivalent after parsing (the 
 
 The repository file is the portable base and already includes both lineage pages. The historical file contains local interpreter paths, internal URL/bind values, and many additional tools. These values must be migrated selectively into `configs/tools.local.yaml`; local-only tools are accepted by the new shared loader. Do not import historical endpoints or credentials into the base registry.
 
-### Same-path SVN review and batch-code differences
+### Owner scope decision: HCYT/NUPS
 
-The repository contains its tested Lakehouse/upstream rule architecture; the historical copy contains additional HCYT/NUPS rules and different UI routing. They are not equivalent implementations and have not been silently discarded or copied. HCYT/NUPS remain `PORT_TO_REPO` candidates, gated on configuration extraction, representative fixtures/tests, and an adapter into the current app. Historical cron/migration variants also have different contracts; retain them pending their owner and schedule inventory rather than choosing a version by age.
+HCYT/NUPS are explicitly `DO_NOT_MIGRATE`. Their historical rule and UI differences do not create a porting, security-refactor, test, PR, or production cutover requirement for this consolidation. Existing historical files are left untouched; this decision does not authorize deleting them.
 
-## Home-only capability disposition
+## HOME_ONLY disposition: source classification, not migration scope
 
-No historical-only application or operational job was deleted from the export or blindly copied into Git. The exported tree is untouched.
+`HOME_ONLY` means only that a path existed in the historical export and not in the repository snapshot. It does **not** mean that all 66 paths must be migrated, reviewed, retired, or resolved before production cutover. Owner decisions for this consolidation are:
 
-| Capability group | Disposition | Evidence / next safe action |
+| Capability | Decision | Scope effect |
 | --- | --- | --- |
-| Cigen root-management app | `PORT_TO_REPO` candidate | It is registered in the historical tool registry, but source review found deployment-specific connection/path material and one undecodable source file. Externalize settings, restore clean UTF-8 source, and add fixtures before porting. |
-| HCYT/NUPS SVN rules and pages | `PORT_TO_REPO` candidate | Distinct from the current Lakehouse rule set. Keep both capabilities; sanitize private configuration, add representative fixtures, and integrate as explicit project adapters before replacing the historical app. |
-| Interface manager | `NEEDS_CONFIRMATION` | It handles downstream endpoint/account data and uses local SQLite state; confirm active ownership and add an access-control/data-path review before source publication. Preserve its database file. |
-| Metric portal | `NEEDS_CONFIRMATION` / `DEPRECATE_CANDIDATE` | The non-MVP code has unauthenticated write operations; the MVP contains a weak default administrator credential. Confirm whether this is active, then harden or retire it explicitly. Preserve local database files. |
-| CMS/development-efficiency and internal cron/tools | `NEEDS_CONFIRMATION` | Operational status, owners, schedules, and secret/config sources cannot be established by file presence. Several sources contain private-address/path or credential-like indicators. Externalize configuration and test before porting. |
-| Historical Shark cycle-check duplicate | `DEPRECATE_CANDIDATE` | The repository has a separately registered and tested `tools/jobgraph` implementation. Compare expected output before disabling the older entry. |
-| `*.pybak`, `tools.yamlbak`, archived YAML, unknown text | `DEPRECATE_CANDIDATE` / `UNKNOWN` | Do not delete automatically; confirm ownership and whether they are required recovery artifacts. |
+| HCYT / NUPS | `DO_NOT_MIGRATE` | No port, code/security changes, tests, or new PR. Not a cutover blocker. |
+| Cigen | `DO_NOT_MIGRATE` | No port, code/security changes, tests, or new PR. Not a cutover blocker. |
+| Interface Manager | `DO_NOT_MIGRATE` | No port or remediation work in this consolidation. Not a cutover blocker. |
+| Metric Portal | `DO_NOT_MIGRATE` | No port or remediation work in this consolidation. Not a cutover blocker. |
+| backup / yamlbak / historical backup content | `DO_NOT_MIGRATE` | Never copy into the repository; preserve existing files. No automatic cleanup is authorized. Not a cutover blocker. |
+| Internal cron / tools | `REVIEW_ACTIVE_RUNTIME` | Identify only entries required by the future unified runtime; uncertain entries remain `NEEDS_RUNTIME_CONFIRMATION`. |
+| Historical Shark cycle-check duplicate | `COMPARE_WITH_JOBGRAPH` | Complete the explicit parity review below; do not remove historical files. |
 
-These are the remaining deployment gates. Until each active HOME_ONLY capability is ported or explicitly retired, a full source-directory overwrite is unsafe. The current change makes the shared runtime contract ready but does not claim that every historical business module has been consolidated.
+`DO_NOT_MIGRATE` is not permission to delete production files. The historical tree and backup artifacts are not changed or cleaned by this work. Only active runtime requirements and the Shark comparison, alongside deployment validation, can hold production cutover.
+
+### Internal cron / tools: unresolved source candidates
+
+The local inventory records relative paths, but the historical source tree is not available in this review workspace. No historical source contents, production crontab, or ignored local tool registry were read. Therefore the source inventory alone cannot establish whether any listed file is still active, who invokes it, or whether a file is an entry point or a helper. These candidates are all `NEEDS_RUNTIME_CONFIRMATION`; that label records uncertainty and does **not** assert that every file is needed or active.
+
+| Relative path | Tool/task name | Candidate entry file | Called by | Why unresolved |
+| --- | --- | --- | --- | --- |
+| `jobs/cms/cms_compare.py` | `cms_compare` | Same file; entry status unverified | Unknown | Inventory path only; source and caller evidence unavailable. |
+| `jobs/cms/cms_compare_create.py` | `cms_compare_create` | Same file; entry status unverified | Unknown | Inventory path only; source and caller evidence unavailable. |
+| `jobs/crontab/czcb_sc.py` | `czcb_sc` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/crontab/imp_dwuprr.py` | `imp_dwuprr` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/crontab/imp_dwuprr_local_send.py` | `imp_dwuprr_local_send` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/crontab/imp_moia_dws.py` | `imp_moia_dws` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/crontab/imp_seachar_directories.py` | `imp_seachar_directories` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/crontab/import_mapping_to_sqlite.py` | `import_mapping_to_sqlite` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/crontab/svn_fine.py` | `svn_fine` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/crontab/unzip_moia.py` | `unzip_moia` | Same file; entry status unverified | Unknown | No approved crontab/runtime schedule evidence. |
+| `jobs/deveff/_bootstrap.py` | `_bootstrap` helper | Helper candidate; caller unknown | Unknown | Inventory path only; source call graph unavailable. |
+| `jobs/deveff/auto_publishlist.py` | `auto_publishlist` | Same file; entry status unverified | Unknown | Inventory path only; source and caller evidence unavailable. |
+| `jobs/deveff/deveff.py` | `deveff` | Same file; entry status unverified | Unknown | Inventory path only; source and caller evidence unavailable. |
+| `shared/lineage/didp_lineage.py` | `didp_lineage` helper | Entry/helper status unknown | Unknown | Inventory path only; source call graph unavailable. |
+| `shared/lineage/job_lineage.py` | `job_lineage` helper | Entry/helper status unknown | Unknown | Inventory path only; source call graph unavailable. |
+| `tools/cms/cms_comments.py` | `cms_comments` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/cms_compare.py` | `cms_compare` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/cms_compare_create.py` | `cms_compare_create` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/cms_compareklq.py` | `cms_compareklq` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/didp_lineage_roamer.py` | `didp_lineage_roamer` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/didp_schedule_diff.py` | `didp_schedule_diff` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/didp_sql_upstream_to_dwf.py` | `didp_sql_upstream_to_dwf` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/dws_create_cms.py` | `dws_create_cms` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/seachar_didp_mysql.py` | `seachar_didp_mysql` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/xueyuan_xd.py` | `xueyuan_xd` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/cms/xueyuan_xd2.py` | `xueyuan_xd2` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/czcb/auto_svn.py` | `auto_svn` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/misc/auto_test_job.py` | `auto_test_job` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/misc/tiaopao.py` | `tiaopao` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/misc/xueyuan.py` | `xueyuan` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/misc/xueyuan_sql.py` | `xueyuan_sql` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/misc/yilaii.py` | `yilaii` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/search/seachar_didp.py` | `seachar_didp` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/search/seachar_yuan.py` | `seachar_yuan` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+| `tools/sql/cms_create_foreign_table.py` | `cms_create_foreign_table` | Same file; entry status unverified | Unknown | Inventory path only; local registry/manual caller unavailable. |
+
+Phase 2A must obtain an owner-approved runtime inventory (for example, approved crontab entries, the deployed local tool registry, or documented manual workflows) and match each active task to its source entry and dependency chain. Only tasks shown to be required are candidates for migration; do not retire or migrate based on file presence alone.
+
+### Shark vs `tools/jobgraph` parity
+
+Historical inventory paths are `tools/shark/job_dependency_cycle_check.py`, `tools/shark/tiaopao_214.py`, `tools/shark/tiaopao_224.py`, and `tools/shark/tiaopao_31.py`. Their source contents and call graph are not available in this review, so these filenames cannot establish behavior or active use.
+
+| Comparison | Current `tools/jobgraph` evidence | Historical Shark evidence | Result |
+| --- | --- | --- | --- |
+| Input | Reads job/dependency pairs from the configured logical `relations` table; ignores null job names. | Unknown; source unavailable. | Not comparable yet. |
+| Output | PyWebIO preview, `EVT` dependency warnings, and cycle list (bounded to 50). | Unknown. | Not comparable yet. |
+| Core rules | Normalizes names to uppercase, de-duplicates edges, flags `EVT` dependencies, then calls `find_cycles`. | Unknown. | Parity unproven. |
+| Page / CLI entry | `tools/jobgraph/job_dependency_cycle_check.py` starts a PyWebIO page and is registered as `job_dependency_cycle`; the tracked registry currently sets it disabled. No parity test was found. | Historical page/CLI entry and registration status unknown. | Not comparable yet. |
+| Dependencies / callers | Uses `pymysql`, `shared.graph.dependency`, metadata-table configuration, and required MySQL credentials. | Unknown. | Call graph and input contract unproven. |
+| Unique capability | This implementation covers its own configured cycle check only. | The three `tiaopao_*` files may be separate capabilities, but filenames do not prove their behavior. | Historical-only capability status unknown. |
+
+**Decision: `NEEDS_RUNTIME_CONFIRMATION`.** There is not enough code evidence to claim `REPLACED_BY_JOBGRAPH` or `KEEP_BOTH`. Phase 2B must compare historical source behavior, inputs/outputs, entry points and callers against jobgraph. Do not delete historical Shark files in this phase.
+
+## Phase sequence and production cutover gate
+
+PR #146 is **Phase 1 / 公共平台桥接层**. It provides shared registry, webadmin/tool-manager/PyWebIO integration, escaping, GaussDB compatibility, schema-config cron compatibility, dependency/ignore updates, docs and tests. **Merge #146 does not equal production cutover** and does not authorize deployment.
+
+Production cutover remains on hold only for these actual remaining workstreams:
+
+- Phase 2A: confirm which internal cron/tools are active and required, then migrate only those.
+- Phase 2B: complete the Shark/jobgraph parity decision.
+- Phase 3: validate the target runtime, production-local configuration and database profile/JAR, `tools.local.yaml`, lineage scopes, reviewed deployment manifest, webadmin/lineage smoke, approved crontab switch, and one approved daily run with idempotency/result checks.
+
+HCYT/NUPS, Cigen, Interface Manager, Metric Portal, and backup/yamlbak content are not cutover blockers and are not part of these phases.
 
 ## Lineage completeness and management integration
 
@@ -92,33 +163,38 @@ The original Streamlit webadmin remains the sole management home. Its registry l
 
 Deployment uses an approved source release and an operator-provided `PYTOOL_ROOT` / `PYTOOL_PYTHON`. Do not source code from a second runtime tree. The repository does not encode the production absolute paths.
 
-### Files/directories to deploy after the HOME_ONLY gate is closed
+### Positive deployment allowlist
 
-- Source directories: `apps/`, `jobs/`, `shared/`, `tools/`.
-- Tracked public runtime configuration: `configs/tools.yaml`, `configs/*.example.yaml`, and `configs/migrate/*.example.json` (where present).
-- Runtime dependency contract: `requirements.txt`.
-- Documentation and tests may be copied for audit, but are not required by the running web processes.
-- Do not use recursive deletion. Deploy by explicit source paths and review the file list before applying. Until HCYT/NUPS and other active HOME_ONLY code is merged or retired, exclude their conflicting paths from any staging sync and do not declare the source cutover complete.
+At an approved future cutover, deploy only from a clean, reviewed repository release. Build a positive manifest from tracked source files under `apps/`, `jobs/`, `shared/`, and `tools/`, plus the explicit public runtime files below. Do not sync the release root and rely on an expanding `--exclude` list. No recursive deletion is permitted.
 
-A non-destructive staged copy can use `rsync -a` without `--delete`, with explicit exclusions for local configuration/state (shown as shell variables so the real path is not stored here):
+The public config templates currently tracked for operator reference are `configs/audit_datasource.example.yaml`, `configs/database.example.yaml`, `configs/lineage_providers.example.yaml`, `configs/migrate/clusters.example.json`, `configs/svn.example.yaml`, and `configs/svn_inventory.example.yaml`. Include only those templates approved for the release; never deploy local config files.
+
+A future cutover operator may generate and inspect an allowlist like this. These commands are documentation only and were **not** run in this PR:
 
 ```bash
-rsync -a \
-  --exclude='/.git/' \
-  --exclude='/configs/database.yaml' \
-  --exclude='/configs/database.local.yaml' \
-  --exclude='/configs/lineage_providers.local.yaml' \
-  --exclude='/configs/tools.local.yaml' \
-  --exclude='/configs/svn.yaml' \
-  --exclude='/configs/migrate/clusters.json' \
-  --exclude='/data/' --exclude='/logs/' --exclude='/runtime/' \
-  --exclude='/tmp/' --exclude='/backup_sc/' --exclude='/send_files/' \
-  --exclude='/venv/' --exclude='/resources/jars/*.jar' \
-  --exclude='/resources/xlsx/' \
-  "$RELEASE_ROOT/" "$PYTOOL_ROOT/"
+MANIFEST=$(mktemp)
+{
+  git -C "$RELEASE_ROOT" ls-files -- apps/ jobs/ shared/ tools/
+  printf '%s\n' \
+    configs/tools.yaml \
+    configs/audit_datasource.example.yaml \
+    configs/database.example.yaml \
+    configs/lineage_providers.example.yaml \
+    configs/migrate/clusters.example.json \
+    configs/svn.example.yaml \
+    configs/svn_inventory.example.yaml \
+    requirements.txt
+} | LC_ALL=C sort -u > "$MANIFEST"
+
+# Review the exact prospective changes first; this is a dry run.
+rsync -ain --files-from="$MANIFEST" "$RELEASE_ROOT/" "$PYTOOL_ROOT/"
+
+# Only after explicit deployment approval and manifest review:
+rsync -ai --files-from="$MANIFEST" "$RELEASE_ROOT/" "$PYTOOL_ROOT/"
+rm -f "$MANIFEST"
 ```
 
-This is deliberately not a green light to overwrite unresolved same-path business code. Review the staged diff and exclusions against the local inventory before the copy. Do not run with `--delete`.
+The manifest contains file paths only; it does not include `.git`, local configuration (`database.yaml`, `*.local.yaml`, `svn.yaml`, local cluster files), runtime state, logs, databases/SQLite, JARs, workbooks, caches, or backups. Review same-path changes in the dry-run output before applying: an allowlisted file may replace an existing file at that path. Files outside the allowlist are left untouched. Do not add `--delete`.
 
 ## Files to preserve
 
@@ -128,7 +204,7 @@ Preserve these in place and outside Git:
 - `data/`, `logs/`, `runtime/`, `tmp/`, `backup_sc/`, `send_files/`, virtual environments, generated outputs, local SQLite/database files, and internal workspaces.
 - All JDBC/JAR binaries, including the operator-managed GaussDB driver. Never copy a bundled/local JAR into the repository.
 - Historical resource data such as local `resources/xlsx/*.xlsx`; the repository-tracked mapping workbook is an empty scaffold and must not replace the historical populated mapping data. New local workbooks under this path are now ignored by Git.
-- Any source or local recovery file marked `NEEDS_CONFIRMATION`, `UNKNOWN`, or `DEPRECATE_CANDIDATE` until its owner makes a decision.
+- Historical source/recovery files outside the approved allowlist, including `DO_NOT_MIGRATE` capabilities and unresolved cron/tool or Shark files. Preserve them in place; this is not authorization for production cleanup.
 
 ## Configuration migration steps
 
