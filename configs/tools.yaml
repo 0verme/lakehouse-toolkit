@@ -136,7 +136,7 @@ tools:
     auto_restart: false
 
   - name: lineage_explorer
-    title: 血缘探索
+    title: 血缘查询 / Explorer
     group: lineage
     type: python
     workdir: tools/lineage

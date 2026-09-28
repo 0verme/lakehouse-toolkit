@@ -160,7 +160,7 @@ Before installing either form, substitute the shell variables with operator-appr
 
 1. Start the existing `webadmin` tool through its manager, using the locally configured interpreter, port, bind host, and public URL.
 2. Start/check `lineage_reconciliation` and `lineage_explorer` through that same manager. They are entries in the tracked registry, not separate homepages.
-3. Open the existing webadmin URL and select **SQL / 调度血缘对账** or **血缘探索**. Use the operator-configured public base URL; the tracked localhost default is not a production URL.
+3. Open the existing webadmin URL and select **SQL / 调度血缘对账** or **血缘查询 / Explorer**. Use the operator-configured public base URL; the tracked localhost default is not a production URL.
 4. Confirm the local scope config exposes only approved environments and that a page load does not attempt to publish suppression data. Reconciliation writes occur only through the explicit daily/publish commands.
 
 ## Validation commands

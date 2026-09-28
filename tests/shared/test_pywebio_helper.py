@@ -50,12 +50,15 @@ class PywebioHelperTests(unittest.TestCase):
     def test_lineage_pages_are_in_the_public_management_registry(self):
         pywebio_helper.load_tools_config.cache_clear()
         try:
-            names = {tool["name"] for tool in pywebio_helper.load_tools_config()}
+            tools = {
+                tool["name"]: tool for tool in pywebio_helper.load_tools_config()
+            }
         finally:
             pywebio_helper.load_tools_config.cache_clear()
 
-        self.assertIn("lineage_reconciliation", names)
-        self.assertIn("lineage_explorer", names)
+        self.assertIn("lineage_reconciliation", tools)
+        self.assertIn("lineage_explorer", tools)
+        self.assertEqual(tools["lineage_explorer"]["title"], "血缘查询 / Explorer")
 
     def test_resolve_registered_port_from_local_only_tool_config(self):
         tmp = make_temp_dir()
