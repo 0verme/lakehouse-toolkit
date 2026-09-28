@@ -66,7 +66,8 @@ def build_create_table_sql(table_name: str, fields: list[str]) -> str:
     columns = ['"source_file" TEXT'] + [
         f'"{safe_identifier(field, "column")}" TEXT' for field in fields
     ]
-    return f"CREATE TABLE {table_name} (\n    {',\n    '.join(columns)}\n);"
+    column_sql = ",\n    ".join(columns)
+    return f"CREATE TABLE {table_name} (\n    {column_sql}\n);"
 
 
 def truncate_table(table_name: str = TABLE_NAME):

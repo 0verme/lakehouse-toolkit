@@ -217,7 +217,7 @@ class LineageExplorerWebTests(unittest.TestCase):
         config = yaml.safe_load((root / "configs" / "tools.yaml").read_text(encoding="utf-8"))
         matches = [item for item in config["tools"] if item["name"] == "lineage_explorer"]
         self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["title"], "血缘探索")
+        self.assertEqual(matches[0]["title"], "血缘查询 / Explorer")
         self.assertEqual(matches[0]["workdir"], "tools/lineage")
         self.assertEqual(matches[0]["script"], "lineage_explorer_web.py")
 

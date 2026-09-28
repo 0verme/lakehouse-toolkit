@@ -10,7 +10,13 @@ from pathlib import Path
 
 import psutil
 import streamlit as st
-import yaml
+
+BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from shared.config.tool_registry import load_tool_configuration  # noqa: E402
 
 st.set_page_config(
     page_title="工具管理台",
@@ -18,8 +24,6 @@ st.set_page_config(
     layout="wide",
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-ROOT_DIR = BASE_DIR.parents[1]
 CONFIG_PATH = ROOT_DIR / "configs" / "tools.yaml"
 LOCAL_CONFIG_PATH = ROOT_DIR / "configs" / "tools.local.yaml"
 MANAGER_PATH = BASE_DIR / "manager" / "tool_manager.py"
@@ -34,23 +38,7 @@ def load_config() -> dict:
         st.error(f"未找到配置文件: {CONFIG_PATH}")
         st.stop()
 
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if LOCAL_CONFIG_PATH.exists():
-        with open(LOCAL_CONFIG_PATH, encoding="utf-8") as f:
-            local_data = yaml.safe_load(f) or {}
-        local_tools = {
-            str(tool.get("name")): tool
-            for tool in local_data.get("tools", [])
-            if isinstance(tool, dict) and tool.get("name")
-        }
-        data = dict(data)
-        data.update({key: value for key, value in local_data.items() if key != "tools"})
-        data["tools"] = [
-            {**tool, **local_tools.get(str(tool.get("name")), {})}
-            for tool in data.get("tools", [])
-        ]
-    return data
+    return load_tool_configuration(CONFIG_PATH, LOCAL_CONFIG_PATH)
 
 
 def load_tools() -> list[dict]:

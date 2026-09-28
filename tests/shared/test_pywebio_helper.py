@@ -47,6 +47,70 @@ def make_temp_dir():
 
 
 class PywebioHelperTests(unittest.TestCase):
+    def test_lineage_pages_are_in_the_public_management_registry(self):
+        pywebio_helper.load_tools_config.cache_clear()
+        try:
+            tools = {
+                tool["name"]: tool for tool in pywebio_helper.load_tools_config()
+            }
+        finally:
+            pywebio_helper.load_tools_config.cache_clear()
+
+        self.assertIn("lineage_reconciliation", tools)
+        self.assertIn("lineage_explorer", tools)
+        self.assertEqual(tools["lineage_explorer"]["title"], "血缘查询 / Explorer")
+
+    def test_resolve_registered_port_from_local_only_tool_config(self):
+        tmp = make_temp_dir()
+        try:
+            config_path = tmp / "tools.yaml"
+            local_config_path = tmp / "tools.local.yaml"
+            config_path.write_text(json.dumps({"tools": []}), encoding="utf-8")
+            local_config_path.write_text(
+                json.dumps(
+                    {
+                        "tools": [
+                            {
+                                "name": "lineage_reconciliation",
+                                "title": "SQL / 调度血缘对账",
+                                "workdir": "tools/lineage",
+                                "script": "reconcile_sql_schedule_web.py",
+                                "port": 8614,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            main_module = types.SimpleNamespace(
+                __file__="tools/lineage/reconcile_sql_schedule_web.py"
+            )
+            with (
+                patch.object(pywebio_helper, "TOOLS_CONFIG_PATH", config_path),
+                patch.object(
+                    pywebio_helper, "LOCAL_TOOLS_CONFIG_PATH", local_config_path
+                ),
+                patch.dict(sys.modules, {"__main__": main_module}),
+            ):
+                pywebio_helper.load_tools_config.cache_clear()
+                port = pywebio_helper.resolve_registered_port()
+                title = pywebio_helper.resolve_tool_title("default")
+        finally:
+            pywebio_helper.load_tools_config.cache_clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        self.assertEqual(port, 8614)
+        self.assertEqual(title, "SQL / 调度血缘对账")
+
+    def test_put_red_text_escapes_untrusted_markup(self):
+        with patch.object(pywebio_helper, "put_markdown") as put_markdown:
+            pywebio_helper.put_red_text("<script>alert(1)</script>")
+
+        self.assertEqual(
+            put_markdown.call_args.args[0],
+            "<p style=\"color:red;\">&lt;script&gt;alert(1)&lt;/script&gt;</p>",
+        )
+
     def test_resolve_registered_port_from_tools_config(self):
         tmp = make_temp_dir()
         try:

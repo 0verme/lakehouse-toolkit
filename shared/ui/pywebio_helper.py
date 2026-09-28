@@ -9,10 +9,11 @@ from html import escape
 from pathlib import Path
 
 import pywebio
-import yaml
 from pywebio import config
 from pywebio.input import TEXT, textarea
 from pywebio.output import put_html, put_markdown, put_text
+
+from shared.config.tool_registry import load_tool_configuration
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 TOOLS_CONFIG_PATH = ROOT_DIR / "configs" / "tools.yaml"
@@ -34,23 +35,8 @@ def normalize_rel_path(path_str: str) -> str:
 
 @lru_cache(maxsize=1)
 def load_tools_config() -> list[dict]:
-    if not TOOLS_CONFIG_PATH.exists():
-        return []
-    with open(TOOLS_CONFIG_PATH, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    local_tools = {}
-    if LOCAL_TOOLS_CONFIG_PATH.exists():
-        with open(LOCAL_TOOLS_CONFIG_PATH, encoding="utf-8") as f:
-            local_data = yaml.safe_load(f) or {}
-        local_tools = {
-            str(tool.get("name")): tool
-            for tool in local_data.get("tools", [])
-            if isinstance(tool, dict) and tool.get("name")
-        }
-    return [
-        {**tool, **local_tools.get(str(tool.get("name")), {})}
-        for tool in data.get("tools", [])
-    ]
+    data = load_tool_configuration(TOOLS_CONFIG_PATH, LOCAL_TOOLS_CONFIG_PATH)
+    return data.get("tools", [])
 
 
 def resolve_current_tool_config() -> dict | None:
@@ -97,7 +83,7 @@ def put_black_text(text: str):
 
 
 def put_red_text(text: str):
-    put_markdown(f'<p style="color:red;">{text}</p>')
+    put_markdown(f'<p style="color:red;">{escape(text)}</p>')
 
 
 def put_table_plus(table_data):
