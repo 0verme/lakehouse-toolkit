@@ -28,8 +28,8 @@ from shared.lineage.domain import (
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
 
-AUDIT_RULE_VERSION = "audit-rule-v1"
-AUDIT_POLICY_VERSION = "audit-policy-v1"
+AUDIT_RULE_VERSION = "audit-rule-v2-static-empty-query"
+AUDIT_POLICY_VERSION = "audit-policy-v2-static-empty-query"
 
 ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
     {
@@ -40,6 +40,7 @@ ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
         IssueType.ORPHAN_BRANCH: "MEDIUM",
         IssueType.LINEAGE_BRANCH_BROKEN: "HIGH",
         IssueType.MULTI_SINK_CANDIDATE: "MEDIUM",
+        IssueType.STATIC_EMPTY_QUERY: "MEDIUM",
     }
 )
 
@@ -976,7 +977,7 @@ def compute_lineage_issue_stable_key(
     ):
         identity["scope"] = "branch"
         identity["branch_sink"] = branch_sink
-    elif resolved_type is IssueType.SELF_REFERENCE:
+    elif resolved_type in (IssueType.SELF_REFERENCE, IssueType.STATIC_EMPTY_QUERY):
         identity["scope"] = "node"
         identity["node_key"] = node_key
     elif resolved_type is IssueType.CYCLE_DETECTED:
@@ -1107,6 +1108,53 @@ class ProgramLineageAuditor:
         )
 
         facts: list[AuditFact] = []
+
+        for step in dag.steps:
+            blocks = {block.query_block_index: block for block in step.query_blocks}
+            for block in step.query_blocks:
+                if not block.is_statically_empty:
+                    continue
+                related_sources = set(block.sources)
+                for candidate in step.query_blocks:
+                    current = candidate
+                    while current.parent_query_block_index is not None:
+                        if current.parent_query_block_index == block.query_block_index:
+                            related_sources.update(candidate.sources)
+                            break
+                        parent = blocks.get(current.parent_query_block_index)
+                        if parent is None:
+                            break
+                        current = parent
+                node_key = (
+                    f"statement:{step.statement_index}/"
+                    f"query_block:{block.query_block_index}"
+                )
+                evidence: dict[str, object] = {
+                    "evaluation": "CONSTANT_FALSE",
+                    "false_reason": block.static_empty_predicate_kind,
+                    "query_block_index": block.query_block_index,
+                    "source_tables": sorted(related_sources),
+                    "statement_index": step.statement_index,
+                    "statement_type": step.statement_type,
+                    "target_table": step.target,
+                }
+                if step.line_number is not None:
+                    evidence["line_number"] = step.line_number
+                if step.column_number is not None:
+                    evidence["column_number"] = step.column_number
+                facts.append(
+                    _make_fact(
+                        dag,
+                        IssueType.STATIC_EMPTY_QUERY,
+                        node_key=node_key,
+                        message=(
+                            "A query block is statically proven to produce no rows; "
+                            "its sources are excluded from data lineage."
+                        ),
+                        evidence=evidence,
+                        confidence=AuditConfidence.HIGH,
+                    )
+                )
 
         self_edges: dict[str, PhysicalEdge] = {}
         for edge in edges:

@@ -8,7 +8,7 @@ Golden Corpus 用于可重复地抽取 Audit fact、做人工事实标注、计�
 `ProgramLineageAuditor` 的 detection rule、severity policy、evidence 或 issue identity。
 `candidate_from_fact()` 与 `candidate_from_issue()` 都只读取 fact 部分。
 
-当前代码的 `IssueType` 枚举共有七类：
+当前代码的 `IssueType` 枚举共有八类：
 
 | 类型 | 来源 |
 | --- | --- |
@@ -18,9 +18,10 @@ Golden Corpus 用于可重复地抽取 Audit fact、做人工事实标注、计�
 | `TARGET_MISMATCH` | `ProgramLineageAuditor` |
 | `CYCLE_DETECTED` | `ProgramLineageAuditor` |
 | `SELF_REFERENCE` | `ProgramLineageAuditor` |
+| `STATIC_EMPTY_QUERY` | `ProgramLineageAuditor` |
 | `LINEAGE_BRANCH_BROKEN` | 现有 evolution/history transition 派生 |
 
-因此直接 Audit replay 目前覆盖六类，history transition fixture 额外覆盖
+因此直接 Audit replay 目前覆盖七类，history transition fixture 额外覆盖
 `LINEAGE_BRANCH_BROKEN`。Golden Corpus 不会把它伪装成直接 detector output。
 
 ## Fact correctness 与 business acceptance
@@ -181,7 +182,7 @@ label = NO_ISSUE
 
 `tests/fixtures/lineage/audit_golden_corpus.jsonl` 是已标注、可提交的 regression
 corpus。它只含 fingerprint、计数/布尔 evidence summary 和标签，不含真实 identity。
-测试会用固定 seed replay sample id/fingerprint，并验证七类当前 `IssueType` 均可
+测试会用固定 seed replay sample id/fingerprint，并验证八类当前 `IssueType` 均可
 被覆盖。Synthetic fixture 暴露出的 detector 行为只作为 evidence；本 Issue 不在
 此处修 detector。
 

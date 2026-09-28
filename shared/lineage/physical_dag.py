@@ -12,6 +12,7 @@ import re
 import tokenize
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from string import Formatter
 from textwrap import dedent
@@ -183,6 +184,21 @@ class SQLExtractionReason(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class SQLQueryBlock:
+    """一个 SELECT Query Block 的脱敏静态事实。"""
+
+    query_block_index: int
+    parent_query_block_index: int | None
+    sources: tuple[str, ...] = ()
+    raw_sources: tuple[str, ...] = ()
+    static_empty_predicate_kind: str | None = None
+
+    @property
+    def is_statically_empty(self) -> bool:
+        return self.static_empty_predicate_kind is not None
+
+
+@dataclass(frozen=True, slots=True)
 class SQLStep:
     """一个可静态确认的程序 SQL statement。
 
@@ -203,6 +219,48 @@ class SQLStep:
     is_temporary: bool = False
     insert_mode: str | None = None
     evidence: Mapping[str, object] = field(default_factory=dict)
+    query_blocks: tuple[SQLQueryBlock, ...] = ()
+    non_query_sources: tuple[str, ...] = ()
+
+    @property
+    def lineage_sources(self) -> tuple[str, ...]:
+        """返回实际贡献写入数据流的 source，不含恒空 block 及其子 block。"""
+
+        if not self.query_blocks:
+            return self.sources
+
+        blocks = {block.query_block_index: block for block in self.query_blocks}
+        non_query_sources = set(self.non_query_sources)
+        result: list[str] = []
+        for source in self.sources:
+            owners = [block for block in self.query_blocks if source in block.sources]
+            if not owners:
+                if source in non_query_sources:
+                    result.append(source)
+                continue
+
+            contributes = False
+            for owner in owners:
+                current: SQLQueryBlock | None = owner
+                suppressed = False
+                while current is not None:
+                    if current.is_statically_empty:
+                        suppressed = True
+                        break
+                    parent_index = current.parent_query_block_index
+                    current = blocks.get(parent_index) if parent_index is not None else None
+                if not suppressed:
+                    contributes = True
+                    break
+            if contributes:
+                result.append(source)
+        return tuple(result)
+
+    @property
+    def lineage_raw_sources(self) -> tuple[str, ...]:
+        sources = self.lineage_sources
+        source_raw = dict(zip(self.sources, self.raw_sources, strict=False))
+        return tuple(source_raw.get(source, source) for source in sources)
 
     @property
     def statement_kind(self) -> str:
@@ -1008,6 +1066,327 @@ def _find_sources(
     return tuple(sources)
 
 
+@dataclass(frozen=True, slots=True)
+class _SQLToken:
+    text: str
+    start: int
+    end: int
+    depth: int
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryBlockRange:
+    query_block_index: int
+    start: int
+    end: int
+    depth: int
+    parent_query_block_index: int | None
+
+
+_SQL_NUMERIC_LITERAL = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+_SQL_BOOLEAN_LITERAL = r"(?:TRUE|FALSE)"
+_SQL_LITERAL = rf"(?:{_SQL_NUMERIC_LITERAL}|{_SQL_BOOLEAN_LITERAL})"
+_QUERY_BLOCK_TERMINATORS = frozenset(
+    {
+        "EXCEPT",
+        "FETCH",
+        "GROUP",
+        "HAVING",
+        "INTERSECT",
+        "LIMIT",
+        "OFFSET",
+        "ORDER",
+        "QUALIFY",
+        "UNION",
+        "WINDOW",
+    }
+)
+
+
+def _sql_tokens(sql_text: str) -> tuple[_SQLToken, ...]:
+    """Scan words and parentheses while skipping quoted identifiers/literals."""
+
+    tokens: list[_SQLToken] = []
+    depth = 0
+    index = 0
+    while index < len(sql_text):
+        char = sql_text[index]
+        if char in "'`\"[":
+            index = _skip_sql_quoted_identifier(sql_text, index)
+            continue
+        if char == "(":
+            depth += 1
+            tokens.append(_SQLToken("(", index, index + 1, depth))
+            index += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            tokens.append(_SQLToken(")", index, index + 1, depth))
+            index += 1
+            continue
+        if char.isalpha() or char in "_$#":
+            start = index
+            index += 1
+            while index < len(sql_text) and (
+                sql_text[index].isalnum() or sql_text[index] in "_$#"
+            ):
+                index += 1
+            tokens.append(
+                _SQLToken(sql_text[start:index].upper(), start, index, depth)
+            )
+            continue
+        if char == ";":
+            tokens.append(_SQLToken(";", index, index + 1, depth))
+        index += 1
+    return tuple(tokens)
+
+
+def _query_block_ranges(sql_text: str) -> tuple[_QueryBlockRange, ...]:
+    tokens = _sql_tokens(sql_text)
+    select_positions = [
+        (index, token)
+        for index, token in enumerate(tokens)
+        if token.text == "SELECT"
+    ]
+    ranges: list[_QueryBlockRange] = []
+    for block_index, (token_index, select_token) in enumerate(select_positions):
+        end = len(sql_text)
+        for token in tokens[token_index + 1 :]:
+            if token.depth < select_token.depth and token.text == ")":
+                end = token.start
+                break
+            if token.depth != select_token.depth:
+                continue
+            if token.text in _QUERY_BLOCK_TERMINATORS or token.text == "SELECT":
+                end = token.start
+                break
+            if token.text == ";":
+                end = token.start
+                break
+
+        parents = [
+            item
+            for item in ranges
+            if item.depth < select_token.depth
+            and item.start < select_token.start < item.end
+        ]
+        parent = max(
+            parents,
+            key=lambda item: (item.depth, item.start),
+            default=None,
+        )
+        ranges.append(
+            _QueryBlockRange(
+                query_block_index=block_index,
+                start=select_token.start,
+                end=end,
+                depth=select_token.depth,
+                parent_query_block_index=(
+                    None if parent is None else parent.query_block_index
+                ),
+            )
+        )
+    return tuple(ranges)
+
+
+def _strip_redundant_parentheses(expression: str) -> str:
+    text = expression.strip()
+    while len(text) >= 2 and text[0] == "(":
+        depth = 0
+        closes_at_end = False
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char in "'`\"[":
+                index = _skip_sql_quoted_identifier(text, index)
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth < 0:
+                    break
+                if depth == 0:
+                    closes_at_end = index == len(text) - 1
+                    if not closes_at_end:
+                        break
+            index += 1
+        if not closes_at_end:
+            break
+        text = text[1:-1].strip()
+    return text
+
+
+def _top_level_and_terms(expression: str) -> tuple[tuple[str, ...], bool]:
+    tokens = _sql_tokens(expression)
+    separators: list[int] = []
+    between_pending = False
+    has_top_level_or = False
+    for token in tokens:
+        if token.depth != 0:
+            continue
+        if token.text == "BETWEEN":
+            between_pending = True
+        elif token.text == "AND":
+            if between_pending:
+                between_pending = False
+            else:
+                separators.append(token.start)
+        elif token.text == "OR":
+            has_top_level_or = True
+    if has_top_level_or:
+        return (), True
+    if not separators:
+        return (expression,), False
+    terms: list[str] = []
+    start = 0
+    for position in separators:
+        terms.append(expression[start:position])
+        token = next(token for token in tokens if token.start == position)
+        start = token.end
+    terms.append(expression[start:])
+    return tuple(terms), False
+
+
+def predicate_is_statically_false(predicate: str) -> str | None:
+    """Return a bounded normalized proof kind, or None when not proven false."""
+
+    expression = _strip_redundant_parentheses(predicate)
+    if expression.upper() == "FALSE":
+        return "boolean_false"
+
+    literal_equality = re.fullmatch(
+        rf"(?P<left>{_SQL_LITERAL})\s*=\s*(?P<right>{_SQL_LITERAL})",
+        expression,
+        re.IGNORECASE,
+    )
+    if literal_equality is not None:
+        left = literal_equality.group("left").upper()
+        right = literal_equality.group("right").upper()
+        left_boolean = left in {"TRUE", "FALSE"}
+        right_boolean = right in {"TRUE", "FALSE"}
+        if left_boolean == right_boolean:
+            if left_boolean:
+                equal = left == right
+            else:
+                try:
+                    equal = Decimal(left) == Decimal(right)
+                except InvalidOperation:
+                    equal = True
+            if not equal:
+                return "literal_comparison_false"
+
+    terms, has_or = _top_level_and_terms(expression)
+    if has_or or len(terms) <= 1:
+        return None
+    for term in terms:
+        false_kind = predicate_is_statically_false(term)
+        if false_kind is not None:
+            return false_kind
+    return None
+
+
+def _query_block_predicate(
+    sanitized_sql: str,
+    query_range: _QueryBlockRange,
+) -> str | None:
+    tokens = _sql_tokens(sanitized_sql)
+    selected = False
+    where_token: _SQLToken | None = None
+    for token in tokens:
+        if token.start < query_range.start:
+            continue
+        if token.start >= query_range.end:
+            break
+        if not selected:
+            if token.text == "SELECT" and token.start == query_range.start:
+                selected = True
+            continue
+        if token.depth != query_range.depth:
+            continue
+        if token.text == "WHERE":
+            where_token = token
+            break
+    if where_token is None:
+        return None
+
+    end = query_range.end
+    for token in tokens:
+        if token.start <= where_token.end or token.start >= query_range.end:
+            continue
+        if token.depth == query_range.depth and token.text in _QUERY_BLOCK_TERMINATORS:
+            end = token.start
+            break
+    predicate = sanitized_sql[where_token.end : end].strip()
+    return predicate or None
+
+
+def _query_blocks_for_statement(
+    sanitized_sql: str,
+    cte_names: set[str],
+) -> tuple[tuple[SQLQueryBlock, ...], tuple[str, ...]]:
+    ranges = _query_block_ranges(sanitized_sql)
+    if not ranges:
+        return (), ()
+
+    block_sources: dict[int, list[_RawAsset]] = {
+        item.query_block_index: [] for item in ranges
+    }
+    block_source_seen: dict[int, set[str]] = {
+        item.query_block_index: set() for item in ranges
+    }
+    non_query_sources: list[str] = []
+    non_query_seen: set[str] = set()
+    tokens_by_start = {token.start: token for token in _sql_tokens(sanitized_sql)}
+    for match in _SOURCE_PATTERN.finditer(sanitized_sql):
+        following_text = sanitized_sql[match.end() :].lstrip()
+        if following_text.startswith("(") or _is_expression_level_source(
+            sanitized_sql, match
+        ):
+            continue
+        normalized = _normalize_asset(match.group("table"))
+        if not normalized or normalized in cte_names:
+            continue
+        relation_token = tokens_by_start.get(match.start("keyword"))
+        owners = [
+            item
+            for item in ranges
+            if item.start < match.start() < item.end
+            and relation_token is not None
+            and relation_token.depth == item.depth
+        ]
+        owner = max(owners, key=lambda item: item.start, default=None)
+        if owner is None:
+            if normalized not in non_query_seen:
+                non_query_seen.add(normalized)
+                non_query_sources.append(normalized)
+            continue
+        seen = block_source_seen[owner.query_block_index]
+        if normalized not in seen:
+            seen.add(normalized)
+            block_sources[owner.query_block_index].append(
+                _RawAsset(match.group("table"), normalized)
+            )
+
+    blocks: list[SQLQueryBlock] = []
+    for item in ranges:
+        predicate = _query_block_predicate(sanitized_sql, item)
+        predicate_kind = (
+            None if predicate is None else predicate_is_statically_false(predicate)
+        )
+        sources = block_sources[item.query_block_index]
+        blocks.append(
+            SQLQueryBlock(
+                query_block_index=item.query_block_index,
+                parent_query_block_index=item.parent_query_block_index,
+                sources=tuple(source.normalized_name for source in sources),
+                raw_sources=tuple(source.raw_name for source in sources),
+                static_empty_predicate_kind=predicate_kind,
+            )
+        )
+    return tuple(blocks), tuple(non_query_sources)
+
+
 def _matched_target(
     statement_type: str,
     match: re.Match[str] | None,
@@ -1089,6 +1468,10 @@ def _parse_statement_with_ctes(
     )
     sources = tuple(item.normalized_name for item in source_items)
     raw_sources = tuple(item.raw_name for item in source_items)
+    query_blocks, non_query_sources = _query_blocks_for_statement(
+        sanitized,
+        cte_names,
+    )
     evidence: dict[str, object] = {
         "statement_index": statement_index,
         "statement_type": target_info.statement_type,
@@ -1112,6 +1495,8 @@ def _parse_statement_with_ctes(
             is_temporary=target_info.is_temporary,
             insert_mode=target_info.insert_mode,
             evidence=evidence,
+            query_blocks=query_blocks,
+            non_query_sources=non_query_sources,
         ),
         tuple(sorted(cte_names)),
     )
@@ -1319,7 +1704,7 @@ def build_program_physical_dag(
             )
 
     for step in steps:
-        for source in step.sources:
+        for source in step.lineage_sources:
             add_node(source)
         if step.target is None:
             continue
@@ -1327,9 +1712,13 @@ def build_program_physical_dag(
         add_node(step.target, temporary=step.is_temporary)
         if step.target not in written_targets:
             written_targets.append(step.target)
-        for index, source in enumerate(step.sources):
+        lineage_sources = step.lineage_sources
+        lineage_raw_sources = step.lineage_raw_sources
+        for index, source in enumerate(lineage_sources):
             raw_source = (
-                step.raw_sources[index] if index < len(step.raw_sources) else None
+                lineage_raw_sources[index]
+                if index < len(lineage_raw_sources)
+                else None
             )
             key = (source, step.target)
             occurrence = _edge_occurrence(step, source, raw_source)
@@ -1402,9 +1791,11 @@ __all__ = [
     "SQLExtractionReason",
     "ProgramPhysicalDAGBuilder",
     "ProgramSQLStep",
+    "SQLQueryBlock",
     "SQLStep",
     "build_physical_dag",
     "build_program_physical_dag",
     "extract_program_sql_steps",
     "extract_sql_steps",
+    "predicate_is_statically_false",
 ]

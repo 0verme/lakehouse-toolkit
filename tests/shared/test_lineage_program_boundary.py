@@ -4,6 +4,9 @@ import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from shared.lineage.domain import IssueType, ProgramSource
+from shared.lineage.materialization import materialize_program
+from shared.lineage.physical_dag import build_program_physical_dag
 from shared.lineage.program_boundary import (
     ProgramBoundaryBusinessEdge,
     ProgramBoundaryProgram,
@@ -66,6 +69,104 @@ def complex_edges(
 
 
 class ProgramBoundaryProjectionTests(unittest.TestCase):
+    def test_static_empty_query_does_not_trigger_result_source_fallback(self) -> None:
+        program_name = f"005:{TARGET}:1:00"
+        program_key = "program-static-empty"
+        source = ProgramSource(
+            environment=ENVIRONMENT,
+            source_profile=SQL_PROFILE,
+            program_name=program_name,
+            expected_target=TARGET,
+            script_code="""
+                INSERT INTO DEMO_DWM.TMP_00 SELECT * FROM DEMO_DWF.A;
+                INSERT INTO DEMO_DWM.TMP_04 SELECT * FROM DEMO_DWM.TMP_00;
+                INSERT INTO DEMO_DWM.TMP_04_0 SELECT * FROM DEMO_DWM.TMP_04;
+                INSERT INTO DEMO_DWM.RESULT SELECT * FROM DEMO_DWM.TMP_04_0;
+                CREATE TABLE DEMO_DWM.TMP_04_0 AS
+                    SELECT * FROM DEMO_DWM.RESULT WHERE 1 = 2;
+            """,
+        )
+        dag = build_program_physical_dag(source)
+        materialization = materialize_program(dag, batch_id="batch-static-empty")
+
+        self.assertNotIn((TARGET, "DEMO_DWM.TMP_04_0"), dag.edge_pairs)
+        self.assertNotIn(
+            (TARGET, "DEMO_DWM.TMP_04_0"),
+            {
+                (item.source_table, item.target_table)
+                for item in materialization.edges
+            },
+        )
+        self.assertIn(
+            IssueType.STATIC_EMPTY_QUERY,
+            {item.issue_type for item in materialization.issues},
+        )
+
+        boundary_program = program(program_name, key=program_key)
+        boundary_edges = tuple(
+            ProgramBoundaryBusinessEdge(
+                environment=ENVIRONMENT,
+                source_profile=SQL_PROFILE,
+                program_key=program_key,
+                program_name=program_name,
+                source_table=item.source_table,
+                target_table=item.target_table,
+            )
+            for item in materialization.edges
+        )
+        projection = build_program_boundary_projections(
+            (boundary_program,), boundary_edges, target_tables=(TARGET,)
+        )[0]
+        self.assertFalse(projection.used_direct_fallback)
+        self.assertNotIn("PROGRAM_RESULT_USED_AS_SOURCE", projection.diagnostics)
+        self.assertEqual(
+            [item.source_table for item in projection.dependencies],
+            ["DEMO_DWF.A"],
+        )
+
+        sql_reader = _BoundaryReader(
+            (projection,),
+            side="sql",
+            batch_id="batch-sql-static-empty",
+            scope=((ENVIRONMENT, SQL_PROFILE),),
+        )
+        schedule_reader = _BoundaryReader(
+            (),
+            side="schedule",
+            batch_id="batch-schedule-static-empty",
+            scope=((ENVIRONMENT, SCHEDULE_PROFILE),),
+            schedule_sources=("DEMO_DWF.A",),
+        )
+        reconciliation = reconcile_active_dws_lineage(
+            sql_reader,
+            schedule_reader,
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+            target_tables=(TARGET,),
+            apply_suppression=False,
+        )
+        self.assertEqual(len(reconciliation.rows), 1)
+        self.assertIs(reconciliation.rows[0].status, ReconciliationStatus.MATCH)
+
+    def test_true_result_source_edge_keeps_existing_boundary_protection(self) -> None:
+        name = f"005:{TARGET}:1:00"
+        projection = build_program_boundary_projections(
+            (program(name, key="program-real-result-source"),),
+            (
+                edge(name, "program-real-result-source", "DEMO_DWF.A", TARGET),
+                edge(name, "program-real-result-source", TARGET, "DEMO_DWM.OTHER"),
+            ),
+            target_tables=(TARGET,),
+        )[0]
+
+        self.assertTrue(projection.used_direct_fallback)
+        self.assertIn("PROGRAM_RESULT_USED_AS_SOURCE", projection.diagnostics)
+        self.assertEqual(
+            [item.source_table for item in projection.dependencies],
+            ["DEMO_DWF.A"],
+        )
+
     def test_simple_program_keeps_direct_external_inputs(self) -> None:
         name = f"005:{TARGET}:1:00"
         projection = build_program_boundary_projections(

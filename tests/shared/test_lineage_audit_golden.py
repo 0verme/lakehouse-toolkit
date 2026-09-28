@@ -86,7 +86,11 @@ def manual_sample(
 def synthetic_candidates() -> tuple[AuditCandidate, ...]:
     candidates: list[AuditCandidate] = []
     for name, script in SYNTHETIC_PROGRAMS.items():
-        expected_target = None if name in {"self_reference", "cycle_detected"} else EXPECTED_TARGET
+        expected_target = (
+            None
+            if name in {"self_reference", "cycle_detected", "static_empty_query"}
+            else EXPECTED_TARGET
+        )
         result = audit_program_physical_dag(
             build_dag(script, expected_target=expected_target, name=f"DEMO_{name.upper()}"),
             observed_at=OBSERVED_AT,
@@ -145,6 +149,7 @@ class AuditGoldenCorpusTests(unittest.TestCase):
                 "CYCLE_DETECTED",
                 "SELF_REFERENCE",
                 "LINEAGE_BRANCH_BROKEN",
+                "STATIC_EMPTY_QUERY",
             },
         )
 
@@ -410,7 +415,7 @@ class AuditGoldenCorpusTests(unittest.TestCase):
             / "audit_golden_corpus.jsonl"
         )
         corpus = read_corpus(corpus_path, require_labels=True)
-        self.assertEqual(len(corpus), 8)
+        self.assertEqual(len(corpus), 9)
         self.assertEqual(
             {sample.issue_type for sample in corpus if sample.issue_type is not None},
             set(IssueType),

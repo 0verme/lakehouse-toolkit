@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import cast
 
 from shared.lineage.audit import (  # pyright: ignore[reportMissingImports]
+    AUDIT_POLICY_VERSION,
+    AUDIT_RULE_VERSION,
     ProgramLineageAuditor,
     TargetSelectionMode,
     audit_program_physical_dag,
@@ -14,12 +17,19 @@ from shared.lineage.audit import (  # pyright: ignore[reportMissingImports]
     select_materialization_target,
 )
 from shared.lineage.domain import (
+    AuditConfidence,
+    IssueDisposition,
     IssueType,
     LineageIssue,
     ProgramSource,
     parse_declared_primary_target,
 )
+from shared.lineage.evolution import (
+    IssueLifecycleStatus,
+    reconcile_issue_lifecycle,
+)
 from shared.lineage.lineage_builder import normalize_table_name
+from shared.lineage.materialization import materialize_program
 from shared.lineage.physical_dag import (
     ProgramPhysicalDAG,
     build_program_physical_dag,
@@ -87,6 +97,83 @@ def issue_signature(result) -> tuple[tuple[object, ...], ...]:
 
 
 class LineageAuditTests(unittest.TestCase):
+    def test_static_empty_query_issue_uses_existing_audit_lifecycle(self):
+        observed_at = datetime(2026, 9, 20, 8, 9, 10, tzinfo=timezone.utc)
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="DEMO_STATIC_EMPTY_AUDIT",
+            expected_target="DWM.EMPTY_TABLE",
+            script_code=(
+                "CREATE TABLE DWM.EMPTY_TABLE AS SELECT * FROM DWF.SOURCE_A "
+                "WHERE FALSE"
+            ),
+        )
+        materialization = materialize_program(
+            build_program_physical_dag(source),
+            batch_id="batch-static-empty-audit",
+            observed_at=observed_at,
+        )
+        issue = issue_of(materialization, IssueType.STATIC_EMPTY_QUERY)
+
+        self.assertEqual(issue.severity, "MEDIUM")
+        self.assertIs(issue.disposition, IssueDisposition.OPEN)
+        self.assertIs(issue.confidence, AuditConfidence.HIGH)
+        self.assertEqual(issue.rule_version, AUDIT_RULE_VERSION)
+        self.assertEqual(issue.policy_version, AUDIT_POLICY_VERSION)
+        self.assertEqual(
+            issue.stable_key,
+            compute_lineage_issue_stable_key(
+                issue.environment,
+                issue.source_profile,
+                issue.program_name,
+                IssueType.STATIC_EMPTY_QUERY,
+                node_key=issue.node_key,
+            ),
+        )
+        self.assertTrue(issue.is_active)
+        self.assertEqual(issue.batch_id, "batch-static-empty-audit")
+        self.assertEqual(issue.first_seen_at, observed_at)
+        self.assertEqual(issue.last_seen_at, observed_at)
+        evidence = evidence_of(issue)
+        self.assertEqual(evidence["statement_type"], "create_table")
+        self.assertEqual(evidence["target_table"], "DWM.EMPTY_TABLE")
+        self.assertEqual(evidence["source_tables"], ["DWF.SOURCE_A"])
+        self.assertEqual(evidence["evaluation"], "CONSTANT_FALSE")
+        serialized = json.dumps(evidence)
+        self.assertNotIn("WHERE FALSE", serialized)
+        self.assertNotIn("predicate", evidence)
+
+        accepted = issue.with_disposition(
+            IssueDisposition.ACCEPTED,
+            updated_at=observed_at,
+            updated_by="reviewer",
+        )
+        next_seen_at = datetime(2026, 9, 21, 8, 9, 10, tzinfo=timezone.utc)
+        next_issue = replace(
+            issue,
+            batch_id="batch-static-empty-next",
+            first_seen_at=observed_at,
+            last_seen_at=next_seen_at,
+        )
+        persisting = reconcile_issue_lifecycle(
+            (accepted,),
+            (next_issue,),
+            observed_at=next_seen_at,
+        )
+        persistent_issue = persisting.current_issues[0]
+        self.assertEqual(persisting.records[0].status, IssueLifecycleStatus.PERSISTING)
+        self.assertEqual(persistent_issue.first_seen_at, observed_at)
+        self.assertEqual(persistent_issue.last_seen_at, next_seen_at)
+        self.assertIs(persistent_issue.disposition, IssueDisposition.ACCEPTED)
+
+        resolved = reconcile_issue_lifecycle(
+            (persistent_issue,), (), observed_at=next_seen_at
+        )
+        self.assertEqual(resolved.records[0].status, IssueLifecycleStatus.RESOLVED)
+        self.assertFalse(resolved.records[0].issue.is_active)
+        self.assertIs(resolved.records[0].issue.disposition, IssueDisposition.RESOLVED)
+
     def test_normal_program_has_no_issues(self):
         result = audit_program_physical_dag(build_dag(NORMAL_PROGRAM))
 

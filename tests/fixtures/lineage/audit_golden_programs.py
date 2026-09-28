@@ -14,6 +14,10 @@ from tests.fixtures.lineage.phase4_audit_programs import (
     TARGET_NOT_FOUND_PROGRAM,
 )
 
+STATIC_EMPTY_QUERY_PROGRAM = (
+    "CREATE TABLE DWM.DEMO_EMPTY AS SELECT * FROM DWF.DEMO_SOURCE WHERE 1 = 2"
+)
+
 SYNTHETIC_PROGRAMS = {
     "normal_negative_control": NORMAL_PROGRAM,
     "orphan_branch": ORPHAN_BRANCH_PROGRAM,
@@ -22,6 +26,7 @@ SYNTHETIC_PROGRAMS = {
     "target_mismatch": TARGET_MISMATCH_PROGRAM,
     "self_reference": SELF_REFERENCE_PROGRAM,
     "cycle_detected": CYCLE_PROGRAM,
+    "static_empty_query": STATIC_EMPTY_QUERY_PROGRAM,
 }
 
 __all__ = ["SYNTHETIC_PROGRAMS"]

@@ -7,7 +7,7 @@ from typing import cast
 from unittest.mock import patch
 
 import shared.lineage.physical_dag as physical_dag_module
-from shared.lineage.domain import PhysicalNodeKind, ProgramSource
+from shared.lineage.domain import IssueType, PhysicalNodeKind, ProgramSource
 from shared.lineage.materialization import materialize_program
 from shared.lineage.lineage_builder import normalize_table_name
 from shared.lineage.physical_dag import (  # pyright: ignore[reportMissingImports]
@@ -530,6 +530,201 @@ class PhysicalDAGTests(unittest.TestCase):
                 ),
             },
         )
+
+    def test_static_empty_query_blocks_do_not_contribute_data_lineage(self):
+        cases = (
+            ("0 = 1", "CREATE TABLE DWM.TMP_X AS SELECT * FROM DWF.A WHERE 0 = 1"),
+            ("1 = 0", "INSERT INTO DWM.T SELECT * FROM DWF.A WHERE 1 = 0"),
+            ("1 = 2", "CREATE TABLE DWM.TMP_X AS SELECT * FROM DWM.RESULT_A WHERE 1 = 2"),
+            ("100 = 200", "INSERT INTO DWM.T SELECT * FROM DWF.A WHERE 100 = 200"),
+            ("FALSE", "INSERT INTO DWM.T SELECT * FROM DWF.A WHERE FALSE"),
+            ("((1 = 2))", "INSERT INTO DWM.T SELECT * FROM DWF.A WHERE ((1 = 2))"),
+            ("FALSE AND ID = 1", "INSERT INTO DWM.T SELECT * FROM DWF.A WHERE FALSE AND ID = 1"),
+        )
+
+        for index, (predicate, sql) in enumerate(cases):
+            with self.subTest(predicate=predicate):
+                expected_target = "DWM.TMP_X" if "CREATE TABLE" in sql else "DWM.T"
+                source = ProgramSource(
+                    environment="DEV",
+                    source_profile="fixture",
+                    program_name=f"DEMO_STATIC_EMPTY_{index}",
+                    script_code=sql,
+                    expected_target=expected_target,
+                )
+                dag = build_program_physical_dag(source)
+                materialization = materialize_program(dag)
+
+                self.assertFalse(
+                    dag.edge_pairs,
+                    "a statically empty Query Block must not produce a Physical edge",
+                )
+                self.assertFalse(
+                    materialization.edges,
+                    "a statically empty Query Block must not produce a LineageEdge",
+                )
+                static_issues = [
+                    issue
+                    for issue in materialization.issues
+                    if issue.issue_type is IssueType.STATIC_EMPTY_QUERY
+                ]
+                self.assertEqual(len(static_issues), 1)
+                evidence = static_issues[0].evidence
+                self.assertIsInstance(evidence, dict)
+                self.assertEqual(evidence["evaluation"], "CONSTANT_FALSE")
+
+    def test_false_join_query_block_records_all_sources_without_edges(self):
+        dag = build_program_physical_dag(
+            program(
+                """
+                INSERT INTO DWM.T
+                SELECT * FROM DWF.A a
+                JOIN DWF.B b ON a.ID = b.ID
+                WHERE 1 = 2
+                """,
+                expected_target="DWM.T",
+            )
+        )
+        materialization = materialize_program(dag)
+
+        self.assertEqual(dag.edges, ())
+        self.assertEqual(materialization.edges, ())
+        issue = next(
+            issue
+            for issue in materialization.issues
+            if issue.issue_type is IssueType.STATIC_EMPTY_QUERY
+        )
+        self.assertEqual(issue.evidence["source_tables"], ["DWF.A", "DWF.B"])
+
+    def test_false_cte_and_subquery_blocks_do_not_hide_other_sources(self):
+        cases = (
+            """
+            WITH empty AS (SELECT * FROM DWF.A WHERE 1 = 2)
+            INSERT INTO DWM.T
+            SELECT * FROM empty JOIN DWF.B b ON 1 = 1
+            """,
+            """
+            INSERT INTO DWM.T
+            SELECT *
+            FROM (SELECT * FROM DWF.A WHERE FALSE) q
+            JOIN DWF.B b ON 1 = 1
+            """,
+        )
+        for sql in cases:
+            with self.subTest(sql=sql):
+                dag = build_program_physical_dag(program(sql, expected_target="DWM.T"))
+                materialization = materialize_program(dag)
+
+                self.assertEqual(dag.edge_pairs, {("DWF.B", "DWM.T")})
+                self.assertEqual(
+                    {(edge.source_table, edge.target_table) for edge in materialization.edges},
+                    {("DWF.B", "DWM.T")},
+                )
+                static_issues = [
+                    issue
+                    for issue in materialization.issues
+                    if issue.issue_type is IssueType.STATIC_EMPTY_QUERY
+                ]
+                self.assertEqual(len(static_issues), 1)
+                self.assertEqual(static_issues[0].evidence["source_tables"], ["DWF.A"])
+
+    def test_false_nested_query_does_not_remove_outer_source(self):
+        dag = build_program_physical_dag(
+            program(
+                """
+                INSERT INTO DWM.T
+                SELECT * FROM DWF.B
+                WHERE ID IN (SELECT ID FROM DWF.A WHERE FALSE)
+                """,
+                expected_target="DWM.T",
+            )
+        )
+        materialization = materialize_program(dag)
+
+        self.assertEqual(dag.edge_pairs, {("DWF.B", "DWM.T")})
+        self.assertEqual(
+            {(edge.source_table, edge.target_table) for edge in materialization.edges},
+            {("DWF.B", "DWM.T")},
+        )
+        issues = [
+            issue
+            for issue in materialization.issues
+            if issue.issue_type is IssueType.STATIC_EMPTY_QUERY
+        ]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].evidence["source_tables"], ["DWF.A"])
+
+    def test_static_empty_read_only_select_keeps_audit_without_lineage(self):
+        dag = build_program_physical_dag(
+            program("SELECT * FROM DWF.A WHERE 1 = 0", expected_target=None)
+        )
+        materialization = materialize_program(dag)
+
+        self.assertEqual(dag.edges, ())
+        self.assertEqual(materialization.edges, ())
+        issues = [
+            issue
+            for issue in materialization.issues
+            if issue.issue_type is IssueType.STATIC_EMPTY_QUERY
+        ]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].evidence["statement_type"], "select")
+        self.assertEqual(issues[0].evidence["source_tables"], ["DWF.A"])
+
+    def test_real_result_source_with_runtime_predicate_keeps_data_lineage(self):
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="DEMO_REAL_RESULT_SOURCE",
+            expected_target=None,
+            script_code=(
+                "INSERT INTO DWM.OTHER SELECT * FROM DWM.RESULT "
+                "WHERE BUSINESS_DATE = CURRENT_DATE"
+            ),
+        )
+        dag = build_program_physical_dag(source)
+        materialization = materialize_program(dag)
+
+        self.assertEqual(dag.edge_pairs, {("DWM.RESULT", "DWM.OTHER")})
+        self.assertEqual(
+            {(edge.source_table, edge.target_table) for edge in materialization.edges},
+            {("DWM.RESULT", "DWM.OTHER")},
+        )
+        self.assertNotIn(
+            IssueType.STATIC_EMPTY_QUERY,
+            {issue.issue_type for issue in materialization.issues},
+        )
+
+    def test_nonempty_or_unknown_predicates_preserve_lineage(self):
+        predicates = (
+            "1 = 1",
+            "TRUE",
+            "ID = 1",
+            "A = B",
+            "ID = 2",
+            "0 = ID",
+            "FUNC(ID) = 0",
+            "FALSE OR ID = 1",
+        )
+        for predicate in predicates:
+            with self.subTest(predicate=predicate):
+                dag = build_program_physical_dag(
+                    program(
+                        f"INSERT INTO DWM.T SELECT * FROM DWF.A WHERE {predicate}",
+                        expected_target="DWM.T",
+                    )
+                )
+                materialization = materialize_program(dag)
+
+                self.assertEqual(dag.edge_pairs, {("DWF.A", "DWM.T")})
+                self.assertEqual(
+                    {(edge.source_table, edge.target_table) for edge in materialization.edges},
+                    {("DWF.A", "DWM.T")},
+                )
+                self.assertNotIn(
+                    IssueType.STATIC_EMPTY_QUERY,
+                    {issue.issue_type for issue in materialization.issues},
+                )
 
     def test_select_without_write_target_does_not_use_expected_target(self):
         dag = build_program_physical_dag(

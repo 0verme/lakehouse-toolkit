@@ -81,6 +81,27 @@ class IncrementalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.unchanged, (current,))
         self.assertEqual(plan.changed, ())
 
+    def test_static_empty_query_pipeline_version_bump_rebuilds_v12_state(self):
+        current = source("PROGRAM_DEMO_STATIC_EMPTY_QUERY_VERSION")
+        previous = (
+            replace(
+                ProgramState.from_source(
+                    current,
+                    observed_at=OBSERVED_AT,
+                    batch_id="batch-old",
+                ),
+                pipeline_version=(
+                    "lineage-pipeline-v12-authoritative-target-binding"
+                ),
+            ),
+        )
+
+        plan = plan_incremental([current], previous)
+
+        self.assertEqual(current.source_hash, previous[0].source_hash)
+        self.assertEqual(plan.unchanged, ())
+        self.assertEqual(plan.changed, (current,))
+
     def test_source_hash_change_is_changed(self):
         previous_source = source("PROGRAM_DEMO_HASH_CHANGED")
         current = source(
