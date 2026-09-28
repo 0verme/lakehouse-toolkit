@@ -41,7 +41,10 @@ class ToolManagerTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with patch.object(tool_manager, "CONFIG_PATH", config_path):
+            with (
+                patch.object(tool_manager, "CONFIG_PATH", config_path),
+                patch.object(tool_manager, "LOCAL_CONFIG_PATH", tmp / "tools.local.yaml"),
+            ):
                 tools = tool_manager.load_tools()
                 tool = tool_manager.get_tool("webadmin")
         finally:
@@ -50,6 +53,42 @@ class ToolManagerTests(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tool["type"], "streamlit")
         self.assertEqual(tool["port"], 8501)
+
+    def test_load_tools_appends_local_only_private_tool(self):
+        tmp = make_temp_dir()
+        try:
+            config_path = tmp / "tools.yaml"
+            local_config_path = tmp / "tools.local.yaml"
+            config_path.write_text(
+                json.dumps({"tools": [{"name": "webadmin", "port": 8500}]}),
+                encoding="utf-8",
+            )
+            local_config_path.write_text(
+                json.dumps(
+                    {
+                        "tools": [
+                            {
+                                "name": "lineage_reconciliation",
+                                "workdir": "tools/lineage",
+                                "script": "reconcile_sql_schedule_web.py",
+                                "port": 8614,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(tool_manager, "CONFIG_PATH", config_path),
+                patch.object(tool_manager, "LOCAL_CONFIG_PATH", local_config_path),
+            ):
+                tools = tool_manager.load_tools()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        self.assertEqual(
+            [tool["name"] for tool in tools], ["webadmin", "lineage_reconciliation"]
+        )
 
     def test_build_command_for_streamlit_relative_path(self):
         tool = {

@@ -13,8 +13,10 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT_DIR / "configs" / "database.local.yaml"
 GENERIC_CONFIG_PATH = ROOT_DIR / "configs" / "database.yaml"
 EXAMPLE_CONFIG_PATH = ROOT_DIR / "configs" / "database.example.yaml"
-DEFAULT_DRIVER = "org.postgresql.Driver"
-DEFAULT_JAR = ROOT_DIR / "resources" / "jars" / "jdbc-driver.jar"
+# Preserve the historical GaussDB defaults used by the internal pytool runtime.
+# Public/demo profiles can override both values in their own example config.
+DEFAULT_DRIVER = "com.huawei.gauss200.jdbc.Driver"
+DEFAULT_JAR = ROOT_DIR / "resources" / "jars" / "gaussdb200.jar"
 
 
 def load_db_profiles() -> dict:
@@ -49,7 +51,10 @@ def get_db_profile(profile: str) -> dict:
 
     config = dict(profiles[profile])
     config.setdefault("driver", DEFAULT_DRIVER)
-    config["jar_path"] = str(Path(config.get("jar_path") or DEFAULT_JAR).expanduser())
+    jar_path = Path(config.get("jar_path") or DEFAULT_JAR).expanduser()
+    if not jar_path.is_absolute():
+        jar_path = ROOT_DIR / jar_path
+    config["jar_path"] = str(jar_path)
     return config
 
 

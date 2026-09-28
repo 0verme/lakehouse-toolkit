@@ -20,6 +20,9 @@ coverage/
 # Runtime output and generated exports
 logs/
 runtime/
+/data/
+/backup_sc/
+/send_files/
 artifacts/
 tmp/
 temp/
@@ -41,6 +44,8 @@ build/
 
 # Local application data
 *.db
+/resources/xlsx/*.xlsx
+/resources/xlsx/*.xls
 *.sqlite
 *.sqlite3
 *.sqlite-*

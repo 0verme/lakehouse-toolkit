@@ -8,10 +8,13 @@ import sys
 import time
 from pathlib import Path
 
-import yaml
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 ROOT_DIR = BASE_DIR.parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from shared.config.tool_registry import load_tool_configuration  # noqa: E402
+
 CONFIG_PATH = ROOT_DIR / "configs" / "tools.yaml"
 LOCAL_CONFIG_PATH = ROOT_DIR / "configs" / "tools.local.yaml"
 PID_DIR = ROOT_DIR / "runtime" / "pids"
@@ -19,30 +22,9 @@ LOG_ROOT = ROOT_DIR / "logs"
 PID_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_yaml(path: Path) -> dict:
-    try:
-        if not path.exists():
-            return {}
-        with open(path, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except (OSError, TypeError, ValueError, yaml.YAMLError):
-        return {}
-
-
 def load_tools():
-    data = _load_yaml(CONFIG_PATH)
-    local_data = _load_yaml(LOCAL_CONFIG_PATH)
-    local_tools = {
-        str(tool.get("name")): tool
-        for tool in local_data.get("tools", [])
-        if isinstance(tool, dict) and tool.get("name")
-    }
-    tools = []
-    for base_tool in data.get("tools", []):
-        tool = dict(base_tool)
-        tool.update(local_tools.get(str(tool.get("name")), {}))
-        tools.append(tool)
-    return tools
+    data = load_tool_configuration(CONFIG_PATH, LOCAL_CONFIG_PATH)
+    return data.get("tools", [])
 
 
 def get_tool(name: str):

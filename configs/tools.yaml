@@ -1,5 +1,6 @@
 # 公开版通用工具注册表。
-# 本文件不包含本机解释器路径、内部地址或凭据；本机覆盖项放在 tools.local.yaml。
+# 本文件不包含本机解释器路径、内部地址或凭据；本机覆盖项与私有工具注册放在 tools.local.yaml。
+# 本机可按 name 覆盖以下工具，也可追加只存在于当前部署的工具；运行数据不进入 Git。
 default_python: python
 public_base_url: http://localhost
 
