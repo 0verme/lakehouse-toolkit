@@ -15,7 +15,6 @@ from shared.lineage.reconciliation import (
     reconcile_active_dws_lineage,
 )
 
-
 ENVIRONMENT = "DEMO_DEV"
 SQL_PROFILE = "DEMO_SQL_PROFILE"
 SCHEDULE_PROFILE = "DEMO_SCHEDULE_PROFILE"
@@ -206,24 +205,126 @@ class ProgramBoundaryProjectionTests(unittest.TestCase):
             },
         )
 
-    def test_cycle_falls_back_to_visible_direct_target_facts(self) -> None:
-        name = f"005:{TARGET}:1:00"
+    def test_m_sxed_stage_cycle_projects_all_external_inputs(self) -> None:
+        target = "DWM.M_SXED"
+        name = "005:DWS_DWM.M_SXED:1:01"
+        program_key = "program-m-sxed-cycle"
+        tmp_sh = "DWM.TMP_SH"
+        tmp_sxed = "DWM.TMP_SXED"
         edges = (
-            edge(name, "program-cycle", "DEMO_DWF.A", "DEMO_DWM.X"),
-            edge(name, "program-cycle", "DEMO_DWM.X", "DEMO_DWM.Y"),
-            edge(name, "program-cycle", "DEMO_DWM.Y", "DEMO_DWM.X"),
-            edge(name, "program-cycle", "DEMO_DWM.X", TARGET),
+            edge(name, program_key, "DWF.EXT_A", tmp_sh),
+            edge(name, program_key, "DWF.EXT_B", tmp_sxed),
+            edge(name, program_key, "DWF.EXT_C", tmp_sxed),
+            edge(name, program_key, tmp_sxed, tmp_sh),
+            edge(name, program_key, tmp_sh, tmp_sxed),
+            edge(name, program_key, tmp_sxed, tmp_sxed),
+            edge(name, program_key, tmp_sxed, target),
         )
         projection = build_program_boundary_projections(
-            (program(name, key="program-cycle"),), edges, target_tables=(TARGET,)
+            (program(name, key=program_key),), edges, target_tables=(target,)
         )[0]
 
-        self.assertTrue(projection.used_direct_fallback)
-        self.assertIn("PROGRAM_CYCLE", projection.diagnostics)
+        self.assertFalse(projection.used_direct_fallback)
+        self.assertNotIn("PROGRAM_CYCLE", projection.diagnostics)
         self.assertEqual(
-            [dependency.source_table for dependency in projection.dependencies],
-            ["DEMO_DWM.X"],
+            {
+                (dependency.source_table, dependency.target_table)
+                for dependency in projection.dependencies
+            },
+            {
+                ("DWF.EXT_A", target),
+                ("DWF.EXT_B", target),
+                ("DWF.EXT_C", target),
+            },
         )
+
+    def test_self_reference_does_not_trigger_cross_node_cycle(self) -> None:
+        name = f"005:{TARGET}:1:00"
+        tmp = "DEMO_DWM.TMP_X"
+        edges = (
+            edge(name, "program-self-loop", "DEMO_DWF.A", tmp),
+            edge(name, "program-self-loop", tmp, tmp),
+            edge(name, "program-self-loop", tmp, TARGET),
+        )
+        projection = build_program_boundary_projections(
+            (program(name, key="program-self-loop"),),
+            edges,
+            target_tables=(TARGET,),
+        )[0]
+
+        self.assertFalse(projection.used_direct_fallback)
+        self.assertNotIn("PROGRAM_CYCLE", projection.diagnostics)
+        self.assertEqual(
+            [
+                (item.source_table, item.target_table)
+                for item in projection.dependencies
+            ],
+            [("DEMO_DWF.A", TARGET)],
+        )
+
+    def test_disconnected_cycle_does_not_leak_source_into_result(self) -> None:
+        name = f"005:{TARGET}:1:00"
+        edges = (
+            edge(name, "program-disconnected-cycle", "DEMO_DWF.EXT_BAD", "DEMO_DWM.X"),
+            edge(name, "program-disconnected-cycle", "DEMO_DWM.X", "DEMO_DWM.Y"),
+            edge(name, "program-disconnected-cycle", "DEMO_DWM.Y", "DEMO_DWM.X"),
+            edge(name, "program-disconnected-cycle", "DEMO_DWF.EXT_GOOD", "DEMO_DWM.Z"),
+            edge(name, "program-disconnected-cycle", "DEMO_DWM.Z", TARGET),
+        )
+        projection = build_program_boundary_projections(
+            (program(name, key="program-disconnected-cycle"),),
+            edges,
+            target_tables=(TARGET,),
+        )[0]
+
+        self.assertFalse(projection.used_direct_fallback)
+        self.assertEqual(
+            [
+                (item.source_table, item.target_table)
+                for item in projection.dependencies
+            ],
+            [("DEMO_DWF.EXT_GOOD", TARGET)],
+        )
+
+    def test_cyclic_projection_is_independent_of_intermediate_names(self) -> None:
+        target = "DWM.M_SXED"
+        name = "005:DWS_DWM.M_SXED:1:01"
+        program_key = "program-cycle-name-independent"
+        base_edges = (
+            ("DWF.EXT_A", "DWM.TMP_SH"),
+            ("DWF.EXT_B", "DWM.TMP_SXED"),
+            ("DWM.TMP_SXED", "DWM.TMP_SH"),
+            ("DWM.TMP_SH", "DWM.TMP_SXED"),
+            ("DWM.TMP_SXED", target),
+        )
+        renamed_edges = tuple(
+            (
+                source.replace("DWM.TMP_SH", "DWM.A").replace("DWM.TMP_SXED", "DWM.B"),
+                destination.replace("DWM.TMP_SH", "DWM.A").replace(
+                    "DWM.TMP_SXED", "DWM.B"
+                ),
+            )
+            for source, destination in base_edges
+        )
+
+        def project(pairs):
+            graph = tuple(
+                edge(name, program_key, source, destination)
+                for source, destination in pairs
+            )
+            return build_program_boundary_projections(
+                (program(name, key=program_key),), graph, target_tables=(target,)
+            )[0]
+
+        tmp_projection = project(base_edges)
+        ordinary_name_projection = project(renamed_edges)
+        expected_sources = {"DWF.EXT_A", "DWF.EXT_B"}
+        for projection in (tmp_projection, ordinary_name_projection):
+            self.assertFalse(projection.used_direct_fallback)
+            self.assertEqual(
+                {item.source_table for item in projection.dependencies},
+                expected_sources,
+            )
 
     def test_self_reference_is_preserved_only_as_evidence(self) -> None:
         name = f"005:{TARGET}:1:00"
@@ -272,6 +373,95 @@ class ProgramBoundaryProjectionTests(unittest.TestCase):
             ],
             [("DEMO_DWF.A", TARGET)],
         )
+
+    def test_duplicate_program_step_still_uses_direct_fallback(self) -> None:
+        name = f"005:{TARGET}:1:00"
+        programs = (
+            program(name, key="program-step-duplicate-a"),
+            program(name, key="program-step-duplicate-b"),
+        )
+        projection = build_program_boundary_projections(
+            programs,
+            (
+                edge(name, "program-step-duplicate-a", "DEMO_DWF.A", TARGET),
+                edge(name, "program-step-duplicate-b", "DEMO_DWF.B", TARGET),
+            ),
+            target_tables=(TARGET,),
+        )[0]
+
+        self.assertTrue(projection.used_direct_fallback)
+        self.assertIn("DUPLICATE_PROGRAM_STEP", projection.diagnostics)
+        self.assertEqual(
+            {item.source_table for item in projection.dependencies},
+            {"DEMO_DWF.A", "DEMO_DWF.B"},
+        )
+
+    def test_ambiguous_program_identity_still_uses_direct_fallback(self) -> None:
+        first_name = f"005:{TARGET}:1:00"
+        second_name = f"005:{TARGET}:2:00"
+        ambiguous_key = "program-ambiguous"
+        projection = build_program_boundary_projections(
+            (
+                program(first_name, key=ambiguous_key),
+                program(second_name, key=ambiguous_key),
+            ),
+            (
+                edge(first_name, ambiguous_key, "DEMO_DWF.A", "DEMO_DWM.WORK"),
+                edge(second_name, ambiguous_key, "DEMO_DWM.WORK", TARGET),
+            ),
+            target_tables=(TARGET,),
+        )[0]
+
+        self.assertTrue(projection.used_direct_fallback)
+        self.assertIn("AMBIGUOUS_PROGRAM_IDENTITY", projection.diagnostics)
+        self.assertEqual(
+            [item.source_table for item in projection.dependencies],
+            ["DEMO_DWM.WORK"],
+        )
+
+    def test_edge_provenance_mismatch_still_uses_direct_fallback(self) -> None:
+        name = f"005:{TARGET}:1:00"
+        mismatched_name = "005:DEMO_DWM.OTHER:1:00"
+        projection = build_program_boundary_projections(
+            (program(name, key="program-provenance"),),
+            (
+                edge(name, "program-provenance", "DEMO_DWF.A", "DEMO_DWM.WORK"),
+                edge(
+                    mismatched_name,
+                    "program-provenance",
+                    "DEMO_DWF.BAD",
+                    "DEMO_DWM.WORK",
+                ),
+                edge(name, "program-provenance", "DEMO_DWM.WORK", TARGET),
+            ),
+            target_tables=(TARGET,),
+        )[0]
+
+        self.assertTrue(projection.used_direct_fallback)
+        self.assertIn("PROGRAM_EDGE_PROVENANCE_MISMATCH", projection.diagnostics)
+        self.assertEqual(
+            [item.source_table for item in projection.dependencies],
+            ["DEMO_DWM.WORK"],
+        )
+
+    def test_missing_authoritative_result_still_uses_direct_fallback(self) -> None:
+        name = f"005:{TARGET}:1:00"
+        projection = build_program_boundary_projections(
+            (program(name, key="program-no-result-edge"),),
+            (
+                edge(
+                    name,
+                    "program-no-result-edge",
+                    "DEMO_DWF.A",
+                    "DEMO_DWM.WORK",
+                ),
+            ),
+            target_tables=(TARGET,),
+        )[0]
+
+        self.assertTrue(projection.used_direct_fallback)
+        self.assertIn("PROGRAM_RESULT_NOT_OBSERVED", projection.diagnostics)
+        self.assertEqual(projection.dependencies, ())
 
     def test_dlo_dwo_edges_do_not_create_boundary_bypass(self) -> None:
         name = f"005:{TARGET}:1:00"
@@ -364,6 +554,64 @@ class ProgramBoundaryReconciliationContractTests(unittest.TestCase):
         self.assertEqual(result.match_count, 4)
         self.assertEqual(result.schedule_only_count, 0)
         self.assertGreaterEqual(timing.sql_boundary_projection_rows, 4)
+
+    def test_raw_reconciliation_projects_cycle_inputs_to_authoritative_result(
+        self,
+    ) -> None:
+        target = "DWM.M_SXED"
+        name = "005:DWS_DWM.M_SXED:1:01"
+        program_key = "program-raw-cycle"
+        tmp_sh = "DWM.TMP_SH"
+        tmp_sxed = "DWM.TMP_SXED"
+        edges = (
+            edge(name, program_key, "DWF.EXT_A", tmp_sh),
+            edge(name, program_key, "DWF.EXT_B", tmp_sxed),
+            edge(name, program_key, "DWF.EXT_C", tmp_sxed),
+            edge(name, program_key, tmp_sxed, tmp_sh),
+            edge(name, program_key, tmp_sh, tmp_sxed),
+            edge(name, program_key, tmp_sxed, tmp_sxed),
+            edge(name, program_key, tmp_sxed, target),
+        )
+        projection = build_program_boundary_projections(
+            (program(name, key=program_key),), edges, target_tables=(target,)
+        )[0]
+        sql_reader = _BoundaryReader(
+            (projection,),
+            side="sql",
+            batch_id="batch-sql-raw-cycle",
+            scope=((ENVIRONMENT, SQL_PROFILE),),
+        )
+        schedule_reader = _BoundaryReader(
+            (),
+            side="schedule",
+            batch_id="batch-schedule-raw-cycle",
+            scope=((ENVIRONMENT, SCHEDULE_PROFILE),),
+        )
+
+        result = reconcile_active_dws_lineage(
+            sql_reader,
+            schedule_reader,
+            environment=ENVIRONMENT,
+            sql_source_profile=SQL_PROFILE,
+            schedule_source_profile=SCHEDULE_PROFILE,
+            target_tables=(target,),
+            apply_suppression=False,
+        )
+
+        self.assertEqual(
+            {
+                (row.source_table, row.target_table)
+                for row in result.rows
+                if row.status is ReconciliationStatus.SQL_ONLY
+            },
+            {
+                ("DWF.EXT_A", target),
+                ("DWF.EXT_B", target),
+                ("DWF.EXT_C", target),
+            },
+        )
+        self.assertEqual(len(result.rows), 3)
+        self.assertEqual(result.sql_only_count, 3)
 
 
 class _BoundaryReader:

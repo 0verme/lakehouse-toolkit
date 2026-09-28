@@ -13,15 +13,15 @@ from shared.lineage.domain import (
     LineageIssue,
     PhysicalEdge,
     PhysicalNode,
-    ProgramState,
     ProgramSource,
+    ProgramState,
 )
 from shared.lineage.materialization import MaterializationBatch, materialize_program
 from shared.lineage.materialization_dws import (
     ACTIVATE_BATCH_SQL,
     BATCH_SELECT_SQL,
-    BUSINESS_RECONCILIATION_PROJECTION_SQL,
     BUSINESS_EDGE_SELECT_SQL,
+    BUSINESS_RECONCILIATION_PROJECTION_SQL,
     INSERT_BATCH_SQL,
     INSERT_BUSINESS_EDGE_SQL,
     INSERT_ISSUE_SQL,
@@ -31,9 +31,9 @@ from shared.lineage.materialization_dws import (
     PHYSICAL_EDGE_SELECT_SQL,
     PROGRAM_STATE_SELECT_SQL,
     RETIRE_BATCH_SQL,
+    TIMESTAMPTZ_PARAM_SQL,
     DWSMaterializationStore,
     DWSPublishResult,
-    TIMESTAMPTZ_PARAM_SQL,
     _begin_transaction,
     _parse_datetime,
     _timestamp_param,
@@ -439,8 +439,9 @@ class DWSMaterializationStoreTests(unittest.TestCase):
 
         aware = datetime(2026, 1, 15, 3, 4, 5, tzinfo=timezone.utc)
         self.assertIs(_parse_datetime(aware, "observed_at"), aware)
+        naive = datetime.fromisoformat("2026-01-15T03:04:05")
         with self.assertRaisesRegex(ValueError, "timezone offset"):
-            _parse_datetime(datetime(2026, 1, 15, 3, 4, 5), "observed_at")
+            _parse_datetime(naive, "observed_at")
         with self.assertRaisesRegex(ValueError, "timezone offset"):
             _parse_datetime("2026-01-15 03:04:05", "observed_at")
 
@@ -896,37 +897,35 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         source = ProgramSource(
             "DEV",
             "fixture",
-            "005:DWM.RESULT:1:00",
-            "synthetic program boundary fixture",
-            expected_target="DWM.RESULT",
-            source_hash="sha256:program-boundary",
+            "005:DWS_DWM.M_SXED:1:01",
+            "synthetic Program Boundary stage-cycle fixture",
+            expected_target="DWM.M_SXED",
+            source_hash="sha256:program-boundary-cycle",
         )
         names = (
-            "DWF.A",
-            "DWF.B",
-            "DWF.C",
-            "DWF.D",
-            "DWM.TMP_X",
-            "DWM.ABC_Y",
-            "DWM.WORK_Z",
-            "DWM.RESULT",
+            "DWF.EXT_A",
+            "DWF.EXT_B",
+            "DWF.EXT_C",
+            "DWM.TMP_SH",
+            "DWM.TMP_SXED",
+            "DWM.M_SXED",
         )
         physical_edges = (
-            PhysicalEdge("DWF.A", "DWM.TMP_X"),
-            PhysicalEdge("DWF.B", "DWM.TMP_X"),
-            PhysicalEdge("DWF.C", "DWM.ABC_Y"),
-            PhysicalEdge("DWM.TMP_X", "DWM.ABC_Y"),
-            PhysicalEdge("DWM.ABC_Y", "DWM.WORK_Z"),
-            PhysicalEdge("DWF.D", "DWM.WORK_Z"),
-            PhysicalEdge("DWM.WORK_Z", "DWM.RESULT"),
+            PhysicalEdge("DWF.EXT_A", "DWM.TMP_SH"),
+            PhysicalEdge("DWF.EXT_B", "DWM.TMP_SXED"),
+            PhysicalEdge("DWF.EXT_C", "DWM.TMP_SXED"),
+            PhysicalEdge("DWM.TMP_SXED", "DWM.TMP_SH"),
+            PhysicalEdge("DWM.TMP_SH", "DWM.TMP_SXED"),
+            PhysicalEdge("DWM.TMP_SXED", "DWM.TMP_SXED"),
+            PhysicalEdge("DWM.TMP_SXED", "DWM.M_SXED"),
         )
         dag = ProgramPhysicalDAG(
             program_source=source,
             nodes=tuple(PhysicalNode(name, name) for name in names),
             edges=physical_edges,
             steps=(),
-            sinks=("DWM.RESULT",),
-            expected_target="DWM.RESULT",
+            sinks=("DWM.M_SXED",),
+            expected_target="DWM.M_SXED",
         )
         materialization = materialize_program(
             dag,
@@ -963,7 +962,7 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             batch_id="batch-program-boundary",
             environment="DEV",
             source_profile="fixture",
-            target_tables=("DWM.RESULT",),
+            target_tables=("DWM.M_SXED",),
             timing=timing,
         )
 
@@ -971,11 +970,11 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         self.assertFalse(projections[0].used_direct_fallback)
         self.assertEqual(
             {dependency.source_table for dependency in projections[0].dependencies},
-            {"DWF.A", "DWF.B", "DWF.C", "DWF.D"},
+            {"DWF.EXT_A", "DWF.EXT_B", "DWF.EXT_C"},
         )
         self.assertEqual(timing.sql_program_rows_read, 1)
         self.assertEqual(timing.sql_program_edge_rows_read, 7)
-        self.assertEqual(timing.sql_boundary_projection_rows, 4)
+        self.assertEqual(timing.sql_boundary_projection_rows, 3)
         self.assertEqual(timing.sql_boundary_fallback_count, 0)
         boundary_sql = next(
             sql

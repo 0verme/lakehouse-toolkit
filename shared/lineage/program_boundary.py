@@ -23,11 +23,9 @@ from shared.lineage.domain import (
     parse_program_name,
 )
 
-
 _PROGRAM_BOUNDARY_NO_AUTHORITY: Final[str] = "NO_AUTHORITATIVE_PROGRAM"
 _PROGRAM_BOUNDARY_AMBIGUOUS_PROGRAM: Final[str] = "AMBIGUOUS_PROGRAM_IDENTITY"
 _PROGRAM_BOUNDARY_DUPLICATE_STEP: Final[str] = "DUPLICATE_PROGRAM_STEP"
-_PROGRAM_BOUNDARY_CYCLE: Final[str] = "PROGRAM_CYCLE"
 _PROGRAM_BOUNDARY_RESULT_NOT_OBSERVED: Final[str] = "PROGRAM_RESULT_NOT_OBSERVED"
 _PROGRAM_BOUNDARY_RESULT_USED_AS_SOURCE: Final[str] = "PROGRAM_RESULT_USED_AS_SOURCE"
 _PROGRAM_BOUNDARY_EDGE_PROVENANCE_MISMATCH: Final[str] = (
@@ -182,11 +180,13 @@ def build_program_boundary_projections(
     all rows for candidate Program keys plus direct rows targeting that target;
     this function keeps Program groups isolated by ``program_key``.
 
-    Valid groups use ``sources - targets`` to derive external inputs.  Cycles,
-    duplicate step numbers, malformed authority, missing authoritative result
-    edges, and provenance inconsistencies use a conservative direct-target
-    fallback.  This retains visible SQL evidence and never guesses a new
-    Program identity.
+    Valid groups derive external inputs from only the edges that can reach the
+    authoritative result. Cross-node cycles in that relevant subgraph are
+    allowed; disconnected branches, including cycles, cannot leak into the
+    projection. Duplicate steps, malformed authority, missing authoritative
+    result edges, and provenance inconsistencies still use a conservative
+    direct-target fallback. This retains visible SQL evidence and never guesses
+    a new Program identity.
     """
 
     program_values = tuple(programs)
@@ -376,8 +376,6 @@ def _group_diagnostics(
         # ``RESULT -> RESULT`` configured dependency.  Fall back to the
         # persisted direct target evidence and keep the diagnostic visible.
         diagnostics.add(_PROGRAM_BOUNDARY_RESULT_USED_AS_SOURCE)
-    if _contains_cycle(group_edges):
-        diagnostics.add(_PROGRAM_BOUNDARY_CYCLE)
     return diagnostics
 
 
@@ -387,14 +385,15 @@ def _project_valid_group(
     group_edges: tuple[_NormalizedEdge, ...],
     direct_target_edges: tuple[_NormalizedEdge, ...],
 ) -> ProgramBoundaryProjection:
-    internal_targets = {item.target_table for item in group_edges}
+    result_reachable_edges = _edges_reaching_target(group_edges, target)
+    internal_targets = {item.target_table for item in result_reachable_edges}
     external_sources = {
         item.source_table
-        for item in group_edges
+        for item in result_reachable_edges
         if item.source_table not in internal_targets and item.source_table != target
     }
     contributions: list[tuple[str, str, str]] = []
-    for item in group_edges:
+    for item in result_reachable_edges:
         if item.source_table in external_sources:
             contributions.append((item.source_table, target, item.edge.program_key))
 
@@ -407,7 +406,7 @@ def _project_valid_group(
 
     contributions.extend(
         (item.source_table, target, item.edge.program_key)
-        for item in group_edges
+        for item in result_reachable_edges
         if item.source_table == target and item.target_table == target
     )
     return ProgramBoundaryProjection(
@@ -455,26 +454,30 @@ def _dependencies_from_contributions(
     )
 
 
-def _contains_cycle(edges: Iterable[_NormalizedEdge]) -> bool:
-    adjacency: dict[str, set[str]] = defaultdict(set)
+def _edges_reaching_target(
+    edges: tuple[_NormalizedEdge, ...], target: str
+) -> tuple[_NormalizedEdge, ...]:
+    """Return the target's complete ancestor subgraph, cycles included.
+
+    Walk incoming edges from the authoritative result. Adding each source to
+    the frontier reaches a fixed point even for cross-node cycles; edges in a
+    disconnected component never enter the projection.
+    """
+
+    incoming: dict[str, list[_NormalizedEdge]] = defaultdict(list)
     for item in edges:
-        if item.source_table != item.target_table:
-            adjacency[item.source_table].add(item.target_table)
-    colors: dict[str, int] = {}
+        incoming[item.target_table].append(item)
 
-    def visit(node: str) -> bool:
-        colors[node] = 1
-        for child in adjacency.get(node, ()):
-            color = colors.get(child, 0)
-            if color == 1 or (color == 0 and visit(child)):
-                return True
-        colors[node] = 2
-        return False
+    reachable_nodes = {target}
+    pending = [target]
+    while pending:
+        node = pending.pop()
+        for item in incoming.get(node, ()):
+            if item.source_table not in reachable_nodes:
+                reachable_nodes.add(item.source_table)
+                pending.append(item.source_table)
 
-    for node in tuple(adjacency):
-        if colors.get(node, 0) == 0 and visit(node):
-            return True
-    return False
+    return tuple(item for item in edges if item.target_table in reachable_nodes)
 
 
 def _normalize_table(value: object) -> str | None:
