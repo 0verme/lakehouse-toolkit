@@ -84,6 +84,8 @@ secrets.local.*
 *.local.yml
 *.local.json
 configs/database.yaml
+configs/svn.yaml
+configs/tools.yamlbak
 configs/migrate/clusters.json
 
 # Optional third-party binaries; obtain them separately under the documented path
