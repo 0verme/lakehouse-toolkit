@@ -379,16 +379,22 @@ projected dependency = external input -> authoritative Program Result
 
 authoritative result 只来自已解析的 `005:<qualified_schema_table>:<step>:...`
 logical target；`TMP`、`TEMP`、`STG`、`TEST` 等名称不参与分类或 fallback。DLO/DWO
-仍由既有 Business Asset Boundary 排除，不能通过 projection 绕过边界。Program
-内部存在 cycle、重复 step、缺失 result、edge provenance 不一致、ambiguous
-Program identity，或 Program Result 在后续 step 被再次作为 source 读取时，projection
-会 fail-open 到该 target 的 persisted direct rows，并保留 diagnostic；不会猜测
-新的 Program identity，也不会制造无意义的 `RESULT -> RESULT` dependency。
+仍由既有 Business Asset Boundary 排除，不能通过 projection 绕过边界。
 
-真实 raw self-reference（规范化后 `source_table == target_table`）仍作为 evidence
-保留，交给 #128 的 presentation contract：默认隐藏，勾选后以中性 evidence 行
-展示，不作为正常 configured dependency 计入 summary。projection 不会因表名含
-`TMP` 等 token 而删除或折叠任何 direct fact。
+Projection 先限制在能够沿 Program 内 direct dependency 到达 authoritative result 的
+子图，再从该子图计算 external inputs。不同 statement 对同一张表阶段性回写时，压平后的
+table graph 可能出现跨节点 cycle；只要这些节点仍可到达 authoritative result，就不能仅
+凭该 cycle 令整个 Program direct-target fallback。external input 仍按可达子图中的
+`sources - targets` 得出，不依赖 TMP 命名。无法到达 result 的孤立 branch/cycle 会被
+排除，其 source 不会泄漏成 Program Result dependency。
+
+`source_table == target_table` 的 self-reference 不构成跨节点 cycle；其 evidence 仍交给
+#128 的 presentation contract：默认隐藏，勾选后以中性 evidence 行展示，不作为正常
+configured dependency 计入 summary。重复 step、缺失 result、edge provenance 不一致、
+ambiguous Program identity，或 Program Result 在后续 step 被再次作为 source 读取时，
+projection 仍会 fail-open 到该 target 的 persisted direct rows 并保留 diagnostic；不会
+猜测新的 Program identity，也不会制造无意义的 `RESULT -> RESULT` dependency。projection
+不会因表名含 `TMP` 等 token 而删除或折叠任何 direct fact。
 
 DWS adapter 的 bounded read 与 projection 计算分别记录 `ReconciliationTiming`
 中的 `sql_program_lookup_ms`、`sql_program_boundary_edge_read_ms`、
