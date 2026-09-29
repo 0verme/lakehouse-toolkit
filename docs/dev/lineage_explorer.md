@@ -87,7 +87,7 @@ WebAdmin registry：
 ```yaml
 name: lineage_explorer
 title: 血缘探索
-port: 8615
+port: 8602
 ```
 
 页面只让用户选择 environment、root、方向、视图、depth 和 max_nodes；profiles 由

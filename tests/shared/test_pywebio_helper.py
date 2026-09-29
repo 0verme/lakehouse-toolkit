@@ -75,7 +75,7 @@ class PywebioHelperTests(unittest.TestCase):
                                 "title": "SQL / 调度血缘对账",
                                 "workdir": "tools/lineage",
                                 "script": "reconcile_sql_schedule_web.py",
-                                "port": 8614,
+                                "port": 8603,
                             }
                         ]
                     }
@@ -99,7 +99,7 @@ class PywebioHelperTests(unittest.TestCase):
             pywebio_helper.load_tools_config.cache_clear()
             shutil.rmtree(tmp, ignore_errors=True)
 
-        self.assertEqual(port, 8614)
+        self.assertEqual(port, 8603)
         self.assertEqual(title, "SQL / 调度血缘对账")
 
     def test_put_red_text_escapes_untrusted_markup(self):
@@ -124,7 +124,7 @@ class PywebioHelperTests(unittest.TestCase):
                                 "title": "追数下游生成工具",
                                 "workdir": "tools/misc",
                                 "script": "job_downstream_zs.py",
-                                "port": 8301,
+                                "port": 8307,
                             }
                         ]
                     }
@@ -142,7 +142,7 @@ class PywebioHelperTests(unittest.TestCase):
             pywebio_helper.load_tools_config.cache_clear()
             shutil.rmtree(tmp, ignore_errors=True)
 
-        self.assertEqual(port, 8301)
+        self.assertEqual(port, 8307)
 
 
 if __name__ == "__main__":

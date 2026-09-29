@@ -8,6 +8,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 tool_manager = importlib.import_module("apps.webadmin.manager.tool_manager")
+PORT_RANGES = {
+    "tools/search": (7001, 7099),
+    "tools/crypto": (8001, 8099),
+    "tools/sql": (8101, 8199),
+    "tools/cms": (8201, 8299),
+    "tools/misc": (8301, 8399),
+    "tools/jobgraph": (8401, 8499),
+    "tools/czcb": (8501, 8599),
+    "tools/lineage": (8601, 8699),
+}
+EXPECTED_PUBLIC_PORTS = {
+    "xlsx_sql_tables": 8308,
+    "xlsx_dependency_splitter": 8309,
+    "workspace_search": 7005,
+    "workspace_lineage": 7006,
+    "table_lineage": 7007,
+    "job_dependency_cycle": 8425,
+    "lineage_reconciliation": 8601,
+    "lineage_explorer": 8602,
+}
 WORK_TMP = Path("runtime/temp/tests_tool_manager")
 WORK_TMP.mkdir(parents=True, exist_ok=True)
 
@@ -19,6 +39,55 @@ def make_temp_dir():
 
 
 class ToolManagerTests(unittest.TestCase):
+    def assert_tool_port_contract(self, tools):
+        used_ports = {}
+        for tool in tools:
+            port = int(tool.get("port") or 0)
+            if port == 0:
+                continue
+
+            self.assertNotIn(
+                port,
+                used_ports,
+                f"duplicate listener port {port}: "
+                f"{used_ports.get(port)} and {tool['name']}",
+            )
+            used_ports[port] = tool["name"]
+
+            port_range = PORT_RANGES.get(tool.get("workdir"))
+            if port_range:
+                self.assertLessEqual(port_range[0], port, tool["name"])
+                self.assertLessEqual(port, port_range[1], tool["name"])
+
+    def test_public_tools_follow_workdir_port_contract(self):
+        data = tool_manager.load_tool_configuration(tool_manager.CONFIG_PATH)
+        tools = data.get("tools", [])
+        self.assert_tool_port_contract(tools)
+
+        by_name = {tool["name"]: tool for tool in tools}
+        for name, port in EXPECTED_PUBLIC_PORTS.items():
+            self.assertEqual(by_name[name]["port"], port, name)
+        self.assertEqual(by_name["xlsx_sql_tables"]["group"], "misc")
+        self.assertEqual(by_name["xlsx_dependency_splitter"]["group"], "misc")
+        self.assertEqual(by_name["job_dependency_cycle"]["group"], "jobgraph")
+
+    def test_port_zero_and_apps_are_outside_fixed_tool_port_ranges(self):
+        self.assert_tool_port_contract(
+            [
+                {"name": "no-listener", "workdir": "tools/misc", "port": 0},
+                {"name": "legacy-app", "workdir": "apps/webadmin", "port": 9999},
+            ]
+        )
+        command = tool_manager.build_command(
+            {
+                "type": "python",
+                "workdir": "tools/misc",
+                "script": "cli.py",
+                "port": 0,
+            }
+        )
+        self.assertNotIn("--port", command)
+
     def test_load_tools_and_get_tool(self):
         tmp = make_temp_dir()
         try:
@@ -71,7 +140,7 @@ class ToolManagerTests(unittest.TestCase):
                                 "name": "lineage_reconciliation",
                                 "workdir": "tools/lineage",
                                 "script": "reconcile_sql_schedule_web.py",
-                                "port": 8614,
+                                "port": 8603,
                             }
                         ]
                     }
@@ -112,13 +181,13 @@ class ToolManagerTests(unittest.TestCase):
             "workdir": "tools/sql",
             "script": "run_sql.py",
             "host": "127.0.0.1",
-            "port": 8020,
+            "port": 8101,
             "python": "python",
         }
         cmd = tool_manager.build_command(tool)
         self.assertEqual(cmd[0], sys.executable)
         self.assertTrue(cmd[1].replace("\\", "/").endswith("tools/sql/run_sql.py"))
-        self.assertEqual(cmd[-4:], ["--host", "127.0.0.1", "--port", "8020"])
+        self.assertEqual(cmd[-4:], ["--host", "127.0.0.1", "--port", "8101"])
 
     def test_resolve_path_keeps_absolute_path(self):
         path = tool_manager.resolve_path(str(Path("apps/webadmin").resolve()))
