@@ -9,7 +9,7 @@ from tools.misc.job_downstream_zs import (
     build_xls_bytes,
     create_export_filename,
     create_run_suffix,
-    split_rows_preserving_dependencies,
+    split_job_export_rows,
     transform_rows,
 )
 
@@ -192,7 +192,7 @@ class JobDownstreamZsTests(unittest.TestCase):
             {"a": "PLAN", "b": "SEQ", "c": "JOB_3", "ab": "33:ROOT"},
         ]
 
-        chunks = split_rows_preserving_dependencies(columns, rows, max_rows_per_file=2)
+        chunks = split_job_export_rows(columns, rows, max_rows_per_file=2)
 
         self.assertEqual(len(chunks), 3)
         self.assertEqual([row["c"] for row in chunks[0]], ["ROOT", "JOB_1"])
@@ -207,7 +207,7 @@ class JobDownstreamZsTests(unittest.TestCase):
             {"a": "PLAN", "c": "MID_2", "ab": "33:ROOT"},
         ]
 
-        chunks = split_rows_preserving_dependencies(columns, rows, max_rows_per_file=2)
+        chunks = split_job_export_rows(columns, rows, max_rows_per_file=2)
 
         for chunk in chunks:
             job_names = {row["c"] for row in chunk}
@@ -224,7 +224,24 @@ class JobDownstreamZsTests(unittest.TestCase):
         ]
 
         with self.assertRaises(ValueError):
-            split_rows_preserving_dependencies(columns, rows, max_rows_per_file=2)
+            split_job_export_rows(columns, rows, max_rows_per_file=2)
+
+    def test_split_rows_preserving_dependencies_handles_cycle_closure(self):
+        # Previously A's closure contained A again through A -> B -> A and
+        # incorrectly exceeded this two-row limit.
+        columns = ["a", "c", "ab"]
+        rows = [
+            {"a": "PLAN", "c": "A", "ab": "33:B"},
+            {"a": "PLAN", "c": "B", "ab": "33:A"},
+            {"a": "PLAN", "c": "X", "ab": ""},
+        ]
+
+        chunks = split_job_export_rows(columns, rows, max_rows_per_file=2)
+
+        self.assertEqual(
+            {row["c"] for row in chunks[0]}, {"A", "B"}
+        )
+        self.assertTrue(all(len(chunk) <= 2 for chunk in chunks))
 
     def test_build_split_zip_bytes_returns_zip_content(self):
         columns = ["a", "c", "ab"]
