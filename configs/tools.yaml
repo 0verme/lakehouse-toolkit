@@ -70,6 +70,19 @@ tools:
     enable: true
     auto_restart: false
 
+  - name: xlsx_dependency_splitter
+    title: 依赖关系 Excel 自动拆分
+    group: tools
+    type: python
+    workdir: tools/misc
+    script: xlsx_dependency_splitter.py
+    host: 127.0.0.1
+    port: 0
+    log: logs/xlsx_dependency_splitter.log
+    python: python
+    enable: true
+    auto_restart: false
+
   - name: workspace_search
     title: Workspace 依赖搜索
     group: search

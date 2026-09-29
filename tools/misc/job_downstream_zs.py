@@ -24,6 +24,9 @@ from shared.graph.dependency import (
     find_all_dependent_jobs,
     parse_job_dependencies,
 )  # noqa: E402
+from shared.graph.dependency_splitter import (
+    split_rows_preserving_dependencies as split_dependency_rows,
+)  # noqa: E402
 
 xlwt = import_module("xlwt")
 
@@ -219,85 +222,23 @@ def build_sheet_rows(columns: list[str], result_rows: list[dict]) -> list[list[s
     ]
 
 
-def split_rows_preserving_dependencies(
+def split_job_export_rows(
     columns: list[str],
     result_rows: list[dict],
     max_rows_per_file: int = MAX_ROWS_PER_FILE,
 ) -> list[list[dict]]:
-    if max_rows_per_file <= 0:
-        raise ValueError("max_rows_per_file 必须大于 0")
-    if len(result_rows) <= max_rows_per_file:
-        return [result_rows]
+    """Map this export's c/ab columns to the shared dependency splitter."""
 
     job_col = find_column_name(columns, "c")
     deps_col = find_column_name(columns, "ab")
-    row_by_job = {}
-    job_order = {}
-    dep_map = {}
-
-    for index, row in enumerate(result_rows):
-        job_name = value_to_text(row.get(job_col))
-        if not job_name:
-            continue
-        row_by_job[job_name] = row
-        job_order[job_name] = index
-        dep_map[job_name] = parse_job_dependencies(row.get(deps_col))
-
-    closure_cache: dict[str, list[str]] = {}
-
-    def resolve_closure(job_name: str) -> list[str]:
-        if job_name in closure_cache:
-            return closure_cache[job_name]
-
-        seen = set()
-        ordered_jobs = []
-
-        def visit(current_job: str):
-            for dep in dep_map.get(current_job, []):
-                if dep not in row_by_job or dep in seen:
-                    continue
-                seen.add(dep)
-                visit(dep)
-                ordered_jobs.append(dep)
-
-        visit(job_name)
-        closure_cache[job_name] = ordered_jobs
-        return ordered_jobs
-
-    chunks: list[list[dict]] = []
-    current_rows: list[dict] = []
-    current_jobs: set[str] = set()
-
-    for row in result_rows:
-        job_name = value_to_text(row.get(job_col))
-        if not job_name:
-            continue
-
-        required_jobs = resolve_closure(job_name) + [job_name]
-        missing_jobs = [job for job in required_jobs if job not in current_jobs]
-        if len(missing_jobs) > max_rows_per_file:
-            raise ValueError(
-                f"单个作业链路超过 {max_rows_per_file} 行，无法自动拆分: {job_name}"
-            )
-
-        if current_rows and len(current_rows) + len(missing_jobs) > max_rows_per_file:
-            chunks.append(current_rows)
-            current_rows = []
-            current_jobs = set()
-            missing_jobs = required_jobs
-            if len(missing_jobs) > max_rows_per_file:
-                raise ValueError(
-                    f"单个作业链路超过 {max_rows_per_file} 行，无法自动拆分: {job_name}"
-                )
-
-        for missing_job in missing_jobs:
-            current_rows.append(dict(row_by_job[missing_job]))
-            current_jobs.add(missing_job)
-
-    if current_rows:
-        chunks.append(current_rows)
-
-    return chunks
+    result = split_dependency_rows(
+        columns,
+        result_rows,
+        id_column=job_col,
+        dependency_column=deps_col,
+        max_rows_per_chunk=max_rows_per_file,
+    )
+    return result.chunks
 
 
 def build_xls_bytes(sheet_name: str, rows: list[list[str]]) -> bytes:
@@ -388,7 +329,7 @@ def render_app():
         put_red_text(f"以下作业名未找到，已跳过：{', '.join(not_found)}")
 
     export_filename = create_export_filename(start_jobs)
-    row_chunks = split_rows_preserving_dependencies(
+    row_chunks = split_job_export_rows(
         columns, result_rows, max_rows_per_file=MAX_ROWS_PER_FILE
     )
 
