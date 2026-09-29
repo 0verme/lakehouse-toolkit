@@ -1,4 +1,20 @@
 # 公开版通用工具注册表。
+# Tool port allocation：按 workdir / 工具域固定分段。
+#
+# search    7001-7099
+# crypto    8001-8099
+# sql       8101-8199
+# cms       8201-8299
+# misc      8301-8399
+# jobgraph  8401-8499
+# czcb      8501-8599
+# lineage   8601-8699
+#
+# 规则：
+# - 工具重命名或迁移目录时，优先保留历史端口身份。
+# - 新工具在所属 workdir / 工具域内顺序分配可用端口。
+# - port: 0 表示不启动独立 Web 服务 / 无固定监听端口。
+# - 本机私有覆盖仍放在 tools.local.yaml。
 # 本文件不包含本机解释器路径、内部地址或凭据；本机覆盖项与私有工具注册放在 tools.local.yaml。
 # 本机可按 name 覆盖以下工具，也可追加只存在于当前部署的工具；运行数据不进入 Git。
 default_python: python
@@ -46,12 +62,12 @@ tools:
 
   - name: xlsx_sql_tables
     title: Excel SQL 表名解析
-    group: tools
+    group: misc
     type: python
     workdir: tools/misc
     script: xlsx_sql_tables.py
     host: 127.0.0.1
-    port: 0
+    port: 8308
     log: logs/xlsx_sql_tables.log
     python: python
     enable: true
@@ -59,12 +75,12 @@ tools:
 
   - name: xlsx_dependency_splitter
     title: 依赖关系 Excel 自动拆分
-    group: tools
+    group: misc
     type: python
     workdir: tools/misc
     script: xlsx_dependency_splitter.py
     host: 127.0.0.1
-    port: 0
+    port: 8309
     log: logs/xlsx_dependency_splitter.log
     python: python
     enable: true
@@ -77,7 +93,7 @@ tools:
     workdir: tools/search
     script: workspace_search_total.py
     host: 127.0.0.1
-    port: 8610
+    port: 7005
     log: logs/workspace_search.log
     python: python
     enable: true
@@ -90,7 +106,7 @@ tools:
     workdir: tools/search
     script: workspace_lineage_search.py
     host: 127.0.0.1
-    port: 8611
+    port: 7006
     log: logs/workspace_lineage.log
     python: python
     enable: true
@@ -103,7 +119,7 @@ tools:
     workdir: tools/search
     script: table_lineage_roamer.py
     host: 127.0.0.1
-    port: 8612
+    port: 7007
     log: logs/table_lineage.log
     python: python
     enable: true
@@ -111,12 +127,12 @@ tools:
 
   - name: job_dependency_cycle
     title: 作业依赖成环检查
-    group: analysis
+    group: jobgraph
     type: python
     workdir: tools/jobgraph
     script: job_dependency_cycle_check.py
     host: 127.0.0.1
-    port: 8613
+    port: 8425
     log: logs/job_dependency_cycle.log
     python: python
     enable: false
@@ -129,7 +145,7 @@ tools:
     workdir: tools/lineage
     script: reconcile_sql_schedule_web.py
     host: 127.0.0.1
-    port: 8614
+    port: 8601
     log: logs/lineage_reconciliation.log
     python: python
     enable: true
@@ -142,7 +158,7 @@ tools:
     workdir: tools/lineage
     script: lineage_explorer_web.py
     host: 127.0.0.1
-    port: 8615
+    port: 8602
     log: logs/lineage_explorer.log
     python: python
     enable: true
