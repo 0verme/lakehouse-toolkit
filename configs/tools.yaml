@@ -12,46 +12,33 @@ tools:
     workdir: apps/webadmin
     script: app.py
     host: 127.0.0.1
-    port: 8500
+    port: 9999
     log: logs/webadmin.log
     python: python
     enable: true
     auto_restart: true
 
-  - name: svn_check
-    title: 数据开发代码审查
-    group: apps
-    type: streamlit
-    workdir: apps/svn_check
-    script: app.py
-    host: 127.0.0.1
-    port: 8501
-    log: logs/svn_check.log
-    python: python
-    enable: true
-    auto_restart: false
-
   - name: encode_demo
-    title: 双重 Base64 编码演示
+    title: Base编码
     group: crypto
     type: python
     workdir: tools/crypto
     script: jiami.py
     host: 127.0.0.1
-    port: 8601
+    port: 8001
     log: logs/encode_demo.log
     python: python
     enable: true
     auto_restart: false
 
   - name: decode_demo
-    title: 双重 Base64 解码演示
+    title: Base解码
     group: crypto
     type: python
     workdir: tools/crypto
     script: jiemi.py
     host: 127.0.0.1
-    port: 8602
+    port: 8002
     log: logs/decode_demo.log
     python: python
     enable: true
