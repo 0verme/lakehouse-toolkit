@@ -685,6 +685,28 @@ class DWSMaterializationStoreTests(unittest.TestCase):
             (business[0].source_table, business[0].target_table),
             ("DWF.SOURCE", "DWM.RESULT"),
         )
+        active_metadata = self.store.get_active_snapshot_metadata()
+        self.assertIsNotNone(active_metadata)
+        assert active_metadata is not None
+        self.assertTrue(active_metadata.complete_snapshot)
+        self.assertEqual(active_metadata.snapshot_mode, "FULL")
+        self.assertEqual(active_metadata.snapshot_scope, (("DEV", "fixture"),))
+        business_rows = self.store.read_business_rows(
+            batch_id=batch.batch_id,
+            active_only=True,
+            environment="DEV",
+            source_profile="fixture",
+        )
+        self.assertEqual(len(business_rows), 1)
+        self.assertEqual(
+            self.store.read_business_rows(
+                batch_id=batch.batch_id,
+                active_only=True,
+                environment="OTHER",
+                source_profile="fixture",
+            ),
+            (),
+        )
         self.assertIsInstance(business[0].evidence, dict)
         assert isinstance(business[0].evidence, dict)
         self.assertEqual(business[0].evidence["collapse_depth"], 2)
@@ -1172,6 +1194,33 @@ class DWSMaterializationStoreTests(unittest.TestCase):
         assert metadata is not None
         self.assertTrue(metadata.is_active)
         self.assertEqual(metadata.edge_count, 0)
+
+    def test_active_metadata_exposes_partial_snapshot_for_replace_safety(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            "INSERT INTO DWM.RESULT SELECT * FROM DWF.SOURCE",
+            expected_target="DWM.RESULT",
+            source_hash="sha256:partial-snapshot",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-partial-metadata",
+            observed_at=OBSERVED_AT,
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=False,
+        )
+
+        metadata = self.store.get_active_snapshot_metadata()
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertFalse(metadata.complete_snapshot)
+        self.assertEqual(metadata.snapshot_mode, "PARTIAL")
+        self.assertEqual(metadata.snapshot_scope, (("DEV", "fixture"),))
 
     def test_history_isolation_and_rebase_preserve_stable_keys(self) -> None:
         source = ProgramSource(

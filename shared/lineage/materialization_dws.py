@@ -449,12 +449,14 @@ class _DWSBatchRow:
 
 @dataclass(frozen=True, slots=True)
 class DWSActiveSnapshotMetadata:
-    """Compact active SQL provenance used by target-scoped reconciliation."""
+    """Compact active SQL provenance used by read-only consumers."""
 
     batch_id: str
     snapshot_scope: tuple[tuple[str, str], ...]
     observed_at: datetime
     is_active: bool = True
+    complete_snapshot: bool = False
+    snapshot_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1789,12 +1791,16 @@ class DWSMaterializationStore:
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        environment: str | None = None,
+        source_profile: str | None = None,
         target_tables: Iterable[object] | None = None,
     ) -> tuple[DWSBusinessEdgeRow, ...]:
         where, params = self._where_for_batch_and_active(
             "e",
             batch_id=batch_id,
             active_only=active_only,
+            environment=environment,
+            source_profile=source_profile,
             target_tables=target_tables,
         )
         join = ACTIVE_BATCH_JOIN if active_only else ""
@@ -2838,6 +2844,8 @@ class DWSMaterializationStore:
             batch_id=row.batch_id,
             snapshot_scope=_snapshot_scope_from_json(row.snapshot_scope),
             observed_at=row.observed_at,
+            complete_snapshot=row.complete_snapshot,
+            snapshot_mode=row.snapshot_mode,
         )
 
     def get_active_batch_id(self) -> str | None:
@@ -3116,11 +3124,39 @@ class DWSMaterializationStore:
                     int((perf_counter() - conversion_started) * 1000),
                 )
 
+    def read_business_rows(
+        self,
+        *,
+        batch_id: str | None = None,
+        active_only: bool = False,
+        environment: str | None = None,
+        source_profile: str | None = None,
+        target_tables: Iterable[object] | None = None,
+    ) -> tuple[DWSBusinessEdgeRow, ...]:
+        """Read stored business facts with optional exact-scope predicates.
+
+        This row-level projection is for bounded downstream adapters that need
+        persisted stable keys and provenance not represented by ``LineageEdge``.
+        It remains read-only and uses the same validated DWS business query.
+        """
+
+        with self._connection_scope() as connection:
+            return self._fetch_business_rows(
+                connection,
+                batch_id=batch_id,
+                active_only=active_only,
+                environment=environment,
+                source_profile=source_profile,
+                target_tables=target_tables,
+            )
+
     def read_edges(
         self,
         *,
         batch_id: str | None = None,
         active_only: bool = False,
+        environment: str | None = None,
+        source_profile: str | None = None,
         target_tables: Iterable[object] | None = None,
     ) -> tuple[LineageEdge, ...]:
         with self._connection_scope() as connection:
@@ -3128,6 +3164,8 @@ class DWSMaterializationStore:
                 connection,
                 batch_id=batch_id,
                 active_only=active_only,
+                environment=environment,
+                source_profile=source_profile,
                 target_tables=target_tables,
             )
         return tuple(_business_to_edge(row) for row in rows)
