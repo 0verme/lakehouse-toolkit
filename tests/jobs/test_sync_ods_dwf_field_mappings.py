@@ -3,562 +3,1026 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import secrets
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from jobs.crontab import sync_ods_dwf_field_mappings as collector
+import requests
+
+from jobs.crontab import sync_ods_dwf_field_mappings as entry
+from tools.field_mapping.collector import collect_workspace
+from tools.field_mapping.dap_client import (
+    FieldMappingApiClient,
+    FieldMappingApiError,
+    build_import_payload,
+    is_local_write_url,
+    split_batches,
+    submit_batches,
+)
+from tools.field_mapping.metadata_resolver import (
+    MetadataResolver,
+    canonical_dwf_target,
+    normalize_logical_target,
+    normalize_program_name,
+    parse_dwo_physical_table,
+)
+from tools.field_mapping.models import (
+    MappingField,
+    MappingItem,
+    RecvDwfRecord,
+    SchemaConfigRecord,
+)
+
+PROGRAM = "005_DWS_DWF_DWF_DEMO_SOURCE_TABLE_00.py"
+JOB = "JOB_DWS_DWS_DWF_DWF_DEMO_SOURCE_TABLE_00_DAY"
+TARGET = "DWF.DWF_DEMO_SOURCE_TABLE"
 
 
-def _item(source_table: str, source_system_id: int = 101) -> collector.MappingItem:
-    return collector.MappingItem(
-        source_system_id=source_system_id,
-        source_table=source_table,
-        target_table="DWF.DEMO_TARGET",
+def _resolver(
+    recv: list[RecvDwfRecord] | None = None,
+    schemas: list[SchemaConfigRecord] | None = None,
+    systems: list[dict[str, object]] | None = None,
+) -> MetadataResolver:
+    return MetadataResolver(
+        recv
+        if recv is not None
+        else [
+            RecvDwfRecord("DEMO_SYSTEM_A", TARGET, "DEMO_SYSTEM_A", ods_job_name=JOB)
+        ],
+        schemas
+        if schemas is not None
+        else [SchemaConfigRecord("DEMO_SYSTEM_A", "DEMO_SCHEMA_A")],
+        {
+            "items": systems
+            if systems is not None
+            else [{"id": "DEMO_SYSTEM_A", "upstreamSystemId": 106}]
+        },
+    )
+
+
+def _write_project(root: Path, files: dict[str, str]) -> Path:
+    project = root / "DWS_DWF.DWF_DEMO_SOURCE_TABLE"
+    project.mkdir(parents=True)
+    for filename, content in files.items():
+        (project / filename).write_text(content, encoding="utf-8")
+    return project
+
+
+def _item(
+    source: str = "DEMO_SOURCE_TABLE",
+    *,
+    target: str = "DWF_DEMO_SOURCE_TABLE",
+    system: int = 106,
+) -> MappingItem:
+    return MappingItem(
+        source_system_identity="DEMO_SYSTEM_A",
+        source_system_id=system,
+        source_table=source,
+        target_table=target,
         fields=(
-            collector.MappingField(
+            MappingField(
                 source_field="ID",
                 target_field="ID",
                 mapping_rule="DIRECT",
                 field_order=1,
+                physical_source_table="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+                db_schema="DEMO_SCHEMA_A",
+                program=PROGRAM,
             ),
         ),
     )
 
 
-def _response(actions: list[str]) -> dict[str, object]:
+def _import_response(
+    items: list[MappingItem], action: str = "created", *, dry_run: bool = False
+) -> dict[str, object]:
+    fields = sum(len(item.fields) for item in items)
     return {
         "mode": "upsert",
-        "dryRun": False,
+        "dryRun": dry_run,
         "summary": {
-            "received": len(actions),
-            "created": actions.count("created"),
-            "updated": actions.count("updated"),
-            "unchanged": actions.count("unchanged"),
-            "failed": actions.count("failed"),
-            "fieldCount": len(actions),
+            "received": len(items),
+            "created": len(items) if action == "created" else 0,
+            "updated": len(items) if action == "updated" else 0,
+            "unchanged": len(items) if action == "unchanged" else 0,
+            "failed": len(items) if action == "failed" else 0,
+            "fieldCount": fields,
         },
         "items": [
             {
                 "index": index,
-                "identity": {"sourceSystemId": 101, "sourceTable": f"ODS.T{index}"},
+                "identity": {
+                    "sourceSystemId": item.source_system_id,
+                    "sourceTable": item.source_table,
+                    "targetLayer": "DWF",
+                    "targetTable": item.target_table,
+                },
                 "action": action,
-                "fieldCount": 1,
+                "fieldCount": len(item.fields),
                 **(
                     {"error": {"code": "INVALID_FIELD", "message": "invalid mapping"}}
                     if action == "failed"
                     else {}
                 ),
             }
-            for index, action in enumerate(actions)
+            for index, item in enumerate(items)
         ],
     }
 
 
-class MappingContractTests(unittest.TestCase):
-    def test_payload_matches_dap_import_contract_and_is_upsert_only(self):
-        item = collector.MappingItem(
-            source_system_id=103,
-            source_table="ODS.CUSTOMER",
-            target_table="DWF.CUSTOMER",
-            fields=(
-                collector.MappingField(
-                    source_field="CUST_ID",
-                    source_type="VARCHAR(32)",
-                    source_comment="customer key",
-                    target_field="CUSTOMER_ID",
-                    mapping_rule="RENAME",
-                    field_order=1,
-                ),
-            ),
-        )
-
-        payload = collector.build_import_payload([item])
-
-        self.assertEqual("upsert", payload["mode"])
-        self.assertFalse(payload["dryRun"])
-        self.assertEqual(
+def _metadata_json(
+    path: Path,
+    recv: list[dict[str, str]] | None = None,
+    schemas: list[dict[str, str]] | None = None,
+) -> Path:
+    path.write_text(
+        json.dumps(
             {
-                "sourceSystemId": 103,
-                "sourceTable": "ODS.CUSTOMER",
-                "targetLayer": "DWF",
-                "targetTable": "DWF.CUSTOMER",
-                "fields": [
+                "recv_dwf": recv
+                or [
                     {
-                        "sourceField": "CUST_ID",
-                        "sourceType": "VARCHAR(32)",
-                        "sourceComment": "customer key",
-                        "targetField": "CUSTOMER_ID",
-                        "mappingRule": "RENAME",
-                        "fieldOrder": 1,
+                        "recv_plan": "DEMO_SYSTEM_A",
+                        "table_name": TARGET,
+                        "data_source": "DEMO_SYSTEM_A",
+                        "ods_job_name": JOB,
                     }
                 ],
+                "schema_config": schemas
+                or [{"schema_key": "DEMO_SYSTEM_A", "db_schema": "DEMO_SCHEMA_A"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class MetadataResolutionTests(unittest.TestCase):
+    def test_historical_dwf_names_normalize_to_one_logical_target(self):
+        self.assertEqual(
+            "DEMO_SOURCE_TABLE", normalize_logical_target("DWF.F_DEMO_SOURCE_TABLE")
+        )
+        self.assertEqual(
+            "DEMO_SOURCE_TABLE", normalize_logical_target("DWF.DWF_DEMO_SOURCE_TABLE")
+        )
+        self.assertEqual(
+            "DWF_DEMO_SOURCE_TABLE", canonical_dwf_target("DWF.F_DEMO_SOURCE_TABLE")
+        )
+        self.assertEqual(
+            "DWF_DEMO_SOURCE_TABLE", canonical_dwf_target("DWF.DWF_DEMO_SOURCE_TABLE")
+        )
+
+    def test_python_filename_and_ods_job_normalize_to_same_identity(self):
+        self.assertEqual(normalize_program_name(PROGRAM), normalize_program_name(JOB))
+
+    def test_recv_plan_resolves_to_current_dap_system_id_not_a_constant(self):
+        resolver = _resolver(systems=[{"id": "DEMO_SYSTEM_A", "upstreamSystemId": 999}])
+        result = resolver.resolve(
+            target=TARGET,
+            program_names=[PROGRAM],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        self.assertEqual("RESOLVED", result.status)
+        self.assertEqual("DEMO_SYSTEM_A", result.record.recv_plan)
+        self.assertEqual(999, result.upstream_system_id)
+        mapping = _item(system=result.upstream_system_id)
+        self.assertEqual(
+            ("demo_system_a", "demo_source_table", "dwf_demo_source_table"),
+            mapping.identity,
+        )
+
+    def test_data_source_to_schema_config_to_db_schema_resolution(self):
+        result = _resolver().resolve(
+            target=TARGET,
+            program_names=[PROGRAM],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        self.assertEqual("DEMO_SCHEMA_A", result.source.db_schema)
+        self.assertEqual("DEMO_SOURCE_TABLE", result.source.source_table)
+
+    def test_dwo_parser_uses_longest_exact_db_schema_prefix(self):
+        source, error = parse_dwo_physical_table(
+            "DWO.DWO_DEMO_SCHEMA_A_B_DEMO_SOURCE_TABLE_B",
+            [
+                SchemaConfigRecord("SHORT", "DEMO"),
+                SchemaConfigRecord("LONG", "DEMO_SCHEMA_A_B"),
+            ],
+        )
+        self.assertIsNone(error)
+        self.assertEqual("DEMO_SCHEMA_A_B", source.db_schema)
+        self.assertEqual("DEMO_SOURCE_TABLE_B", source.source_table)
+
+    def test_one_dwf_target_can_resolve_multiple_dwo_sources_and_systems(self):
+        recv = [
+            RecvDwfRecord("DEMO_SYSTEM_A", TARGET, "DEMO_SYSTEM_A", ods_job_name=JOB),
+            RecvDwfRecord(
+                "DEMO_SCHEMA_A_B",
+                "DWF.F_DEMO_SOURCE_TABLE",
+                "DEMO_SCHEMA_A_B",
+                ods_job_name=JOB,
+            ),
+        ]
+        resolver = _resolver(
+            recv,
+            [
+                SchemaConfigRecord("DEMO_SYSTEM_A", "DEMO_SCHEMA_A"),
+                SchemaConfigRecord("DEMO_SCHEMA_A_B", "DEMO_SCHEMA_A_B"),
+            ],
+            [
+                {"id": "DEMO_SYSTEM_A", "upstreamSystemId": 106},
+                {"id": "DEMO_SCHEMA_A_B", "upstreamSystemId": 244},
+            ],
+        )
+        first = resolver.resolve(
+            target=TARGET,
+            program_names=[PROGRAM],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        second = resolver.resolve(
+            target=TARGET,
+            program_names=[PROGRAM],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_B_DEMO_SOURCE_TABLE_B",
+        )
+        self.assertEqual(
+            ("RESOLVED", 106, "DEMO_SOURCE_TABLE"),
+            (first.status, first.upstream_system_id, first.source.source_table),
+        )
+        self.assertEqual(
+            ("RESOLVED", 244, "DEMO_SOURCE_TABLE_B"),
+            (second.status, second.upstream_system_id, second.source.source_table),
+        )
+
+    def test_program_metadata_conflict_is_not_silently_overridden(self):
+        resolver = _resolver(
+            [
+                RecvDwfRecord("P1", TARGET, "S1", ods_job_name="JOB_FOR_OTHER_TABLE"),
+                RecvDwfRecord(
+                    "P2",
+                    "DWF.DWF_OTHER",
+                    "S2",
+                    ods_job_name="JOB_005_DWS_DWF_DWF_DEMO_SOURCE_TABLE_00",
+                ),
+            ],
+            [
+                SchemaConfigRecord("S1", "DEMO_SCHEMA_A"),
+                SchemaConfigRecord("S2", "DEMO_SCHEMA_A"),
+            ],
+            [{"id": "P1", "upstreamSystemId": 1}, {"id": "P2", "upstreamSystemId": 2}],
+        )
+        result = resolver.resolve(
+            target=TARGET,
+            program_names=[PROGRAM],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        self.assertEqual(
+            ("CONFLICT", "program_metadata_conflict"), (result.status, result.reason)
+        )
+
+    def test_multiple_recv_plan_and_data_source_conflicts_are_reported(self):
+        rows = [
+            RecvDwfRecord("PLAN_A", TARGET, "SOURCE_A", ods_job_name="OTHER"),
+            RecvDwfRecord("PLAN_B", TARGET, "SOURCE_B", ods_job_name="OTHER"),
+        ]
+        resolver = _resolver(
+            rows,
+            [
+                SchemaConfigRecord("SOURCE_A", "DEMO_SCHEMA_A"),
+                SchemaConfigRecord("SOURCE_B", "DEMO_SCHEMA_A"),
+            ],
+            [],
+        )
+        result = resolver.resolve(
+            target=TARGET,
+            program_names=["unmatched.py"],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        self.assertEqual("multiple_recv_plan_conflict", result.reason)
+
+        same_plan = [
+            RecvDwfRecord("PLAN_A", TARGET, "SOURCE_A", ods_job_name="OTHER"),
+            RecvDwfRecord("PLAN_A", TARGET, "SOURCE_B", ods_job_name="OTHER"),
+        ]
+        resolver = _resolver(
+            same_plan,
+            [
+                SchemaConfigRecord("SOURCE_A", "DEMO_SCHEMA_A"),
+                SchemaConfigRecord("SOURCE_B", "DEMO_SCHEMA_A"),
+            ],
+            [],
+        )
+        result = resolver.resolve(
+            target=TARGET,
+            program_names=["unmatched.py"],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        self.assertEqual("multiple_data_source_conflict", result.reason)
+
+    def test_schema_mismatch_is_a_conflict_and_unknown_system_is_unresolved(self):
+        resolver = _resolver(
+            [RecvDwfRecord("DEMO_SYSTEM_A", TARGET, "WRONG_SOURCE", ods_job_name=JOB)],
+            [
+                SchemaConfigRecord("WRONG_SOURCE", "WRONG_SCHEMA"),
+                SchemaConfigRecord("OTHER", "DEMO_SCHEMA_A"),
+            ],
+            [{"id": "DEMO_SYSTEM_A", "upstreamSystemId": 106}],
+        )
+        result = resolver.resolve(
+            target=TARGET,
+            program_names=[PROGRAM],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        self.assertEqual(
+            ("CONFLICT", "schema_match_conflict"), (result.status, result.reason)
+        )
+        unknown = _resolver(systems=[]).resolve(
+            target=TARGET,
+            program_names=[PROGRAM],
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+        )
+        self.assertEqual(
+            ("UNRESOLVED", "unknown_upstream_system"), (unknown.status, unknown.reason)
+        )
+
+
+class SqlProjectionTests(unittest.TestCase):
+    def _collect(self, files: dict[str, str], resolver: MetadataResolver | None = None):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        _write_project(Path(temp.name), files)
+        return collect_workspace(temp.name, resolver or _resolver())
+
+    def test_multi_python_project_and_tmp_chain_project_to_final_dwf(self):
+        audit = self._collect(
+            {
+                "stage.py": (
+                    "def run(execute):\n"
+                    '    execute("INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE_TMP (ID) '
+                    'SELECT s.ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE s")\n'
+                ),
+                PROGRAM: (
+                    "def run(execute):\n"
+                    '    execute("INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID) '
+                    'SELECT t.ID FROM DWF.DWF_DEMO_SOURCE_TABLE_TMP t")\n'
+                ),
+            }
+        )
+        self.assertEqual(1, audit.summary["project_count"])
+        self.assertEqual(2, audit.summary["python_file_count"])
+        self.assertEqual(1, audit.summary["dwo_physical_table_count"])
+        self.assertEqual(1, len(audit.items))
+        item = audit.items[0]
+        self.assertEqual(
+            ("DEMO_SOURCE_TABLE", "DWF_DEMO_SOURCE_TABLE"),
+            (item.source_table, item.target_table),
+        )
+        self.assertEqual(
+            "DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+            audit.resolved[0]["physicalSourceTable"],
+        )
+
+    def test_alias_cast_case_and_coalesce_keep_all_upstream_fields(self):
+        audit = self._collect(
+            {
+                "program.sql": (
+                    "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE "
+                    "(ID, CAST_ID, FULL_NAME, LABEL) SELECT "
+                    "s.ID AS alias_id, CAST(s.ID AS CHAR), "
+                    "COALESCE(s.FIRST_NAME, s.LAST_NAME), "
+                    "CASE WHEN s.FLAG = 1 THEN s.ID ELSE s.OTHER_ID END "
+                    "FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE s"
+                )
+            }
+        )
+        self.assertEqual(1, len(audit.items))
+        mappings = {
+            (item.source_field, item.target_field): item
+            for item in audit.items[0].fields
+        }
+        self.assertEqual("DIRECT", mappings[("ID", "ID")].mapping_rule)
+        self.assertEqual("待补充", mappings[("ID", "CAST_ID")].mapping_rule)
+        self.assertIn(("FIRST_NAME", "FULL_NAME"), mappings)
+        self.assertIn(("LAST_NAME", "FULL_NAME"), mappings)
+        self.assertEqual(
+            {"FLAG", "ID", "OTHER_ID"},
+            {source for source, target in mappings if target == "LABEL"},
+        )
+        self.assertEqual(
+            0, audit.summary["unresolved"]["multi_source_field_unsupported"]
+        )
+        build_import_payload(audit.items)
+
+    def test_join_and_cte_are_resolved_to_dwo_leaf_sources(self):
+        recv = [
+            RecvDwfRecord("DEMO_SYSTEM_A", TARGET, "DEMO_SYSTEM_A", ods_job_name=JOB),
+            RecvDwfRecord("DEMO_SYSTEM_B", TARGET, "DEMO_SYSTEM_B", ods_job_name=JOB),
+        ]
+        resolver = _resolver(
+            recv,
+            [
+                SchemaConfigRecord("DEMO_SYSTEM_A", "DEMO_SCHEMA_A"),
+                SchemaConfigRecord("DEMO_SYSTEM_B", "DEMO_SYSTEM_B"),
+            ],
+            [
+                {"id": "DEMO_SYSTEM_A", "upstreamSystemId": 106},
+                {"id": "DEMO_SYSTEM_B", "upstreamSystemId": 207},
+            ],
+        )
+        audit = self._collect(
+            {
+                PROGRAM: (
+                    "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID, DEMO_CONTACT_NAME) "
+                    "WITH customers AS (SELECT c.ID, c.DEMO_CONTACT_ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE c) "
+                    "SELECT customers.ID, r.NAME FROM customers "
+                    "JOIN DWO.DWO_DEMO_SYSTEM_B_DEMO_CONTACT r ON customers.DEMO_CONTACT_ID = r.ID"
+                )
             },
-            payload["items"][0],
+            resolver,
         )
-        self.assertNotIn("dataSourceId", payload["items"][0])
-        self.assertFalse(
-            any(key in payload for key in ("delete", "replace", "truncate"))
+        by_system = {item.source_system_id: item for item in audit.items}
+        self.assertEqual({106, 207}, set(by_system))
+        self.assertEqual("DEMO_SOURCE_TABLE", by_system[106].source_table)
+        self.assertEqual("DEMO_CONTACT", by_system[207].source_table)
+        self.assertEqual("DEMO_CONTACT_NAME", by_system[207].fields[0].target_field)
+
+    def test_quoted_identifiers_and_case_are_normalized(self):
+        audit = self._collect(
+            {
+                "quoted.sql": (
+                    "INSERT INTO `dwf`.`DWF_DEMO_SOURCE_TABLE` (`TargetId`) "
+                    "SELECT `s`.`Id` FROM `dwo`.`DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE` AS `s`"
+                )
+            }
+        )
+        self.assertEqual("ID", audit.items[0].fields[0].source_field)
+        self.assertEqual("TARGETID", audit.items[0].fields[0].target_field)
+
+    def test_merge_and_ambiguous_expression_are_unsupported_not_guessed(self):
+        merge = self._collect(
+            {
+                PROGRAM: (
+                    "MERGE INTO DWF.DWF_DEMO_SOURCE_TABLE t USING DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE s "
+                    "ON t.ID=s.ID WHEN MATCHED THEN UPDATE SET t.ID=s.ID"
+                )
+            }
+        )
+        self.assertEqual((), merge.items)
+        self.assertTrue(
+            any(row["reason"] == "unsupported_sql" for row in merge.unresolved)
+        )
+        ambiguous = self._collect(
+            {
+                "expr.sql": (
+                    "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID) "
+                    "SELECT x.ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE x "
+                    "JOIN DWO.DWO_DEMO_SCHEMA_A_OTHER_TABLE y ON x.ID=y.ID"
+                )
+            }
+        )
+        # The qualified expression resolves. An unqualified joined field does not.
+        self.assertEqual(1, len(ambiguous.items))
+        unqualified = self._collect(
+            {
+                "expr.sql": (
+                    "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID) "
+                    "SELECT ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE x "
+                    "JOIN DWO.DWO_DEMO_SCHEMA_A_OTHER_TABLE y ON x.ID=y.ID"
+                )
+            }
+        )
+        self.assertEqual((), unqualified.items)
+        self.assertTrue(
+            any("ambiguous" in row["detail"] for row in unqualified.unresolved)
         )
 
-    def test_payload_validation_rejects_bad_identity_or_duplicate_field_key(self):
-        item = _item("ODS.CUSTOMER")
-        duplicate = collector.MappingItem(
-            source_system_id=item.source_system_id,
-            source_table=item.source_table,
-            target_table=item.target_table,
-            fields=(item.fields[0], item.fields[0]),
+    def test_resolved_audit_lists_only_evidence_that_was_actually_matched(self):
+        resolver = _resolver(
+            [RecvDwfRecord("DEMO_SYSTEM_A", TARGET, "DEMO_SYSTEM_A")],
+            [SchemaConfigRecord("DEMO_SYSTEM_A", "DEMO_SCHEMA_A")],
+            [{"id": "DEMO_SYSTEM_A", "upstreamSystemId": 106}],
         )
-        with self.assertRaisesRegex(ValueError, "duplicates"):
-            collector.build_import_payload([duplicate])
-        with self.assertRaisesRegex(ValueError, "500"):
-            collector.build_import_payload([_item(f"ODS.T{n}") for n in range(501)])
+        audit = self._collect(
+            {
+                "mapping.sql": (
+                    "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID) "
+                    "SELECT s.ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE s"
+                )
+            },
+            resolver,
+        )
 
-    def test_idempotent_replay_keeps_the_same_dap_identity_and_payload(self):
-        item = _item("ODS.CUSTOMER", 103)
-
-        first = collector.build_import_payload([item])
-        second = collector.build_import_payload([item])
-
-        self.assertEqual(first, second)
-        self.assertEqual((103, "ods.customer"), item.identity)
-
-
-class SourceSystemIdentityTests(unittest.TestCase):
-    def test_source_system_id_must_be_explicit_and_is_not_guessed(self):
-        self.assertIsNone(collector.resolve_source_system_id(None, {}))
+        self.assertEqual(1, len(audit.items))
         self.assertEqual(
-            103,
-            collector.resolve_source_system_id(
-                None, {"PYTOOLS_DAP_SOURCE_SYSTEM_ID": "103"}
-            ),
-        )
-        with self.assertRaisesRegex(ValueError, "positive integer"):
-            collector.resolve_source_system_id(
-                None, {"PYTOOLS_DAP_SOURCE_SYSTEM_ID": "CORE"}
-            )
-
-    def test_same_source_table_in_two_systems_has_two_distinct_identities(self):
-        first = _item("ODS.CUSTOMER", source_system_id=103)
-        second = _item("ODS.CUSTOMER", source_system_id=204)
-
-        self.assertNotEqual(first.identity, second.identity)
-        self.assertNotEqual(
-            collector.build_import_payload([first]),
-            collector.build_import_payload([second]),
+            "table_name;db_schema;dap_upstream_system",
+            audit.resolved[0]["evidence"],
         )
 
-    def test_missing_identity_skips_tables_without_sending_them(self):
-        with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "load.sql").write_text(
-                "INSERT INTO DWF.CUSTOMER (CUSTOMER_ID) "
-                "SELECT c.ID FROM ODS.CUSTOMER c",
-                encoding="utf-8",
-            )
+    def test_conflicting_field_order_is_not_silently_selected(self):
+        audit = self._collect(
+            {
+                "first.sql": (
+                    "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID, NAME) "
+                    "SELECT s.ID, s.NAME FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE s"
+                ),
+                "second.sql": (
+                    "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (NAME, ID) "
+                    "SELECT s.NAME, s.ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE s"
+                ),
+            }
+        )
 
-            result = collector.collect_workspace(
-                directory, source_system_id=None, dialect="mysql"
-            )
+        self.assertEqual((), audit.items)
+        self.assertTrue(
+            any(row["reason"] == "field_mapping_conflict" for row in audit.conflicts)
+        )
 
-        self.assertEqual((), result.items)
-        self.assertEqual(1, result.stats.candidate_programs)
-        self.assertEqual(1, result.stats.skipped_tables)
+    def test_metadata_conflict_never_enters_resolved_payload(self):
+        resolver = _resolver(
+            [
+                RecvDwfRecord("PLAN_A", TARGET, "A", ods_job_name="OTHER"),
+                RecvDwfRecord("PLAN_B", TARGET, "B", ods_job_name="OTHER"),
+            ],
+            [
+                SchemaConfigRecord("A", "DEMO_SCHEMA_A"),
+                SchemaConfigRecord("B", "DEMO_SCHEMA_A"),
+            ],
+            [
+                {"id": "PLAN_A", "upstreamSystemId": 1},
+                {"id": "PLAN_B", "upstreamSystemId": 2},
+            ],
+        )
+        audit = self._collect(
+            {
+                "x.sql": "INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID) SELECT x.ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE x"
+            },
+            resolver,
+        )
+        self.assertEqual((), audit.items)
         self.assertTrue(
             any(
-                "missing explicit DAP sourceSystemId" in item
-                for item in result.stats.diagnostics
+                row["reason"] == "multiple_recv_plan_conflict"
+                for row in audit.conflicts
             )
         )
 
 
-class SqlFieldMappingParseTests(unittest.TestCase):
-    def _collect(
-        self, sql: str, *, source_system_id: int = 103
-    ) -> collector.Collection:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        Path(directory.name, "program.sql").write_text(sql, encoding="utf-8")
-        return collector.collect_workspace(
-            directory.name, source_system_id=source_system_id, dialect="mysql"
-        )
-
-    def test_python_program_uses_existing_static_sql_candidate_extractor(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        program = (
-            "def run(execute):\n"
-            "    sql = 'INSERT INTO DWF.CUSTOMER (ID) SELECT c.ID FROM ODS.CUSTOMER c'\n"
-            "    execute(sql)\n"
-        )
-        Path(directory.name, "program.py").write_text(program, encoding="utf-8")
-
-        result = collector.collect_workspace(
-            directory.name, source_system_id=103, dialect="mysql"
-        )
-
-        self.assertEqual(1, result.stats.candidate_programs)
-        self.assertEqual("ODS.CUSTOMER", result.items[0].source_table)
-
-    def test_insert_select_field_order_alias_and_mapping_rule(self):
-        result = self._collect(
-            "INSERT INTO DWF.CUSTOMER (CUSTOMER_ID) "
-            "SELECT c.ID AS customer_alias FROM ODS.CUSTOMER c"
-        )
-
-        self.assertEqual(1, result.stats.parsed_tables)
-        mapping = result.items[0]
-        self.assertEqual("ODS.CUSTOMER", mapping.source_table)
-        self.assertEqual("DWF.CUSTOMER", mapping.target_table)
-        self.assertEqual(
-            ("ID", "CUSTOMER_ID", "RENAME", 1),
-            (
-                mapping.fields[0].source_field,
-                mapping.fields[0].target_field,
-                mapping.fields[0].mapping_rule,
-                mapping.fields[0].field_order,
-            ),
-        )
-
-    def test_function_commas_are_parsed_as_ast_and_multicolumn_coalesce_is_skipped(
-        self,
-    ):
-        result = self._collect(
-            "INSERT INTO DWF.CUSTOMER (ID_ALIAS, NAME_UPPER, FULL_NAME, COUNTRY) "
-            "SELECT c.ID AS alias, UPPER(c.NAME), "
-            "COALESCE(c.FIRST_NAME, c.LAST_NAME), CONCAT(c.COUNTRY, ',') "
-            "FROM ODS.CUSTOMER c"
-        )
-
-        mapping = result.items[0]
-        fields = {item.target_field: item for item in mapping.fields}
-        self.assertEqual({"ID_ALIAS", "NAME_UPPER", "COUNTRY"}, set(fields))
-        self.assertEqual("待补充", fields["NAME_UPPER"].mapping_rule)
-        self.assertEqual("COUNTRY", fields["COUNTRY"].source_field)
-        self.assertEqual(4, fields["COUNTRY"].field_order)
-        self.assertTrue(
-            any("FULL_NAME" in diagnostic for diagnostic in result.stats.diagnostics)
-        )
-
-    def test_case_when_and_cast_are_never_guessed(self):
-        result = self._collect(
-            "INSERT INTO DWF.CUSTOMER (CAST_ID, CONDITIONAL_ID) "
-            "SELECT CAST(c.ID AS CHAR), "
-            "CASE WHEN c.FLAG = 1 THEN c.ID ELSE c.OTHER_ID END "
-            "FROM ODS.CUSTOMER c"
-        )
-
-        fields = {item.target_field: item for item in result.items[0].fields}
-        self.assertEqual({"CAST_ID"}, set(fields))
-        self.assertEqual("待补充", fields["CAST_ID"].mapping_rule)
-        self.assertTrue(
-            any("CONDITIONAL_ID" in item for item in result.stats.diagnostics)
-        )
-
-    def test_quoted_schema_identifiers_and_case_normalization(self):
-        result = self._collect(
-            "INSERT INTO `dwf`.`Customer` (`TargetId`) "
-            "SELECT `c`.`Id` FROM `ods`.`Customer` AS `c`"
-        )
-
-        mapping = result.items[0]
-        self.assertEqual("ODS.CUSTOMER", mapping.source_table)
-        self.assertEqual("DWF.CUSTOMER", mapping.target_table)
-        self.assertEqual("ID", mapping.fields[0].source_field)
-        self.assertEqual("TARGETID", mapping.fields[0].target_field)
-
-    def test_join_fields_are_grouped_by_physical_source_table(self):
-        result = self._collect(
-            "INSERT INTO DWF.CUSTOMER (CUSTOMER_ID, CRM_NAME) "
-            "SELECT c.ID, r.NAME FROM ODS.CUSTOMER c "
-            "JOIN CRM.CONTACT r ON c.ID = r.CUSTOMER_ID"
-        )
-
-        self.assertEqual(2, len(result.items))
-        by_source = {item.source_table: item for item in result.items}
-        self.assertEqual({"ODS.CUSTOMER", "CRM.CONTACT"}, set(by_source))
-        self.assertEqual(
-            "CUSTOMER_ID", by_source["ODS.CUSTOMER"].fields[0].target_field
-        )
-        self.assertEqual("CRM_NAME", by_source["CRM.CONTACT"].fields[0].target_field)
-
-    def test_cte_is_explicitly_unsupported(self):
-        result = self._collect(
-            "INSERT INTO DWF.CUSTOMER (CUSTOMER_ID) "
-            "WITH source_rows AS (SELECT ID FROM ODS.CUSTOMER) "
-            "SELECT ID FROM source_rows"
-        )
-
-        self.assertEqual((), result.items)
-        self.assertGreaterEqual(result.stats.skipped_tables, 1)
-        self.assertTrue(
-            any(
-                "CTE source is unsupported" in item for item in result.stats.diagnostics
-            )
-        )
-
-    def test_source_table_feeding_multiple_targets_is_skipped_for_dap_identity(self):
-        result = self._collect(
-            "INSERT INTO DWF.CUSTOMER_A (ID) SELECT c.ID FROM ODS.CUSTOMER c; "
-            "INSERT INTO DWF.CUSTOMER_B (ID) SELECT c.ID FROM ODS.CUSTOMER c"
-        )
-
-        self.assertEqual((), result.items)
-        self.assertEqual(1, result.stats.skipped_tables)
-        self.assertTrue(
-            any("multiple DWF targets" in item for item in result.stats.diagnostics)
-        )
-
-
-class BatchAndPartialFailureTests(unittest.TestCase):
-    def test_failed_table_can_be_rescanned_and_filtered_for_single_item_retry(self):
-        stats = collector.CollectorStats(parsed_tables=2, parsed_fields=2)
-        collection = collector.Collection(
-            (_item("ODS.CUSTOMER"), _item("ODS.ACCOUNT")), stats
-        )
-
-        retry = collector.filter_collection_by_source_tables(
-            collection, ["ods.customer"]
-        )
-
-        self.assertEqual(["ODS.CUSTOMER"], [item.source_table for item in retry.items])
-        self.assertEqual(1, retry.stats.parsed_tables)
-        self.assertEqual(1, retry.stats.parsed_fields)
-
-    def test_default_batch_size_100_splits_4000_tables_as_expected(self):
-        items = [_item(f"ODS.T{index:04d}") for index in range(4_000)]
-
-        batches = collector.split_batches(items, 100)
-
-        self.assertEqual(40, len(batches))
-        self.assertTrue(all(len(batch) == 100 for batch in batches))
-
-    def test_100_tables_fit_one_batch_and_101_split(self):
-        items = [_item(f"ODS.T{index:03d}") for index in range(101)]
-
-        self.assertEqual(
-            [100], [len(batch) for batch in collector.split_batches(items[:100], 100)]
-        )
-        self.assertEqual(
-            [100, 1], [len(batch) for batch in collector.split_batches(items, 100)]
-        )
-        with self.assertRaisesRegex(ValueError, "between 1 and 500"):
-            collector.split_batches(items, 501)
-
-    def test_partial_failure_preserves_item_level_results(self):
-        client = Mock()
-        client.import_mappings.return_value = _response(
-            ["created", "failed", "unchanged"]
-        )
-        stats = collector.CollectorStats()
-        items = [_item(f"ODS.T{index}") for index in range(3)]
-
-        collector.submit_batches(
-            items,
-            client,
-            batch_size=100,
-            server_dry_run=False,
-            stats=stats,
-        )
-
-        self.assertEqual(
-            (1, 0, 1, 1), (stats.created, stats.updated, stats.unchanged, stats.failed)
-        )
-        self.assertEqual("ODS.T1", stats.failed_tables[0]["sourceTable"])
-        self.assertEqual("INVALID_FIELD", stats.failed_tables[0]["errorCode"])
-        self.assertEqual(3, stats.field_count)
-
-
-class DryRunAndApiRetryTests(unittest.TestCase):
-    class FakeResponse:
-        def __init__(self, status_code: int, body: dict[str, object]) -> None:
-            self.status_code = status_code
+class BatchAndApiTests(unittest.TestCase):
+    class Response:
+        def __init__(self, status: int, body: dict[str, object]):
+            self.status_code = status
             self._body = body
 
-        def json(self) -> dict[str, object]:
+        def json(self):
             return self._body
 
-    class FakeSession:
-        def __init__(self, responses: list[object]) -> None:
-            self.responses = responses
-            self.calls: list[dict[str, object]] = []
+    class Session:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = []
+            self.headers = {}
 
-        def post(
-            self, url: str, **kwargs: object
-        ) -> DryRunAndApiRetryTests.FakeResponse:
-            self.calls.append({"url": url, **kwargs})
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
             result = self.responses.pop(0)
             if isinstance(result, BaseException):
                 raise result
             return result
 
-        def close(self) -> None:
-            return None
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            result = self.responses.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
 
-    def test_local_dry_run_writes_preview_and_never_constructs_api_client(self):
-        with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "load.sql").write_text(
-                "INSERT INTO DWF.CUSTOMER (ID) SELECT c.ID FROM ODS.CUSTOMER c",
-                encoding="utf-8",
+        def close(self):
+            pass
+
+    def test_batch_size_100_and_contract_allows_multiple_sources_per_target(self):
+        items = [_item(f"SRC_{index}") for index in range(201)]
+        self.assertEqual(
+            [100, 100, 1], [len(batch) for batch in split_batches(items, 100)]
+        )
+        two_sources = _item("SOURCE_A")
+        second_field = MappingField(
+            source_field="OTHER_ID",
+            target_field="ID",
+            mapping_rule="待补充",
+            field_order=1,
+            physical_source_table="DWO.DWO_DEMO_SCHEMA_A_OTHER",
+            db_schema="DEMO_SCHEMA_A",
+            program=PROGRAM,
+        )
+        from tools.field_mapping.models import MappingItem as TableMapping
+
+        second_table = TableMapping(
+            "DEMO_SCHEMA_A_B", 244, "SOURCE_B", "DWF_DEMO_SOURCE_TABLE", (second_field,)
+        )
+        payload = build_import_payload([two_sources, second_table])
+        self.assertEqual(2, len(payload["items"]))
+        self.assertEqual("upsert", payload["mode"])
+
+    def test_default_100_batch_splits_4000_mappings_into_40_serial_batches(self):
+        batches = split_batches([_item(f"T{index}") for index in range(4_000)], 100)
+        self.assertEqual(40, len(batches))
+        self.assertTrue(all(len(batch) == 100 for batch in batches))
+
+    def test_retryable_502_503_504_and_connection_timeout_are_bounded(self):
+        items = [_item()]
+        success = self.Response(200, _import_response(items, dry_run=True))
+        session = self.Session(
+            [
+                self.Response(503, {}),
+                self.Response(502, {}),
+                self.Response(504, {}),
+                success,
+            ]
+        )
+        sleep = Mock()
+        client = FieldMappingApiClient(
+            "http://dap.example.test",
+            session_cookie="sid=secret",
+            session=session,
+            max_retries=3,
+            retry_backoff=0.25,
+            sleep=sleep,
+        )
+        payload = build_import_payload(items, dry_run=True)
+        self.assertEqual(
+            "created", client.import_mappings(payload)["items"][0]["action"]
+        )
+        self.assertEqual(4, len(session.calls))
+        self.assertEqual(
+            [0.25, 0.5, 1.0], [call.args[0] for call in sleep.call_args_list]
+        )
+
+        session = self.Session([requests.exceptions.Timeout(), success])
+        client = FieldMappingApiClient(
+            "http://dap.example.test",
+            session_cookie="sid=x",
+            session=session,
+            max_retries=1,
+            sleep=Mock(),
+        )
+        self.assertEqual(
+            "created", client.import_mappings(payload)["items"][0]["action"]
+        )
+        self.assertEqual(2, len(session.calls))
+
+    def test_upstream_systems_pagination_uses_server_effective_page_size(self):
+        session = self.Session(
+            [
+                self.Response(
+                    200,
+                    {
+                        "items": [
+                            {"id": "A", "upstreamSystemId": 11},
+                            {"id": "B", "upstreamSystemId": 12},
+                        ],
+                        "page": 1,
+                        "pageSize": 2,
+                        "total": 3,
+                    },
+                ),
+                self.Response(
+                    200,
+                    {
+                        "items": [{"id": "C", "upstreamSystemId": 13}],
+                        "page": 2,
+                        "pageSize": 2,
+                        "total": 3,
+                    },
+                ),
+            ]
+        )
+        client = FieldMappingApiClient("http://dap.example.test", session=session)
+        systems = client.get_upstream_systems()
+        self.assertEqual(3, len(systems["items"]))
+        self.assertEqual(2, len(session.calls))
+
+    def test_login_accepts_runtime_password_without_echoing_it(self):
+        session = self.Session(
+            [
+                self.Response(200, {"message": "ok"}),
+                self.Response(
+                    200,
+                    {
+                        "data": {
+                            "user": "uat-user",
+                            "permissions": ["field_mapping:write"],
+                        }
+                    },
+                ),
+            ]
+        )
+        client = FieldMappingApiClient("http://dap.example.test", session=session)
+        password = secrets.token_urlsafe(24)
+        self.assertEqual("uat-user", client.login("uat-user", password)["data"]["user"])
+        self.assertEqual(password, session.calls[0][1]["json"]["password"])
+
+    def test_400_401_403_are_not_retried(self):
+        for status in (400, 401, 403):
+            session = self.Session(
+                [
+                    self.Response(
+                        status,
+                        {"error": {"code": f"HTTP_{status}", "message": "rejected"}},
+                    )
+                ]
             )
-            output = Path(directory, "preview.json")
+            client = FieldMappingApiClient(
+                "http://dap.example.test",
+                session_cookie="sid=sensitive",
+                session=session,
+                max_retries=4,
+            )
+            with self.subTest(status=status), self.assertRaises(FieldMappingApiError):
+                client.import_mappings(build_import_payload([_item()], dry_run=True))
+            self.assertEqual(1, len(session.calls))
+
+    def test_replay_reports_unchanged_and_localhost_guard_blocks_remote_real_write(
+        self,
+    ):
+        item = _item()
+        unchanged = self.Response(
+            200, _import_response([item], "unchanged", dry_run=True)
+        )
+        session = self.Session([unchanged, unchanged])
+        client = FieldMappingApiClient(
+            "http://dap.example.test", session_cookie="sid=x", session=session
+        )
+        first = submit_batches([item], client, batch_size=100, dry_run=True)
+        second = submit_batches([item], client, batch_size=100, dry_run=True)
+        self.assertEqual((1, 0), (first["unchanged"], first["failed"]))
+        self.assertEqual((1, 0), (second["unchanged"], second["failed"]))
+        self.assertEqual(2, len(session.calls))
+
+        changed_field = MappingField(
+            source_field="ID",
+            target_field="ID",
+            mapping_rule="待补充",
+            field_order=1,
+            physical_source_table="DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE",
+            db_schema="DEMO_SCHEMA_A",
+            program=PROGRAM,
+        )
+        changed_item = MappingItem(
+            item.source_system_identity,
+            item.source_system_id,
+            item.source_table,
+            item.target_table,
+            (changed_field,),
+        )
+        self.assertEqual(item.dap_identity, changed_item.dap_identity)
+        self.assertNotEqual(
+            build_import_payload([item]), build_import_payload([changed_item])
+        )
+        updated_response = self.Response(
+            200, _import_response([changed_item], "updated", dry_run=True)
+        )
+        updated_client = FieldMappingApiClient(
+            "http://dap.example.test",
+            session_cookie="sid=x",
+            session=self.Session([updated_response]),
+        )
+        updated = submit_batches(
+            [changed_item], updated_client, batch_size=100, dry_run=True
+        )
+        self.assertEqual((1, 0), (updated["updated"], updated["failed"]))
+        remote = FieldMappingApiClient(
+            "https://dap.example.test", session_cookie="sid=x", session=self.Session([])
+        )
+        with self.assertRaisesRegex(ValueError, "localhost"):
+            remote.import_mappings(build_import_payload([item], dry_run=False))
+        self.assertTrue(is_local_write_url("http://localhost:15099"))
+        self.assertTrue(is_local_write_url("http://127.0.0.1:15099"))
+        self.assertFalse(is_local_write_url("http://0.0.0.0:15099"))
+        self.assertFalse(is_local_write_url("https://dap.example.test"))
+        self.assertFalse(is_local_write_url("http://[invalid"))
+
+    def test_local_real_write_bypasses_environment_proxies_and_redirects(self):
+        item = _item()
+        session = self.Session([self.Response(200, _import_response([item]))])
+        session.trust_env = True
+        client = FieldMappingApiClient(
+            "http://localhost:15099", session_cookie="sid=x", session=session
+        )
+
+        client.import_mappings(build_import_payload([item], dry_run=False))
+
+        self.assertFalse(session.trust_env)
+        self.assertFalse(session.calls[0][1]["allow_redirects"])
+
+    def test_item_level_api_failure_is_recorded_without_retrying_other_items(self):
+        item = _item()
+        response = self.Response(200, _import_response([item], "failed", dry_run=True))
+        client = FieldMappingApiClient(
+            "http://dap.example.test",
+            session_cookie="sid=x",
+            session=self.Session([response]),
+        )
+        result = submit_batches([item], client, batch_size=100, dry_run=True)
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("INVALID_FIELD", result["failedItems"][0]["errorCode"])
+
+    def test_partial_batch_failure_is_recorded_without_losing_retry_context(self):
+        item = _item()
+
+        class BrokenClient:
+            def import_mappings(self, payload):
+                raise FieldMappingApiError("HTTP_503", "temporary", retryable=True)
+
+            @staticmethod
+            def redact(value):
+                return value
+
+        result = submit_batches([item], BrokenClient(), batch_size=100, dry_run=True)
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("DEMO_SOURCE_TABLE", result["failedItems"][0]["sourceTable"])
+
+
+class RunModeTests(unittest.TestCase):
+    class FakeClient:
+        def __init__(self, action: str = "created", fail: bool = False):
+            self.action = action
+            self.fail = fail
+            self.payloads = []
+            self.closed = False
+
+        def get_upstream_systems(self):
+            return {"items": [{"id": "DEMO_SYSTEM_A", "upstreamSystemId": 106}]}
+
+        def import_mappings(self, payload):
+            self.payloads.append(payload)
+            items = []
+            for index, raw in enumerate(payload["items"]):
+                items.append(
+                    {
+                        "index": index,
+                        "identity": {
+                            "sourceSystemId": raw["sourceSystemId"],
+                            "sourceTable": raw["sourceTable"],
+                            "targetLayer": raw["targetLayer"],
+                            "targetTable": raw["targetTable"],
+                        },
+                        "action": self.action,
+                        "fieldCount": len(raw["fields"]),
+                    }
+                )
+            return {
+                "mode": "upsert",
+                "dryRun": payload["dryRun"],
+                "summary": {
+                    "received": len(items),
+                    "created": int(self.action == "created") * len(items),
+                    "updated": int(self.action == "updated") * len(items),
+                    "unchanged": int(self.action == "unchanged") * len(items),
+                    "failed": 0,
+                    "fieldCount": sum(item["fieldCount"] for item in items),
+                },
+                "items": items,
+            }
+
+        def get_mapping_stats(self):
+            return {"data": {"sourceTableCount": 1, "fieldCount": 1}}
+
+        def get_mapping_tables(self):
+            return [{"srcTable": "DEMO_SOURCE_TABLE"}]
+
+        def get_mapping_fields(self):
+            return [{"srcField": "ID"}]
+
+        def close(self):
+            self.closed = True
+
+    def _inputs(self, directory: Path) -> tuple[Path, Path]:
+        source_root = directory / "source"
+        _write_project(
+            source_root,
+            {
+                PROGRAM: (
+                    "def run(execute):\n"
+                    '    execute("INSERT INTO DWF.DWF_DEMO_SOURCE_TABLE (ID) '
+                    'SELECT s.ID FROM DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE s")\n'
+                )
+            },
+        )
+        metadata = _metadata_json(directory / "metadata.json")
+        upstreams = directory / "upstreams.json"
+        upstreams.write_text(
+            json.dumps({"items": [{"id": "DEMO_SYSTEM_A", "upstreamSystemId": 106}]}),
+            encoding="utf-8",
+        )
+        return source_root, metadata
+
+    def test_local_dry_run_writes_audit_bundle_and_never_creates_api_client(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, metadata = self._inputs(root)
+            upstreams = root / "upstreams.json"
+            report_root = root / "reports"
             stdout = io.StringIO()
             with (
                 patch.object(
-                    collector,
-                    "FieldMappingApiClient",
-                    side_effect=AssertionError("HTTP client must not be created"),
-                ) as api_client,
+                    entry,
+                    "_runtime_client",
+                    side_effect=AssertionError("must not create DAP client"),
+                ),
                 contextlib.redirect_stdout(stdout),
             ):
-                exit_code = collector.main(
+                code = entry.main(
                     [
                         "--directory",
-                        directory,
-                        "--source-system-id",
-                        "103",
-                        "--dry-run",
-                        "--payload-output",
-                        str(output),
+                        str(source),
+                        "--metadata-json",
+                        str(metadata),
+                        "--upstreams-json",
+                        str(upstreams),
+                        "--mode",
+                        "local-dry-run",
+                        "--report-root",
+                        str(report_root),
+                        "--include-payload",
                     ]
                 )
+            self.assertEqual(0, code)
+            report = next(report_root.iterdir())
+            self.assertTrue((report / "summary.json").is_file())
+            self.assertTrue((report / "resolved.csv").is_file())
+            self.assertTrue((report / "unresolved.csv").is_file())
+            self.assertTrue((report / "conflicts.csv").is_file())
+            self.assertTrue((report / "payload.json").is_file())
+            self.assertIn('"resolved_field_mappings": 1', stdout.getvalue())
 
-            preview = json.loads(output.read_text(encoding="utf-8"))
-
-        self.assertEqual(0, exit_code)
-        self.assertEqual("local-dry-run", preview["executionMode"])
-        self.assertTrue(preview["batches"][0]["dryRun"])
-        self.assertIn("dry_run=true", stdout.getvalue())
-        api_client.assert_not_called()
-
-    def test_502_503_timeout_policy_retries_only_retryable_http_errors(self):
-        good = self.FakeResponse(200, _response(["created"]))
-        session = self.FakeSession(
-            [self.FakeResponse(503, {}), self.FakeResponse(502, {}), good]
-        )
-        sleeper = Mock()
-        client = collector.FieldMappingApiClient(
-            "https://dap.example.test",
-            session_cookie="session=redacted-cookie",
-            max_retries=2,
-            retry_backoff=0.5,
-            session=session,
-            sleep=sleeper,
-        )
-
-        response = client.import_mappings({"mode": "upsert", "items": [{}]})
-
-        self.assertEqual("created", response["items"][0]["action"])
-        self.assertEqual(3, len(session.calls))
-        self.assertEqual((5.0, 30.0), session.calls[0]["timeout"])
-        self.assertEqual(
-            "session=redacted-cookie", session.calls[0]["headers"]["Cookie"]
-        )
-        self.assertEqual([0.5, 1.0], [call.args[0] for call in sleeper.call_args_list])
-        self.assertEqual(
-            "https://dap.example.test/api/field-mappings/import",
-            session.calls[0]["url"],
-        )
-
-    def test_server_dry_run_is_sent_as_dry_run_and_validated_in_response(self):
-        response = _response(["created"])
-        response["dryRun"] = True
-        session = self.FakeSession([self.FakeResponse(200, response)])
-        client = collector.FieldMappingApiClient(
-            "https://dap.example.test",
-            session_cookie="session=secret",
-            max_retries=0,
-            session=session,
-        )
-
-        result = client.import_mappings(
-            {"mode": "upsert", "dryRun": True, "items": [{}]}
-        )
-
-        self.assertTrue(result["dryRun"])
-        self.assertTrue(session.calls[0]["json"]["dryRun"])
-
-    def test_connection_timeout_retries_a_bounded_number_of_times(self):
-        session = self.FakeSession(
-            [
-                collector.requests.exceptions.Timeout(),
-                self.FakeResponse(200, _response(["created"])),
-            ]
-        )
-        sleeper = Mock()
-        client = collector.FieldMappingApiClient(
-            "https://dap.example.test",
-            session_cookie="session=secret",
-            max_retries=1,
-            retry_backoff=0.25,
-            session=session,
-            sleep=sleeper,
-        )
-
-        result = client.import_mappings({"mode": "upsert", "items": [{}]})
-
-        self.assertEqual("created", result["items"][0]["action"])
-        self.assertEqual(2, len(session.calls))
-        sleeper.assert_called_once_with(0.25)
-
-    def test_non_retryable_400_401_403_are_not_retried(self):
-        for status, code in (
-            (400, "VALIDATION_ERROR"),
-            (401, "UNAUTHORIZED"),
-            (403, "FORBIDDEN"),
-        ):
-            with self.subTest(status=status):
-                session = self.FakeSession(
+    def test_server_dry_run_submits_only_dryrun_true(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, metadata = self._inputs(root)
+            fake = self.FakeClient()
+            with patch.object(entry, "_runtime_client", return_value=fake):
+                code = entry.main(
                     [
-                        self.FakeResponse(
-                            status,
-                            {"error": {"code": code, "message": "rejected"}},
-                        ),
-                        self.FakeResponse(200, _response(["created"])),
+                        "--directory",
+                        str(source),
+                        "--metadata-json",
+                        str(metadata),
+                        "--api-base-url",
+                        "http://dap.example.test",
+                        "--mode",
+                        "server-dry-run",
+                        "--report-root",
+                        str(root / "reports"),
                     ]
                 )
-                client = collector.FieldMappingApiClient(
-                    "https://dap.example.test",
-                    session_cookie="session=secret",
-                    max_retries=2,
-                    retry_backoff=0,
-                    session=session,
-                    sleep=Mock(),
+            self.assertEqual(0, code)
+            self.assertEqual([True], [payload["dryRun"] for payload in fake.payloads])
+            self.assertTrue(fake.closed)
+
+    def test_real_sync_on_localhost_upserts_and_reconciles_dap_stats(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, metadata = self._inputs(root)
+            fake = self.FakeClient()
+            with patch.object(entry, "_runtime_client", return_value=fake):
+                code = entry.main(
+                    [
+                        "--directory",
+                        str(source),
+                        "--metadata-json",
+                        str(metadata),
+                        "--api-base-url",
+                        "http://127.0.0.1:15099",
+                        "--mode",
+                        "real-sync",
+                        "--report-root",
+                        str(root / "reports"),
+                    ]
                 )
-                with self.assertRaises(collector.FieldMappingApiError) as raised:
-                    client.import_mappings({"mode": "upsert", "items": [{}]})
-                self.assertEqual(code, raised.exception.code)
-                self.assertEqual(1, len(session.calls))
-                self.assertNotIn("secret", str(raised.exception))
-
-    def test_item_error_message_redacts_session_cookie(self):
-        response = _response(["failed"])
-        response["items"][0]["error"] = {
-            "code": "ITEM_FAILED",
-            "message": "rejected session=private-value",
-        }
-        session = self.FakeSession([self.FakeResponse(200, response)])
-        client = collector.FieldMappingApiClient(
-            "https://dap.example.test",
-            session_cookie="session=private-value",
-            max_retries=0,
-            session=session,
-        )
-        stats = collector.CollectorStats()
-        stderr = io.StringIO()
-
-        with contextlib.redirect_stderr(stderr):
-            collector.submit_batches(
-                [_item("ODS.T0")],
-                client,
-                batch_size=100,
-                server_dry_run=False,
-                stats=stats,
+            self.assertEqual(0, code)
+            self.assertEqual([False], [payload["dryRun"] for payload in fake.payloads])
+            self.assertTrue(fake.closed)
+            summary = json.loads(
+                next((root / "reports").iterdir()).joinpath("summary.json").read_text()
             )
+            self.assertTrue(summary["dap_reconciliation"]["fields_match_stats"])
 
-        self.assertEqual(1, stats.failed)
-        self.assertNotIn("private-value", stderr.getvalue())
-        self.assertNotIn("private-value", str(stats.failed_tables))
+    def test_non_local_real_sync_is_rejected_before_api_client_or_scan(self):
+        with patch.object(
+            entry, "_runtime_client", side_effect=AssertionError("must be blocked")
+        ):
+            code = entry.main(
+                [
+                    "--directory",
+                    "/missing",
+                    "--metadata-json",
+                    "/missing.json",
+                    "--api-base-url",
+                    "https://dap.example.test",
+                    "--mode",
+                    "real-sync",
+                ]
+            )
+        self.assertEqual(2, code)
 
 
 if __name__ == "__main__":
