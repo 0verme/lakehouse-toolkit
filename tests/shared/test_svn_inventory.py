@@ -26,6 +26,7 @@ from shared.lineage.svn_inventory import (
     PROCESSING_LAYOUT,
     READ_ERROR,
     READABLE,
+    SPECIAL_LOCAL_DWUPRR,
     SUCCESS,
     SVN_REPORT_VERSION,
     UNSUPPORTED_LAYER,
@@ -144,6 +145,26 @@ class SVNInventoryPathTests(unittest.TestCase):
         self.assertTrue(outside_workspace.out_of_scope)
         self.assertEqual(outside_workspace.unresolved_reason, OUT_OF_SCOPE)
 
+    def test_special_local_dwuprr_layout_is_explicitly_excluded(self):
+        path = (
+            FIXTURE_ROOT
+            / "DIDP_PROJECT_WORKSPACE"
+            / "DWUPRR"
+            / "1.0"
+            / "LOCAL_DWUPRR"
+            / "LOCAL_DWUPRR.DEMO_SPECIAL"
+            / "special.py"
+        )
+
+        result = classify_svn_program_path(path, PROCESSING_LAYOUT)
+
+        self.assertEqual(result.layer, "DWUPRR")
+        self.assertFalse(result.candidate)
+        self.assertFalse(result.matched_program_file)
+        self.assertFalse(result.primary_target_resolved)
+        self.assertTrue(result.out_of_scope)
+        self.assertEqual(result.unresolved_reason, SPECIAL_LOCAL_DWUPRR)
+
 
 class SVNInventoryScanTests(unittest.TestCase):
     def profile(self, layout: str) -> SVNProfile:
@@ -231,6 +252,108 @@ class SVNInventoryScanTests(unittest.TestCase):
         self.assertEqual(unrelated.unresolved_reason, OUT_OF_SCOPE)
         self.assertEqual(unrelated.read_status, NOT_ATTEMPTED)
         self.assertEqual(result.unresolved_reasons[UNSUPPORTED_LAYER], 0)
+
+    def test_special_local_dwuprr_does_not_enter_candidate_or_unresolved_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "production"
+            self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DWUPRR",
+                "1.0",
+                "DWS_DWUPRR",
+                "DWS_DWUPRR.DEMO_FORMAL",
+                "formal.py",
+            )
+            self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DWUPRR",
+                "1.0",
+                "LOCAL_DWUPRR",
+                "LOCAL_DWUPRR.DEMO_SPECIAL",
+                "special.py",
+            )
+            result = scan_svn_profile(
+                SVNProfile(
+                    name="special_local_dwuprr",
+                    environment="PROD",
+                    root_path=root,
+                    layout=PROCESSING_LAYOUT,
+                )
+            )
+
+        self.assertEqual(result.candidate_program_files, 1)
+        self.assertEqual(result.matched_program_files, 1)
+        self.assertEqual(result.out_of_scope_python_files, 1)
+        self.assertEqual(result.primary_target_resolved, 1)
+        self.assertEqual(result.primary_target_unresolved, 0)
+        self.assertEqual(result.primary_resolved_rate, 100.0)
+        special = next(
+            record for record in result.records if record.filename == "special.py"
+        )
+        self.assertFalse(special.candidate)
+        self.assertFalse(special.matched_program_file)
+        self.assertTrue(special.out_of_scope)
+        self.assertEqual(special.unresolved_reason, SPECIAL_LOCAL_DWUPRR)
+        self.assertEqual(special.read_status, NOT_ATTEMPTED)
+
+        report = build_svn_verification_report([result])
+        profile = cast(list[dict[str, object]], report["profiles"])[0]
+        self.assertEqual(
+            profile["explicit_exclusion_counts"], {SPECIAL_LOCAL_DWUPRR: 1}
+        )
+        sample = cast(list[dict[str, object]], profile["sample"])
+        self.assertIn(
+            SPECIAL_LOCAL_DWUPRR,
+            {item["unresolved_reason"] for item in sample},
+        )
+
+    def test_abc_dwuprr_layout_remains_invalid_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "production"
+            bad_file = self._write_program(
+                root,
+                "DIDP_PROJECT_WORKSPACE",
+                "DWUPRR",
+                "1.0",
+                "ABC_DWUPRR",
+                "ABC_DWUPRR.DEMO_INVALID",
+                "bad.py",
+            )
+            result = scan_svn_profile(
+                SVNProfile(
+                    name="invalid_dwuprr",
+                    environment="PROD",
+                    root_path=root,
+                    layout=PROCESSING_LAYOUT,
+                )
+            )
+
+        classification = classify_svn_program_path(bad_file, PROCESSING_LAYOUT)
+        self.assertTrue(classification.candidate)
+        self.assertFalse(classification.out_of_scope)
+        self.assertEqual(classification.unresolved_reason, INVALID_LAYOUT)
+        self.assertEqual(result.candidate_program_files, 1)
+        self.assertEqual(result.primary_target_unresolved, 1)
+        self.assertEqual(result.unresolved_reasons[INVALID_LAYOUT], 1)
+
+    def test_local_dwm_remains_invalid_candidate(self):
+        path = (
+            FIXTURE_ROOT
+            / "DIDP_PROJECT_WORKSPACE"
+            / "DWM"
+            / "1.0"
+            / "LOCAL_DWM"
+            / "LOCAL_DWM.DEMO_TABLE"
+            / "script.py"
+        )
+
+        result = classify_svn_program_path(path, PROCESSING_LAYOUT)
+
+        self.assertTrue(result.candidate)
+        self.assertFalse(result.out_of_scope)
+        self.assertEqual(result.unresolved_reason, INVALID_LAYOUT)
 
     def test_dwf_scan_is_separate_from_processing(self):
         result = scan_svn_profile(self.profile(DWF_LAYOUT))

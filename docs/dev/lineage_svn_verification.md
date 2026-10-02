@@ -163,10 +163,10 @@ inventory locator，不能覆盖目录推导，也不读取 SQL 猜 target。par
 `READ_ERROR`，编码声明或解码失败计为 `DECODE_ERROR`，扫描继续进行。
 
 JSON report 只包含 profile alias、environment、layout、状态、计数、耗时、layer
-计数、原因计数和脱敏 sample shape。当前 report `report_version` 为 `2`；原有
-字段保留，新增范围 accounting 字段，并明确修正 primary metrics 的语义。没有
-发现仓库内的 report consumer；兼容 consumer 可以继续读取原有字段，但应按
-version 2 的 denominator 解释 primary metrics。例如：
+计数、原因计数和脱敏 sample shape。当前 report `report_version` 为 `3`；该版本
+增加特殊排除计数，原有字段保留且 primary metrics 继续沿用 version 2 的
+candidate denominator。没有发现仓库内的 report consumer；兼容 consumer 可以继续
+读取原有字段。例如：
 
 ```json
 {
@@ -188,6 +188,9 @@ SVN URL、script code 或 SQL。报告指标包括：
   Python；
 - `out_of_scope_python_files`：明确属于其他 layout / sibling / non-target subtree
   的 Python；它们不属于 primary resolution denominator；
+- `explicit_exclusion_counts`：已识别特殊排除类别的聚合计数（例如
+  `SPECIAL_LOCAL_DWUPRR`）；这些文件仍属于 out-of-scope，不进入 candidate 或
+  unresolved denominator；
 - `unmatched_python_files`：本次处理但没有 matched 的 Python，包含 candidate
   diagnostic 和 out-of-scope；需要结合上面两个字段阅读；
 - `primary_target_resolved`、`primary_target_unresolved`：只统计当前 candidate

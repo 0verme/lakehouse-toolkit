@@ -28,11 +28,12 @@ from shared.lineage.svn_inventory import (
     OUT_OF_SCOPE,
     PROCESSING_LAYOUT,
     READ_ERROR,
+    SPECIAL_LOCAL_DWUPRR,
+    UNRESOLVED_REASON_ORDER,
     SourceReadResult,
     SVNFileInventory,
     SVNProfile,
     SVNScanResult,
-    UNRESOLVED_REASON_ORDER,
 )
 from shared.lineage.svn_provider import (
     IDENTITY_COLLISION,
@@ -152,6 +153,41 @@ class SVNProgramSourceProviderTests(unittest.TestCase):
         self.assertNotIn("INSERT INTO", accounting_text)
         self.assertEqual(processing_path.suffix, ".py")
         self.assertEqual(dwf_path.suffix, ".py")
+
+    def test_special_local_dwuprr_is_not_yielded_as_lineage_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "DEMO_SVN_ROOT"
+            self._write_program(
+                root,
+                layout=PROCESSING_LAYOUT,
+                target="DWUPRR.DEMO_FORMAL",
+            )
+            local_path = (
+                root
+                / "DIDP_PROJECT_WORKSPACE"
+                / "DWUPRR"
+                / "1.0"
+                / "LOCAL_DWUPRR"
+                / "LOCAL_DWUPRR.DEMO_SPECIAL"
+                / "DEMO_SPECIAL.py"
+            )
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text("print('special exclusion')\n", encoding="utf-8")
+
+            provider = self._provider(root, "prod_svn_processing", PROCESSING_LAYOUT)
+            sources = list(provider.iter_program_sources())
+
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].expected_target, "DWUPRR.DEMO_FORMAL")
+        self.assertTrue(provider.snapshot_complete)
+        self.assertEqual(provider.accounting.candidate_program_files, 1)
+        self.assertEqual(provider.accounting.matched_program_files, 1)
+        self.assertEqual(provider.accounting.primary_target_unresolved, 0)
+        self.assertEqual(provider.accounting.out_of_scope_python_files, 1)
+        self.assertNotIn(
+            SPECIAL_LOCAL_DWUPRR,
+            provider.accounting.unresolved_reasons,
+        )
 
     def test_expected_target_comes_from_validated_directory_not_sql_guessing(self):
         with tempfile.TemporaryDirectory() as directory:
