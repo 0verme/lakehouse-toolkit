@@ -1,69 +1,104 @@
-# ODS / 上游源系统 → DWF 字段映射 Collector
+# ODS / DWO → DWF Field Mapping Collector
 
-## Purpose
+## Scope and ownership
 
-独立采集 ODS / 上游源系统 → DWF 标准层 ETL 的表、字段映射事实，并通过 DAP Field Mapping Import API 批量 upsert。
+This is an independent field-mapping collector. `jobs/crontab/imp_dws_comments.py` and its cron remain unchanged and are neither imported nor reused.
 
-## Ownership
+- **lakehouse-toolkit** scans DWF projects, extracts statically identifiable SQL, resolves source/target/field mappings, validates the import payload, and writes local audit reports.
+- **DAP** validates the Field Mapping Import contract, authorizes the caller, upserts, persists, and displays the data.
+- The collector never connects to DAP's database, never connects to source-system JDBC endpoints, and never deletes, truncates, or replaces data. Import mode is always `upsert`.
 
-- **lakehouse-toolkit**：扫描程序、解析可确认的映射、构造 payload、报告采集与同步结果。
-- **DAP**：校验 contract、授权、幂等 upsert、持久化与治理。
+The checked-in DAP contract reference is `backend/app/contracts/field_mapping.py`; current API behavior was cross-checked against its FastAPI route/service. The importer uses `POST /api/field-mappings/import`. The DAP instance-local `upstreamSystemId` is looked up at runtime by exact `recv_plan` ↔ upstream `id` match from `GET /api/upstreams/systems`; no DAP primary key is hardcoded. The stable business identity in collector/audit data is `recv_plan + sourceTable + targetTable`.
 
-程序使用 DAP 当前 `backend/app/contracts/field_mapping.py` 所定义的语义。API 为 `POST /api/field-mappings/import`，要求已认证的签名 session cookie 和 `field_mapping:write` 权限；请求使用 `mode: "upsert"`，响应含 summary 及逐项 `created` / `updated` / `unchanged` / `failed`。API 限制为最多 500 items / request、最多 1000 fields / item。Collector 默认每批 100 张表，最大配置值为 500。
+## Metadata input and authoritative identity
 
-DAP 对表映射采用 `sourceSystemId + sourceTable` 身份，字段采用 `sourceField + targetField` 身份。当前 toolkit 的 program `source_profile` / workspace 元数据不能可靠换算成 DAP 上游系统主键，因此每次运行必须显式配置 DAP 的 `p_upstream_system.system_pk`：`--source-system-id` 或 `PYTOOLS_DAP_SOURCE_SYSTEM_ID`。一次运行应只扫描属于该上游系统的程序目录；多个系统请使用各自隔离的程序目录和 ID 分别执行。缺少 ID、源表无法唯一归属或一张源表写入多个 DWF 目标时会 skip 并报告，不从表名猜系统、不取候选、不模糊匹配。`dataSourceId` 当前不从 toolkit 配置推导，因此不发送。
+`--metadata-json` is a runtime JSON snapshot containing only the two whitelisted data sets needed for resolution:
 
-`.py` 程序 SQL 候选提取复用现有静态 Python/SQL candidate extractor；SQL 表达式通过 SQLGlot AST 解析，不使用旧脚本的 regex / comma-split 字段解析，也不进入 lineage 产物或持久化。`.sql` / `.py` 文件只支持能明确解析的 INSERT…SELECT，目标字段列表须显式给出。仅将 schema/layer 标识为 `DWF` / `DWF_*` 或目标表名以 `DWF_` 开头的 INSERT 视为 DWF 写入；其他命名布局明确不纳入第一版。默认 SQL dialect 为 `mysql`，可通过 `--sql-dialect` / `PYTOOLS_DAP_MAPPING_SQL_DIALECT` 设置。直接字段及重命名分别标记为 `DIRECT` / `RENAME`；单一来源字段的转换表达式记为 `待补充`。CTE、嵌套查询、无法唯一归属的字段表达式（例如多字段 `COALESCE(a, b)` / `CASE WHEN`）明确 skip，不猜测来源。解析后的字段顺序取 INSERT/SELECT 对应位置。
-
-## Non-goals
-
-- DWF→DWM→DWD→DWA→DM 通用 SQL lineage 或 full column lineage。
-- 删除、replace-all、truncate 或根据扫描缺失结果失效资产。
-- 直接写 DAP 数据库。
-- 替换、调用或改造 `jobs/crontab/imp_dws_comments.py`；旧脚本和 cron 保持独立不动。
-
-第一阶段只发送 upsert；API 未收到的旧字段不会被删除。
-
-## Execution
-
-目录和上游系统 ID 没有弱默认值，示例使用占位路径 / ID。认证通过外部注入现有 DAP session cookie；不要把真实 URL / cookie 写入仓库或命令历史。
-
-本地 dry-run 扫描、解析、校验和输出统计，不调用 HTTP API。可选 `--payload-output` 写出 `dryRun=true` 的批次预览，便于检查 / 送 DAP server dry-run：
-
-```sh
-export PYTOOLS_DAP_SOURCE_SYSTEM_ID='<DAP_UPSTREAM_SYSTEM_ID>'
-python -B jobs/crontab/sync_ods_dwf_field_mappings.py \
-  --directory '<ODS_TO_DWF_PROGRAM_WORKSPACE>' \
-  --dry-run \
-  --payload-output /tmp/ods-dwf-field-mapping-preview.json
+```json
+{
+  "recv_dwf": [
+    {
+      "recv_plan": "<RECV_PLAN>",
+      "table_name": "DWF.DWF_<LOGICAL_TABLE>",
+      "data_source": "<DATA_SOURCE>",
+      "recv_job_name": "<RECV_JOB>",
+      "ods_job_name": "<ODS_JOB>"
+    }
+  ],
+  "schema_config": [
+    {"schema_key": "<DATA_SOURCE>", "db_schema": "<AUTHORITATIVE_DB_SCHEMA>"}
+  ]
+}
 ```
 
-DAP server dry-run 会实际调用 API，但 DAP 的 `dryRun=true` 只预览、不持久化；它与 local dry-run 不同：
+Prepare this file from an authorized, read-only metadata export. Do not include `jdbc_url`, `db_user`, hosts, passwords, or any other connection details. The collector does not connect to source-system databases.
 
-```sh
-export DAP_API_BASE_URL='<DAP_BASE_URL>'
-export DAP_SESSION_COOKIE='<signed-session-cookie-header>'
-python -B jobs/crontab/sync_ods_dwf_field_mappings.py \
-  --directory '<ODS_TO_DWF_PROGRAM_WORKSPACE>' \
-  --server-dry-run
+DWF matching normalizes history names only for comparison:
+
+- `DWF.F_<LOGICAL>` → `<LOGICAL>`
+- `DWF.DWF_<LOGICAL>` → `<LOGICAL>`
+- source project/table `DWF_<LOGICAL>` → `<LOGICAL>`
+
+DAP's final `targetTable` uses the canonical source-code form `DWF_<LOGICAL>`; history `F_*` names are never emitted as targets. Program evidence is an exact normalized `ods_job_name` ↔ Python filename match (numeric program prefix, `JOB_`, duplicated leading `DWS_`, and `_DAY`/`_NIGHT` suffix normalized). Logical target is the next evidence; the physical DWO schema match is then verified against `p_schema_config.db_schema`. Any evidence disagreement or unresolved multiplicity is reported as unresolved/conflict, never selected by row order.
+
+DWO table parsing uses the authoritative `db_schema` dictionary and longest exact prefix. For example, `DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE` plus schema `DEMO_SCHEMA_A` produces `sourceTable=DEMO_SOURCE_TABLE`; `physicalSourceTable` remains in audit output. `sourceTable` never contains the DWO technical prefix. Multiple source systems may legitimately feed one DWF target.
+
+## SQL extraction and safe projection
+
+Python SQL candidate extraction reuses `shared.lineage.physical_dag._extract_python_candidates_with_reason`; SQL statements and projections use SQLGlot AST. This stays a Field Mapping business projection and does not write or alter common lineage materializations.
+
+Supported safe projections include `INSERT INTO ... SELECT`, aliases, quoted/case-varied identifiers, `CAST` and single/multi-input expressions, `JOIN`, simple CTEs, multiple Python files in a project, multiple DWO inputs, and DWF temporary-table passthrough. DWF intermediate/TMP fields are recursively traced to their DWO leaf fields; TMP tables are not emitted as source tables. For expressions with multiple upstream fields (for example `COALESCE` or `CASE`), each actual input field is emitted against the same target field; the DAP contract allows distinct sourceField/targetField pairs. Unqualified ambiguous fields, unknown relations, cycles, or unsupported SQL are audited and excluded. `MERGE` is explicitly unsupported in this first safe projection and never produces guessed mappings.
+
+`sourceType` and `sourceComment` are omitted because source database metadata is not crawled. Mapping rules are `DIRECT`, `RENAME`, or the DAP contract's `待补充` for expressions.
+
+## Execution modes
+
+The default mode is `local-dry-run`, so running the collector does not write data. Each run writes `summary.json`, `resolved.csv`, `unresolved.csv`, and `conflicts.csv` under a timestamped, gitignored `runtime/field_mapping_sync/` directory. Add `--include-payload` to save `payload.json` there. Reports retain physical source names and business evidence but never connection URLs or credentials; do not copy real reports into Git.
+
+DAP upstream systems may be resolved by the read-only API GET or, for local dry-run only, a previously downloaded `--upstreams-json` response with an `items` array.
+
+### 1. Local dry-run
+
+Scans source, reads metadata, parses SQL, resolves identities, validates each local payload, and writes audit artifacts. It does not call the Field Mapping Import endpoint.
+
+```powershell
+$env:DAP_API_BASE_URL = 'http://127.0.0.1:15099'
+# Set this locally to the authorized DWF source root; do not commit the path.
+$env:DWF_SOURCE_ROOT = '<path-to-DWS_DWF>'
+python -B jobs/crontab/sync_ods_dwf_field_mappings.py `
+  --directory $env:DWF_SOURCE_ROOT `
+  --metadata-json '<secure-local-path>\field-mapping-metadata.json' `
+  --mode local-dry-run --login --batch-size 100
 ```
 
-真实 upsert 示例（确认上游 ID、workspace 归属和 server dry-run 结果后再执行）：
+`--login` prompts for username and uses a non-echoing password prompt. It calls `/api/auth/login` and `/api/auth/me`; password values are not logged or accepted on the command line. Alternatively inject an already obtained signed session cookie at runtime with `DAP_SESSION_COOKIE`. Never commit a local config or secret.
 
-```sh
-python -B jobs/crontab/sync_ods_dwf_field_mappings.py \
-  --directory '<ODS_TO_DWF_PROGRAM_WORKSPACE>' \
-  --batch-size 50
+### 2. DAP server dry-run
+
+Calls the actual import endpoint with `dryRun=true`; DAP validates the full contract without persistence:
+
+```powershell
+python -B jobs/crontab/sync_ods_dwf_field_mappings.py `
+  --directory $env:DWF_SOURCE_ROOT `
+  --metadata-json '<secure-local-path>\field-mapping-metadata.json' `
+  --api-base-url $env:DAP_API_BASE_URL `
+  --mode server-dry-run --login --batch-size 100
 ```
 
-`--batch-size` 可设为 1..500，默认 100，也可用 `PYTOOLS_DAP_MAPPING_BATCH_SIZE` 覆盖。失败表可复制日志中的 canonical `sourceTable` 精确单表重扫、重试；多表可重复指定参数：
+### 3. Real sync (Windows localhost only)
 
-```sh
-python -B jobs/crontab/sync_ods_dwf_field_mappings.py \
-  --directory '<ODS_TO_DWF_PROGRAM_WORKSPACE>' \
-  --source-table 'ODS.CUSTOMER'
+```powershell
+python -B jobs/crontab/sync_ods_dwf_field_mappings.py `
+  --directory $env:DWF_SOURCE_ROOT `
+  --metadata-json '<secure-local-path>\field-mapping-metadata.json' `
+  --api-base-url $env:DAP_API_BASE_URL `
+  --mode real-sync --login --batch-size 100
 ```
 
-网络设置：`PYTOOLS_DAP_MAPPING_CONNECT_TIMEOUT`（默认 5 秒）、`PYTOOLS_DAP_MAPPING_READ_TIMEOUT`（默认 30 秒）、`PYTOOLS_DAP_MAPPING_MAX_RETRIES`（默认 2 次 retry，最多 5 次）。仅连接超时、临时连接错误和 HTTP 502/503/504 有界指数退避；400/401/403、contract 错误不重试。DAP item-level failure 会逐表输出 table、error code / message；failed table 可单独重跑，无自动无限重试。
+Real import has a hard code guard: only `localhost` or `127.0.0.1` URLs are accepted. There is no remote-write override; real POSTs bypass environment proxies and do not follow redirects, so a loopback write cannot be routed to a remote service through proxy/redirect settings. Batches are serial and default to 100 mapping items (DAP contract maximum 500 items and 1,000 fields per item). After real sync, the runner reads `/api/field-mappings/stats`, `/tables`, and `/fields` and records reconciliation counts.
 
-日志输出 scanned/candidate/parsed/skipped/batch 统计及每张 failed table；不输出 API cookie。`--dry-run` 输出 `dry_run=true`。若没有有效 mapping，会打印原因并以非零状态结束。
+Production service-token/M2M authentication and Linux production cutover are TODOs for a separate issue. This collector does not change Linux cron configuration.
+
+## Audit summary
+
+`summary.json` records actual scan counts (`project_count`, `python_file_count`, `dwo_physical_table_count`), metadata row counts, DAP upstream count, resolved project/table/field mapping counts, unresolved reasons (`no_program`, `no_final_target`, `no_recv_dwf`, `no_schema_config`, `no_dwo_source`, `unknown_upstream_system`, `unsupported_sql`, `multi_source_field_unsupported`), conflict reasons (`program_metadata_conflict`, `multiple_recv_plan_conflict`, `multiple_data_source_conflict`, `schema_match_conflict`), and failed requests/items. Unresolved, conflict, unsupported, and contract-invalid records never enter import batches.
