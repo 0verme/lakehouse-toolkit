@@ -142,9 +142,7 @@ def export_active_business_lineage(
     source_profile = source_profile.strip()
     active = reader.get_active_snapshot_metadata()
     if active is None:
-        raise DAPExportNotReadyError(
-            "no active toolkit lineage snapshot is available"
-        )
+        raise DAPExportNotReadyError("no active toolkit lineage snapshot is available")
     if not active.is_active:
         raise DAPExportNotReadyError("active toolkit snapshot metadata is not active")
     if not active.complete_snapshot or active.snapshot_mode != "FULL":
@@ -233,6 +231,10 @@ def _print_summary(preflight: DAPLineagePreflight) -> None:
         "task_nodes",
         "total_nodes",
         "business_edges",
+        "raw_projected_edges",
+        "semantic_dap_edges",
+        "deduplicated_edges",
+        "dedup_reduction_pct",
         "dap_edges",
         "diagnostic_count",
         "payload_bytes",
@@ -242,6 +244,8 @@ def _print_summary(preflight: DAPLineagePreflight) -> None:
         value = summary[key]
         if key == "payload_megabytes":
             value = f"{value:.6f}"
+        elif key == "dedup_reduction_pct":
+            value = f"{value:.2f}%"
         print(f"{key}: {value}")
     capacity = summary["capacity"]
     assert isinstance(capacity, dict)

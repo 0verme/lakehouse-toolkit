@@ -19,7 +19,6 @@ from shared.lineage.materialization_dws import (
     program_key,
 )
 
-
 OBSERVED_AT = datetime(2026, 9, 30, 8, 9, 10, tzinfo=timezone.utc)
 ENVIRONMENT = "DEV214"
 SOURCE_PROFILE = "fixture-sql"
@@ -137,13 +136,22 @@ class DAPLineageContractAdapterTests(unittest.TestCase):
             self.assertIn(edge["targetId"], node_by_id)
             self.assertEqual(edge["confidence"], "unknown")
             expected_key = business_row("DWF.A", "DWM.B").business_edge_key
-            self.assertEqual(edge["evidence"]["sourceRecordId"], expected_key)
-            self.assertEqual(edge["diagnostics"][0]["collapseDepth"], 2)
+            self.assertEqual(edge["evidence"]["sourceRecordId"], edge["externalId"])
+            self.assertNotEqual(edge["evidence"]["sourceRecordId"], expected_key)
+            self.assertEqual(edge["diagnostics"][0]["businessFactCount"], 1)
+            self.assertEqual(edge["diagnostics"][0]["collapseDepthMin"], 2)
+            self.assertEqual(edge["diagnostics"][0]["collapseDepthMax"], 2)
+            self.assertEqual(
+                edge["diagnostics"][0]["pipelineVersion"],
+                "lineage-pipeline-v12-fixture",
+            )
+            self.assertEqual(edge["diagnostics"][0]["pipelineVersionCount"], 1)
 
     def test_multiple_edges_share_one_task_and_reuse_table_nodes(self) -> None:
         rows = (
             business_row("DWF.A", "DWM.SHARED"),
             business_row("DWF.B", "DWM.SHARED"),
+            business_row("DWF.C", "DWM.SHARED"),
         )
         contract = make_contract(*rows)
         nodes = contract["nodes"]
@@ -151,18 +159,78 @@ class DAPLineageContractAdapterTests(unittest.TestCase):
         assert isinstance(nodes, list)
         assert isinstance(edges, list)
         self.assertEqual(sum(node["type"] == "task" for node in nodes), 1)
-        self.assertEqual(sum(node["type"] == "table" for node in nodes), 3)
+        self.assertEqual(sum(node["type"] == "table" for node in nodes), 4)
         self.assertEqual(len(edges), 4)
         task_id = next(node["externalId"] for node in nodes if node["type"] == "task")
         self.assertEqual(
             sum(edge["targetId"] == task_id for edge in edges),
-            2,
+            3,
         )
         shared_id = "table:DEV214:DWM.SHARED"
+        shared_output_edges = [edge for edge in edges if edge["targetId"] == shared_id]
+        self.assertEqual(len(shared_output_edges), 1)
         self.assertEqual(
-            sum(edge["targetId"] == shared_id for edge in edges),
-            2,
+            shared_output_edges[0]["diagnostics"][0]["businessFactCount"], 3
         )
+        self.assertEqual(
+            shared_output_edges[0]["evidence"]["description"],
+            "Derived from 3 toolkit business facts.",
+        )
+
+    def test_shared_source_to_multiple_targets_reuses_table_to_task_edge(self) -> None:
+        rows = (
+            business_row("DWF.A", "DWM.T1"),
+            business_row("DWF.A", "DWM.T2"),
+        )
+        contract = make_contract(*rows)
+        nodes = contract["nodes"]
+        edges = contract["edges"]
+        assert isinstance(nodes, list)
+        assert isinstance(edges, list)
+
+        self.assertEqual(len(edges), 3)
+        input_edges = [edge for edge in edges if edge["type"] == "table_to_task"]
+        output_edges = [edge for edge in edges if edge["type"] == "task_to_table"]
+        self.assertEqual(len(input_edges), 1)
+        self.assertEqual(len(output_edges), 2)
+        self.assertEqual(input_edges[0]["diagnostics"][0]["businessFactCount"], 2)
+        self.assertEqual(input_edges[0]["sourceId"], "table:DEV214:DWF.A")
+        node_ids = {node["externalId"] for node in nodes}
+        self.assertTrue(
+            all(
+                edge["sourceId"] in node_ids and edge["targetId"] in node_ids
+                for edge in edges
+            )
+        )
+        preflight = preflight_dap_lineage_contract(
+            contract,
+            environment=ENVIRONMENT,
+            source_profile=SOURCE_PROFILE,
+            toolkit_batch_id=BATCH_ID,
+        )
+        self.assertTrue(preflight.ready, preflight.errors)
+        self.assertEqual(preflight.business_edges, 2)
+        self.assertEqual(preflight.raw_projected_edges, 4)
+        self.assertEqual(preflight.semantic_dap_edges, 3)
+        self.assertEqual(preflight.dap_edges, 3)
+        self.assertEqual(preflight.deduplicated_edges, 1)
+        self.assertEqual(preflight.dedup_reduction_pct, 25.0)
+
+    def test_multiple_tasks_preserve_independent_semantic_edges(self) -> None:
+        rows = (
+            business_row("DWF.A", "DWM.T", program_name="JOB1"),
+            business_row("DWF.A", "DWM.T", program_name="JOB2"),
+        )
+        contract = make_contract(*rows)
+        nodes = contract["nodes"]
+        edges = contract["edges"]
+        assert isinstance(nodes, list)
+        assert isinstance(edges, list)
+        self.assertEqual(sum(node["type"] == "task" for node in nodes), 2)
+        self.assertEqual(len(edges), 4)
+        self.assertEqual(sum(edge["type"] == "table_to_task" for edge in edges), 2)
+        self.assertEqual(sum(edge["type"] == "task_to_table" for edge in edges), 2)
+        self.assertEqual(len({edge["externalId"] for edge in edges}), 4)
 
     def test_same_table_can_be_reused_by_multiple_programs(self) -> None:
         rows = (
@@ -241,34 +309,83 @@ class DAPLineageContractAdapterTests(unittest.TestCase):
         row = business_row("DWF.A", "DWM.B")
         contract = make_contract(row, row)
         self.assertEqual(len(contract["edges"]), 2)
+        self.assertTrue(
+            all(
+                edge["diagnostics"][0]["businessFactCount"] == 1
+                for edge in contract["edges"]
+            )
+        )
         with self.assertRaisesRegex(ValueError, "conflicting row data"):
             make_contract(row, replace(row, collapse_depth=3))
 
+    def test_shared_edge_provenance_is_bounded_and_deterministic(self) -> None:
+        rows = (
+            business_row("DWF.A", "DWM.SHARED", collapse_depth=2),
+            replace(
+                business_row("DWF.B", "DWM.SHARED", collapse_depth=4),
+                pipeline_version="lineage-pipeline-v13-fixture",
+            ),
+            replace(
+                business_row("DWF.C", "DWM.SHARED", collapse_depth=7),
+                pipeline_version=None,
+            ),
+        )
+        contract = make_contract(*rows)
+        output_edge = next(
+            edge
+            for edge in contract["edges"]
+            if edge["type"] == "task_to_table"
+            and edge["targetId"] == "table:DEV214:DWM.SHARED"
+        )
+        diagnostic = output_edge["diagnostics"][0]
+        self.assertEqual(diagnostic["businessFactCount"], 3)
+        self.assertEqual(diagnostic["collapseDepthMin"], 2)
+        self.assertEqual(diagnostic["collapseDepthMax"], 7)
+        self.assertEqual(diagnostic["pipelineVersion"], "multiple")
+        self.assertEqual(diagnostic["pipelineVersionCount"], 2)
+        self.assertEqual(diagnostic["pipelineVersionFactCount"], 2)
+        self.assertEqual(diagnostic["pipelineVersionMissingCount"], 1)
+
+        reversed_contract = make_contract(*reversed(rows))
+        self.assertEqual(
+            serialize_dap_lineage_contract(contract),
+            serialize_dap_lineage_contract(reversed_contract),
+        )
+
     def test_other_environment_or_source_profile_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside the requested"):
-            make_contract(
-                business_row("DWF.A", "DWM.B", environment="PROD")
-            )
+            make_contract(business_row("DWF.A", "DWM.B", environment="PROD"))
         with self.assertRaisesRegex(ValueError, "outside the requested"):
             make_contract(
                 business_row("DWF.A", "DWM.B", source_profile="other-profile")
             )
 
     def test_projection_does_not_copy_sql_or_raw_sensitive_metadata(self) -> None:
-        row = business_row(
-            "DWF.A",
-            "DWM.B",
-            source_hash="SELECT * FROM confidential_table WHERE password='secret'",
-            physical_derivation_hash="token=do-not-export",
+        row = replace(
+            business_row(
+                "DWF.A",
+                "DWM.B",
+                source_hash="SELECT * FROM confidential_table WHERE password='secret'",
+                physical_derivation_hash="token=do-not-export",
+            ),
+            pipeline_version="SELECT password FROM secrets",
         )
         serialized = serialize_dap_lineage_contract(make_contract(row))
         self.assertNotIn("SELECT *", serialized)
         self.assertNotIn("password", serialized)
         self.assertNotIn("secret", serialized)
         self.assertNotIn("token=", serialized)
-        self.assertIn(row.business_edge_key, serialized)
-        self.assertIn("collapseDepth", serialized)
+        self.assertNotIn("credential", serialized)
+        self.assertNotIn(row.business_edge_key, serialized)
+        self.assertNotIn('"evidence_json"', serialized)
+        self.assertIn("collapseDepthMin", serialized)
+        self.assertIn("collapseDepthMax", serialized)
+        self.assertIn("businessFactCount", serialized)
         self.assertIn("pipelineVersion", serialized)
+        self.assertEqual(
+            make_contract(row)["edges"][0]["diagnostics"][0]["pipelineVersion"],
+            "nonstandard",
+        )
 
     def test_empty_complete_snapshot_is_a_valid_empty_contract(self) -> None:
         contract = make_contract()
@@ -284,6 +401,9 @@ class DAPLineageContractAdapterTests(unittest.TestCase):
         self.assertEqual(preflight.total_nodes, 0)
         self.assertEqual(preflight.dap_edges, 0)
         self.assertEqual(preflight.business_edges, 0)
+        self.assertEqual(preflight.raw_projected_edges, 0)
+        self.assertEqual(preflight.semantic_dap_edges, 0)
+        self.assertEqual(preflight.deduplicated_edges, 0)
 
     def test_partial_batch_is_not_exportable_as_replace_snapshot(self) -> None:
         with self.assertRaisesRegex(ValueError, "complete FULL toolkit snapshot"):
@@ -325,6 +445,8 @@ class DAPLineageContractAdapterTests(unittest.TestCase):
         self.assertFalse(preflight.ready)
         self.assertEqual(preflight.total_nodes, 3)
         self.assertEqual(preflight.dap_edges, 2)
+        self.assertEqual(preflight.semantic_dap_edges, 2)
+        self.assertEqual(preflight.raw_projected_edges, 2)
         self.assertGreater(preflight.payload_bytes, 1)
         self.assertTrue(
             any("node capacity exceeded" in error for error in preflight.errors)
