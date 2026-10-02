@@ -17,7 +17,7 @@ else:
 
 PROJECT_ROOT = Path(ensure_project_root_on_path())
 
-from tools.field_mapping.collector import collect_workspace
+from tools.field_mapping.collector import DEFAULT_PROGRESS_EVERY, collect_workspace
 from tools.field_mapping.dap_client import (
     DEFAULT_BATCH_SIZE,
     FieldMappingApiClient,
@@ -78,6 +78,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=os.environ.get("PYTOOLS_DAP_MAPPING_SQL_DIALECT", "mysql"),
     )
     parser.add_argument("--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument(
+        "--progress-every",
+        type=positive_int,
+        default=DEFAULT_PROGRESS_EVERY,
+        help="emit collector progress every N projects",
+    )
     parser.add_argument(
         "--login",
         action="store_true",
@@ -220,7 +226,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             client = _runtime_client(args, write_mode=args.mode != "local-dry-run")
         upstream_payload = _resolve_upstreams(args, client)
         resolver = MetadataResolver(recv_dwf_rows, schema_rows, upstream_payload)
-        audit = collect_workspace(args.directory, resolver, dialect=args.sql_dialect)
+        audit = collect_workspace(
+            args.directory,
+            resolver,
+            dialect=args.sql_dialect,
+            progress_every=args.progress_every,
+        )
         _filter_contract_items(audit)
         audit.summary["execution_mode"] = args.mode
         # Validate every serialized request locally before any DAP import call.

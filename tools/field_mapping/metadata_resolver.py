@@ -246,6 +246,42 @@ class MetadataResolver:
                 system.upstream_system_id
             )
 
+        recv_by_logical_target: dict[str, list[RecvDwfRecord]] = defaultdict(list)
+        recv_by_program: dict[str, list[RecvDwfRecord]] = defaultdict(list)
+        recv_by_target_program: dict[
+            tuple[str, str], list[tuple[int, RecvDwfRecord]]
+        ] = defaultdict(list)
+        recv_identities_by_target: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        normalized_program_name_by_record: dict[RecvDwfRecord, str] = {}
+        for index, row in enumerate(self.recv_dwf):
+            logical_target = normalize_logical_target(row.table_name)
+            program_name = normalize_program_name(row.ods_job_name)
+            recv_by_logical_target[logical_target].append(row)
+            recv_identities_by_target[logical_target].add(
+                (row.recv_plan.casefold(), row.data_source.casefold())
+            )
+            normalized_program_name_by_record[row] = program_name
+            if program_name:
+                recv_by_program[program_name].append(row)
+                recv_by_target_program[(logical_target, program_name)].append(
+                    (index, row)
+                )
+        self.recv_by_logical_target = {
+            key: tuple(rows) for key, rows in recv_by_logical_target.items()
+        }
+        self.recv_by_program = {key: tuple(rows) for key, rows in recv_by_program.items()}
+        self.recv_by_target_program = {
+            key: tuple(rows) for key, rows in recv_by_target_program.items()
+        }
+        self._recv_identities_by_target = {
+            key: frozenset(identities)
+            for key, identities in recv_identities_by_target.items()
+        }
+        self._normalized_program_name_by_record = normalized_program_name_by_record
+        self._resolution_cache: dict[
+            tuple[str, tuple[str, ...], tuple[str, ...]], Resolution
+        ] = {}
+
     def resolve(
         self,
         *,
@@ -254,33 +290,51 @@ class MetadataResolver:
         physical_source: str,
     ) -> Resolution:
         logical_target = normalize_logical_target(target)
-        target_rows = [
-            row
-            for row in self.recv_dwf
-            if normalize_logical_target(row.table_name) == logical_target
-        ]
+        target_rows = self.recv_by_logical_target.get(logical_target, ())
         if not target_rows:
             return Resolution(status="UNRESOLVED", reason="no_recv_dwf")
 
-        program_keys = {normalize_program_name(name) for name in program_names}
-        program_rows = [
-            row
-            for row in self.recv_dwf
-            if normalize_program_name(row.ods_job_name)
-            and normalize_program_name(row.ods_job_name) in program_keys
+        normalized_program_names = tuple(
+            sorted({normalize_program_name(name) for name in program_names})
+        )
+        normalized_source = _identifier_parts(physical_source)
+        cache_key = (logical_target, normalized_program_names, normalized_source)
+        cached = self._resolution_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        resolution = self._resolve_indexed(
+            logical_target=logical_target,
+            target_rows=target_rows,
+            program_keys=frozenset(normalized_program_names),
+            physical_source=physical_source,
+        )
+        self._resolution_cache[cache_key] = resolution
+        return resolution
+
+    def _resolve_indexed(
+        self,
+        *,
+        logical_target: str,
+        target_rows: tuple[RecvDwfRecord, ...],
+        program_keys: frozenset[str],
+        physical_source: str,
+    ) -> Resolution:
+        matched_program_entries = [
+            entry
+            for program_key in program_keys
+            for entry in self.recv_by_target_program.get(
+                (logical_target, program_key), ()
+            )
         ]
         target_program_rows = [
             row
-            for row in program_rows
-            if normalize_logical_target(row.table_name) == logical_target
+            for _, row in sorted(matched_program_entries, key=lambda entry: entry[0])
         ]
-        if program_rows and not target_program_rows:
+        has_program_rows = any(self.recv_by_program.get(key) for key in program_keys)
+        if has_program_rows and not target_program_rows:
             return Resolution(status="CONFLICT", reason="program_metadata_conflict")
         if target_program_rows:
-            target_identities = {
-                (row.recv_plan.casefold(), row.data_source.casefold())
-                for row in target_rows
-            }
+            target_identities = self._recv_identities_by_target[logical_target]
             matched_identities = {
                 (row.recv_plan.casefold(), row.data_source.casefold())
                 for row in target_program_rows
@@ -359,7 +413,7 @@ class MetadataResolver:
             key=lambda row: (
                 row.recv_plan.casefold(),
                 row.data_source.casefold(),
-                normalize_program_name(row.ods_job_name),
+                self._normalized_program_name_by_record[row],
                 row.ods_job_name.casefold(),
             ),
         )

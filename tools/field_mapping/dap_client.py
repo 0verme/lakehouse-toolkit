@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from types import TracebackType
-from typing import Any, Self
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests
@@ -174,7 +174,7 @@ class FieldMappingApiClient:
         if self._owns_session:
             self.session.close()
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> FieldMappingApiClient:
         return self
 
     def __exit__(
