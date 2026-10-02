@@ -70,9 +70,10 @@ INVALID_PROGRAM_DIRECTORY = "INVALID_PROGRAM_DIRECTORY"
 # A non-target top-level subtree is now classified as OUT_OF_SCOPE instead.
 UNSUPPORTED_LAYER = "UNSUPPORTED_LAYER"
 OUT_OF_SCOPE = "OUT_OF_SCOPE"
+SPECIAL_LOCAL_DWUPRR = "SPECIAL_LOCAL_DWUPRR"
 NOT_PYTHON = "NOT_PYTHON"
 
-SVN_REPORT_VERSION = 2
+SVN_REPORT_VERSION = 3
 
 UNRESOLVED_REASON_ORDER = (
     INVALID_LAYOUT,
@@ -87,6 +88,10 @@ UNRESOLVED_REASON_ORDER = (
 _PROGRAM_DIRECTORY_RE = re.compile(
     r"^DWS_(?P<layer>[A-Z][A-Z0-9_]*)\."
     r"(?P<table>[A-Z0-9][A-Z0-9_]*)$",
+    re.IGNORECASE,
+)
+_SPECIAL_LOCAL_DWUPRR_PROGRAM_DIRECTORY_RE = re.compile(
+    r"^LOCAL_DWUPRR\.[A-Z0-9][A-Z0-9_]*$",
     re.IGNORECASE,
 )
 
@@ -408,6 +413,23 @@ def _classify_processing_at(
         )
 
     layer = first_after_workspace
+    if (
+        layer == "DWUPRR"
+        and len(parts) == workspace_index + 6
+        and parts[workspace_index + 2] == "1.0"
+        and parts[workspace_index + 3].upper() == "LOCAL_DWUPRR"
+        and _SPECIAL_LOCAL_DWUPRR_PROGRAM_DIRECTORY_RE.fullmatch(
+            parts[workspace_index + 4]
+        )
+        is not None
+    ):
+        return _classification(
+            layout,
+            layer=layer,
+            reason=SPECIAL_LOCAL_DWUPRR,
+            out_of_scope=True,
+        )
+
     if len(parts) != workspace_index + 6:
         return _classification(
             layout,
@@ -689,6 +711,7 @@ class SVNScanResult:
     # source-compatible while consumers adopt the v2 accounting fields.
     candidate_program_files: int = 0
     out_of_scope_python_files: int = 0
+    explicit_exclusion_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def primary_resolved_rate(self) -> float:
@@ -718,6 +741,7 @@ class SVNScanResult:
             candidate_program_files=0,
             matched_program_files=0,
             out_of_scope_python_files=0,
+            explicit_exclusion_counts={SPECIAL_LOCAL_DWUPRR: 0},
             unmatched_python_files=0,
             primary_target_resolved=0,
             primary_target_unresolved=0,
@@ -839,6 +863,7 @@ def scan_svn_profile(
     candidate_count = 0
     matched_count = 0
     out_of_scope_count = 0
+    explicit_exclusion_counts = {SPECIAL_LOCAL_DWUPRR: 0}
     primary_resolved_count = 0
     primary_unresolved_count = 0
     readable_count = 0
@@ -858,6 +883,8 @@ def scan_svn_profile(
             candidate_count += 1
         elif classification.out_of_scope:
             out_of_scope_count += 1
+            if classification.unresolved_reason == SPECIAL_LOCAL_DWUPRR:
+                explicit_exclusion_counts[SPECIAL_LOCAL_DWUPRR] += 1
 
         if classification.matched_program_file:
             matched_count += 1
@@ -939,6 +966,7 @@ def scan_svn_profile(
         candidate_program_files=candidate_count,
         matched_program_files=matched_count,
         out_of_scope_python_files=out_of_scope_count,
+        explicit_exclusion_counts=explicit_exclusion_counts,
         unmatched_python_files=len(classified_paths) - matched_count,
         primary_target_resolved=primary_resolved_count,
         primary_target_unresolved=primary_unresolved_count,
@@ -998,6 +1026,7 @@ def build_svn_verification_report(
                 "candidate_program_files": candidate_count,
                 "matched_program_files": result.matched_program_files,
                 "out_of_scope_python_files": result.out_of_scope_python_files,
+                "explicit_exclusion_counts": dict(result.explicit_exclusion_counts),
                 "unmatched_python_files": result.unmatched_python_files,
                 "primary_target_resolved": result.primary_target_resolved,
                 "primary_target_unresolved": result.primary_target_unresolved,
@@ -1056,6 +1085,7 @@ __all__ = [
     "REQUIRED_PROCESSING_LAYERS",
     "ROOT_NOT_DIRECTORY",
     "ROOT_NOT_FOUND",
+    "SPECIAL_LOCAL_DWUPRR",
     "SUCCESS",
     "SVN_REPORT_VERSION",
     "PathClassification",
