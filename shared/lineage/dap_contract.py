@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,6 +49,13 @@ DAP_V1_MAX_EVIDENCE_TYPE_LENGTH = 64
 DAP_V1_MAX_EVIDENCE_RECORD_ID_LENGTH = 256
 DAP_V1_MAX_EVIDENCE_DESCRIPTION_LENGTH = 1_000
 
+_PIPELINE_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
+_SENSITIVE_PIPELINE_VERSION_PATTERN = re.compile(
+    r"(?:secret|token|password|credential|authorization|://|"
+    r"(?:select|insert|update|delete|drop)\s)",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class DAPLineageCapacityLimits:
@@ -76,6 +84,10 @@ class DAPLineagePreflight:
     task_nodes: int
     total_nodes: int
     business_edges: int
+    raw_projected_edges: int
+    semantic_dap_edges: int
+    deduplicated_edges: int
+    dedup_reduction_pct: float
     dap_edges: int
     diagnostic_count: int
     payload_bytes: int
@@ -98,6 +110,11 @@ class DAPLineagePreflight:
             "task_nodes": self.task_nodes,
             "total_nodes": self.total_nodes,
             "business_edges": self.business_edges,
+            "raw_projected_edges": self.raw_projected_edges,
+            "semantic_dap_edges": self.semantic_dap_edges,
+            "deduplicated_edges": self.deduplicated_edges,
+            "dedup_reduction_pct": self.dedup_reduction_pct,
+            # Backwards-compatible field; this is the final semantic edge count.
             "dap_edges": self.dap_edges,
             "diagnostic_count": self.diagnostic_count,
             "payload_bytes": self.payload_bytes,
@@ -214,13 +231,9 @@ def _validate_row(
         target_table=target_identity.canonical_name,
         program_name=program_name,
     )
-    stored_business_key = _required_text(
-        row.business_edge_key, "business_edge_key"
-    )
+    stored_business_key = _required_text(row.business_edge_key, "business_edge_key")
     if stored_business_key != business_edge_key(edge):
-        raise ValueError(
-            "business_edge_key does not match the canonical business edge"
-        )
+        raise ValueError("business_edge_key does not match the canonical business edge")
     if (
         not isinstance(row.collapse_depth, int)
         or isinstance(row.collapse_depth, bool)
@@ -235,6 +248,45 @@ def _validate_row(
         program_name,
         stored_program_key,
     )
+
+
+def _pipeline_version_label(value: str) -> str:
+    """Keep a single pipeline-version label bounded and metadata-only."""
+
+    if (
+        _PIPELINE_VERSION_PATTERN.fullmatch(value) is None
+        or _SENSITIVE_PIPELINE_VERSION_PATTERN.search(value) is not None
+    ):
+        return "nonstandard"
+    return value
+
+
+def _edge_provenance(rows: list[DWSBusinessEdgeRow]) -> dict[str, object]:
+    versions = {
+        row.pipeline_version.strip()
+        for row in rows
+        if isinstance(row.pipeline_version, str) and row.pipeline_version.strip()
+    }
+    version_fact_count = sum(
+        isinstance(row.pipeline_version, str) and bool(row.pipeline_version.strip())
+        for row in rows
+    )
+    diagnostic: dict[str, object] = {
+        "code": "toolkit_business_projection",
+        "businessFactCount": len(rows),
+        "collapseDepthMin": min(row.collapse_depth for row in rows),
+        "collapseDepthMax": max(row.collapse_depth for row in rows),
+        "pipelineVersionCount": len(versions),
+        "pipelineVersionFactCount": version_fact_count,
+        "pipelineVersionMissingCount": len(rows) - version_fact_count,
+    }
+    if not versions:
+        diagnostic["pipelineVersion"] = "unavailable"
+    elif len(versions) == 1:
+        diagnostic["pipelineVersion"] = _pipeline_version_label(next(iter(versions)))
+    else:
+        diagnostic["pipelineVersion"] = "multiple"
+    return diagnostic
 
 
 def build_dap_lineage_contract(
@@ -253,13 +305,8 @@ def build_dap_lineage_contract(
     batch_id = _required_text(active_snapshot.batch_id, "toolkit_batch_id")
     if not active_snapshot.is_active:
         raise ValueError("active_snapshot must be active")
-    if (
-        not active_snapshot.complete_snapshot
-        or active_snapshot.snapshot_mode != "FULL"
-    ):
-        raise ValueError(
-            "DAP replace export requires a complete FULL toolkit snapshot"
-        )
+    if not active_snapshot.complete_snapshot or active_snapshot.snapshot_mode != "FULL":
+        raise ValueError("DAP replace export requires a complete FULL toolkit snapshot")
     if (environment, source_profile) not in active_snapshot.snapshot_scope:
         raise ValueError(
             "requested environment/profile is not declared by active batch"
@@ -287,7 +334,7 @@ def build_dap_lineage_contract(
     table_ids: dict[str, str] = {}
     task_names: dict[str, str] = {}
     task_program_keys: dict[str, str] = {}
-    edge_records: list[tuple[str, str, str, DWSBusinessEdgeRow]] = []
+    semantic_edge_rows: dict[tuple[str, ...], list[DWSBusinessEdgeRow]] = {}
     for row in sorted(unique_rows.values(), key=lambda item: item.business_edge_key):
         source_table, target_table, task_name, task_key = _validate_row(
             row,
@@ -295,10 +342,10 @@ def build_dap_lineage_contract(
             source_profile=source_profile,
             batch_id=batch_id,
         )
-        source_id = table_ids.setdefault(
+        table_ids.setdefault(
             source_table, _external_id("table", environment, source_table)
         )
-        target_id = table_ids.setdefault(
+        table_ids.setdefault(
             target_table, _external_id("table", environment, target_table)
         )
         task_id = _external_id("task", environment, task_key)
@@ -308,7 +355,22 @@ def build_dap_lineage_contract(
         previous_program_key = task_program_keys.setdefault(task_id, task_key)
         if previous_program_key != task_key:
             raise ValueError("one task identity resolved to conflicting program keys")
-        edge_records.append((source_id, task_id, target_id, row))
+        table_to_task_key = (
+            "table-to-task",
+            environment,
+            source_profile,
+            source_table,
+            task_key,
+        )
+        task_to_table_key = (
+            "task-to-table",
+            environment,
+            source_profile,
+            task_key,
+            target_table,
+        )
+        semantic_edge_rows.setdefault(table_to_task_key, []).append(row)
+        semantic_edge_rows.setdefault(task_to_table_key, []).append(row)
 
     nodes: list[dict[str, object]] = []
     for table_name, external_id in table_ids.items():
@@ -345,39 +407,51 @@ def build_dap_lineage_contract(
     nodes.sort(key=lambda item: str(item["externalId"]))
 
     edges: list[dict[str, object]] = []
-    for source_id, task_id, target_id, row in edge_records:
-        evidence = {
-            "type": "toolkit_business_lineage",
-            "sourceRecordId": row.business_edge_key,
-            "description": (
-                "Toolkit business projection; "
-                f"collapseDepth={row.collapse_depth}."
-            ),
-        }
-        diagnostic: dict[str, object] = {
-            "code": "toolkit_business_projection",
-            "collapseDepth": row.collapse_depth,
-        }
-        if row.pipeline_version:
-            diagnostic["pipelineVersion"] = row.pipeline_version
-        for direction, source, target, edge_type in (
-            ("table-to-task", source_id, task_id, "table_to_task"),
-            ("task-to-table", task_id, target_id, "task_to_table"),
-        ):
-            edges.append(
-                {
-                    "externalId": _external_id(
-                        "edge", row.business_edge_key, direction
-                    ),
-                    "sourceId": source,
-                    "targetId": target,
-                    "type": edge_type,
-                    "evidence": dict(evidence),
-                    # Toolkit business rows do not carry a confidence score.
-                    "confidence": "unknown",
-                    "diagnostics": [dict(diagnostic)],
-                }
+    for semantic_key, contributing_rows in sorted(semantic_edge_rows.items()):
+        direction, edge_environment, edge_profile, left, right = semantic_key
+        if direction == "table-to-task":
+            source_id = table_ids[left]
+            target_id = _external_id("task", edge_environment, right)
+            edge_type = "table_to_task"
+            identity_parts = (
+                direction,
+                edge_environment,
+                edge_profile,
+                left,
+                right,
             )
+        else:
+            source_id = _external_id("task", edge_environment, left)
+            target_id = table_ids[right]
+            edge_type = "task_to_table"
+            identity_parts = (
+                direction,
+                edge_environment,
+                edge_profile,
+                left,
+                right,
+            )
+
+        semantic_id = _external_id("edge", *identity_parts)
+        fact_count = len(contributing_rows)
+        edges.append(
+            {
+                "externalId": semantic_id,
+                "sourceId": source_id,
+                "targetId": target_id,
+                "type": edge_type,
+                "evidence": {
+                    "type": "toolkit_business_lineage",
+                    "sourceRecordId": semantic_id,
+                    "description": (
+                        f"Derived from {fact_count} toolkit business facts."
+                    ),
+                },
+                # Toolkit business rows do not carry a confidence score.
+                "confidence": "unknown",
+                "diagnostics": [_edge_provenance(contributing_rows)],
+            }
+        )
     edges.sort(key=lambda item: str(item["externalId"]))
 
     return {
@@ -598,6 +672,28 @@ def _validate_dap_shape(contract: Mapping[str, object]) -> list[str]:
     return errors
 
 
+def _business_fact_count(edges: list[object]) -> int:
+    """Count distinct toolkit facts from input-side semantic edge summaries."""
+
+    total = 0
+    for edge in edges:
+        if not isinstance(edge, Mapping) or edge.get("type") != "table_to_task":
+            continue
+        diagnostics = edge.get("diagnostics")
+        if not isinstance(diagnostics, list):
+            continue
+        for diagnostic in diagnostics:
+            if (
+                isinstance(diagnostic, Mapping)
+                and diagnostic.get("code") == "toolkit_business_projection"
+            ):
+                count = diagnostic.get("businessFactCount")
+                if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                    total += count
+                break
+    return total
+
+
 def preflight_dap_lineage_contract(
     contract: Mapping[str, object],
     *,
@@ -625,10 +721,20 @@ def preflight_dap_lineage_contract(
     diagnostic_count = sum(
         len(edge.get("diagnostics", []))
         for edge in edges
-        if isinstance(edge, Mapping)
-        and isinstance(edge.get("diagnostics", []), list)
+        if isinstance(edge, Mapping) and isinstance(edge.get("diagnostics", []), list)
     )
     errors = _validate_dap_shape(contract)
+    business_edges = _business_fact_count(edges)
+    raw_projected_edges = business_edges * 2
+    semantic_dap_edges = len(edges)
+    if semantic_dap_edges > raw_projected_edges:
+        errors.append(
+            "semantic DAP edge count exceeds the two-edge projections of business facts"
+        )
+    deduplicated_edges = max(0, raw_projected_edges - semantic_dap_edges)
+    dedup_reduction_pct = (
+        deduplicated_edges * 100.0 / raw_projected_edges if raw_projected_edges else 0.0
+    )
     if len(nodes) > limits.max_nodes:
         errors.append(
             f"DAP V1 node capacity exceeded: {len(nodes)} > {limits.max_nodes}"
@@ -642,11 +748,6 @@ def preflight_dap_lineage_contract(
             "DAP V1 body capacity exceeded: "
             f"{payload_bytes} > {limits.max_payload_bytes} bytes"
         )
-    if len(edges) % 2:
-        errors.append(
-            "DAP edge count is not a whole number of two-edge business projections"
-        )
-
     return DAPLineagePreflight(
         environment=_required_text(environment, "environment"),
         source_profile=_required_text(source_profile, "source_profile"),
@@ -654,8 +755,12 @@ def preflight_dap_lineage_contract(
         table_nodes=table_nodes,
         task_nodes=task_nodes,
         total_nodes=len(nodes),
-        business_edges=len(edges) // 2,
-        dap_edges=len(edges),
+        business_edges=business_edges,
+        raw_projected_edges=raw_projected_edges,
+        semantic_dap_edges=semantic_dap_edges,
+        deduplicated_edges=deduplicated_edges,
+        dedup_reduction_pct=dedup_reduction_pct,
+        dap_edges=semantic_dap_edges,
         diagnostic_count=diagnostic_count,
         payload_bytes=payload_bytes,
         payload_megabytes=payload_bytes / (1024 * 1024),
@@ -669,12 +774,12 @@ __all__ = [
     "DAP_LINEAGE_ADAPTER_VERSION",
     "DAP_LINEAGE_COLLECTOR_NAME",
     "DAP_LINEAGE_CONTRACT_VERSION",
-    "DAPLineageCapacityLimits",
-    "DAPLineagePreflight",
-    "DEFAULT_DAP_V1_CAPACITY_LIMITS",
     "DAP_V1_MAX_LINEAGE_EDGES",
     "DAP_V1_MAX_LINEAGE_NODES",
     "DAP_V1_MAX_METADATA_BODY_BYTES",
+    "DEFAULT_DAP_V1_CAPACITY_LIMITS",
+    "DAPLineageCapacityLimits",
+    "DAPLineagePreflight",
     "build_dap_lineage_contract",
     "preflight_dap_lineage_contract",
     "serialize_dap_lineage_contract",

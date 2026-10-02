@@ -5,9 +5,9 @@ import io
 import json
 import tempfile
 import unittest
-from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from shared.lineage.dap_contract import (
@@ -22,7 +22,6 @@ from shared.lineage.materialization_dws import (
     program_key,
 )
 from tools.integrations import export_dap_lineage
-
 
 STAMP = datetime(2026, 9, 30, 8, 9, 10, tzinfo=timezone.utc)
 ENVIRONMENT = "DEV214"
@@ -183,7 +182,10 @@ class ExportDapLineageTests(unittest.TestCase):
             },
         )
         self.assertEqual(exported.preflight.business_edges, 1)
+        self.assertEqual(exported.preflight.raw_projected_edges, 2)
+        self.assertEqual(exported.preflight.semantic_dap_edges, 2)
         self.assertEqual(exported.preflight.dap_edges, 2)
+        self.assertEqual(exported.preflight.deduplicated_edges, 0)
 
     def test_no_batch_partial_batch_and_scope_mismatch_are_non_ready(self) -> None:
         cases = (
@@ -259,6 +261,10 @@ class ExportDapLineageTests(unittest.TestCase):
         self.assertIn("READY", stdout.getvalue())
         self.assertIn("toolkit_batch_id: batch-cli-fixture", stdout.getvalue())
         self.assertIn("business_edges: 1", stdout.getvalue())
+        self.assertIn("raw_projected_edges: 2", stdout.getvalue())
+        self.assertIn("semantic_dap_edges: 2", stdout.getvalue())
+        self.assertIn("deduplicated_edges: 0", stdout.getvalue())
+        self.assertIn("dedup_reduction_pct: 0.00%", stdout.getvalue())
         self.assertIn("dap_edges: 2", stdout.getvalue())
         self.assertIn("capacity_nodes: 3/10000 PASS", stdout.getvalue())
         store.assert_called_once_with(profile="fixture-dws")
@@ -327,6 +333,10 @@ class ExportDapLineageTests(unittest.TestCase):
             task_nodes=1,
             total_nodes=2,
             business_edges=1,
+            raw_projected_edges=2,
+            semantic_dap_edges=2,
+            deduplicated_edges=0,
+            dedup_reduction_pct=0.0,
             dap_edges=2,
             diagnostic_count=2,
             payload_bytes=512,
