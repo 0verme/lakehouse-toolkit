@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -18,6 +20,8 @@ from .metadata_resolver import (
     normalize_logical_target,
 )
 from .models import AuditResult, MappingField, MappingItem, Resolution
+
+DEFAULT_PROGRESS_EVERY = 100
 
 IGNORED_DIRECTORIES = frozenset(
     {".git", ".svn", ".hg", "__pycache__", ".venv", "venv", "node_modules"}
@@ -476,10 +480,17 @@ def _resolve_candidate(
 
 
 def collect_workspace(
-    root: str | Path, resolver: MetadataResolver, *, dialect: str = "mysql"
+    root: str | Path,
+    resolver: MetadataResolver,
+    *,
+    dialect: str = "mysql",
+    progress_every: int = DEFAULT_PROGRESS_EVERY,
 ) -> AuditResult:
     """Scan program projects, project field lineage, and resolve authoritative metadata."""
 
+    if progress_every < 1:
+        raise ValueError("progress_every must be a positive integer")
+    collection_started_at = time.monotonic()
     workspace = Path(root).expanduser().resolve()
     if not workspace.is_dir():
         raise ValueError("workspace directory does not exist or is not a directory")
@@ -624,8 +635,23 @@ def collect_workspace(
     no_dwo_count = 0
     unknown_upstream_count = 0
     conflict_counts: dict[str, int] = defaultdict(int)
+    known_logicals = set(resolver.recv_by_logical_target)
+    progress_total = len(definitions_by_project)
 
-    for project, definitions in definitions_by_project.items():
+    def log_project_progress(processed: int) -> None:
+        if processed % progress_every == 0 or processed == progress_total:
+            elapsed = time.monotonic() - collection_started_at
+            print(
+                f"[collector] projects={processed}/{progress_total} "
+                f"elapsed={elapsed:.1f}s",
+                file=sys.stderr,
+            )
+
+    for processed_projects, (project, definitions) in enumerate(
+        definitions_by_project.items(), start=1
+    ):
+        if processed_projects > 1:
+            log_project_progress(processed_projects - 1)
         if not definitions:
             continue
         all_targets = set(definitions)
@@ -637,9 +663,6 @@ def collect_workspace(
                     if _is_dwf_table(table):
                         consumed.add(_table_key(table).casefold())
         terminal_targets = sorted(all_targets - consumed)
-        known_logicals = {
-            normalize_logical_target(row.table_name) for row in resolver.recv_dwf
-        }
         matching_terminals = [
             target
             for target in terminal_targets
@@ -842,6 +865,9 @@ def collect_workspace(
                     builder["field_evidence"][field_key].update(field.evidence)
                     builder["fields"][field_key] = field
 
+    if progress_total:
+        log_project_progress(progress_total)
+
     items: list[MappingItem] = []
     for key in sorted(builders):
         builder = builders[key]
@@ -980,4 +1006,4 @@ def collect_workspace(
     )
 
 
-__all__ = ["collect_workspace"]
+__all__ = ["DEFAULT_PROGRESS_EVERY", "collect_workspace"]
