@@ -106,6 +106,42 @@ class LineageCoverageTests(unittest.TestCase):
             1,
         )
 
+    def test_dynamic_literal_template_counts_as_physical_edge_success(self):
+        source = ProgramSource(
+            environment="ENV_SYNTHETIC",
+            source_profile="profile_dynamic_literal",
+            program_name="DEMO_DYNAMIC_LITERAL_SQL",
+            script_code=(
+                "def run(runtime_vars, batchflg):\n"
+                "    sql = \"\"\"\n"
+                "    insert into DWA.DEMO_RESULT\n"
+                "    select * from ODS.DEMO_A\n"
+                "    where dt = '{DATE}'\n"
+                "      and batch_flag = 'batchflg'\n"
+                "    \"\"\".replace('batchflg', batchflg).format(**runtime_vars)\n"
+                "    execute(sql)\n"
+            ),
+            expected_target=None,
+        )
+        dag = build_program_physical_dag(source)
+
+        coverage = LineageCoverageAccumulator()
+        coverage.observe_sources([source])
+        coverage.observe_dag(dag, count_program=False)
+        coverage.observe_materialized_edges([])
+        report = coverage.report(generated_at="2026-01-05T10:11:12+00:00")
+
+        profile = report.profiles[0]
+        self.assertEqual(profile.programs_with_physical_edges, 1)
+        self.assertEqual(
+            profile.failure_reasons[CoverageReason.SQL_ARGUMENT_DYNAMIC.value],
+            0,
+        )
+        self.assertEqual(
+            profile.failure_reasons[CoverageReason.NO_PHYSICAL_EDGE.value],
+            0,
+        )
+
     def test_business_boundary_only_program_is_not_a_lineage_failure(self):
         source = ProgramSource(
             environment="ENV_SYNTHETIC",

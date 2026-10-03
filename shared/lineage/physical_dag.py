@@ -329,6 +329,24 @@ class _PythonBinding:
     column_number: int
 
 
+class _SQLExpressionKind(str, Enum):
+    """Python SQL expression 归一化后的安全分类。"""
+
+    STATIC_SQL = "STATIC_SQL"
+    SAFE_DYNAMIC_LITERAL = "SAFE_DYNAMIC_LITERAL"
+    DYNAMIC_IDENTIFIER = "DYNAMIC_IDENTIFIER"
+    UNRESOLVED_DYNAMIC = "UNRESOLVED_DYNAMIC"
+    NOT_SQL_VALUE = "NOT_SQL_VALUE"
+
+
+@dataclass(frozen=True, slots=True)
+class _SQLExpressionNormalization:
+    """``Python AST -> safe SQL template`` 的结果，不包含真实运行时值。"""
+
+    kind: _SQLExpressionKind
+    text: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class _LegacyBinding:
     token_index: int
@@ -451,6 +469,10 @@ _UNRESOLVED = object()
 _FORMATTER = Formatter()
 _FORMAT_FIELD_ROOT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_FORMAT_TYPES = (str, int, float, bool, type(None))
+# 动态值在 Python 层只统一渲染为同一个 safe placeholder。它既满足 identifier 字符集，
+# 也能安全地位于单引号 literal 内；是否允许继续进入 SQL parser 由
+# ``_normalize_sql_expression`` 按 SQL 上下文判定。
+_DYNAMIC_SQL_PLACEHOLDER = "__LINEAGE_DYNAMIC_LITERAL__"
 
 
 def _static_value(
@@ -474,7 +496,10 @@ def _static_value(
                 return _UNRESOLVED
             formatted = _static_value(value.value, position, bindings, resolving)
             if formatted is _UNRESOLVED:
-                return _UNRESOLVED
+                # 动态 f-string 值先保留 safe placeholder；是否允许由
+                # ``_normalize_sql_expression`` 按 SQL 上下文统一判定。
+                parts.append(_DYNAMIC_SQL_PLACEHOLDER)
+                continue
             parts.append(str(formatted))
         return "".join(parts)
 
@@ -526,15 +551,24 @@ def _static_value(
                         resolving,
                     )
                 return _UNRESOLVED
+            if function_name.lower() == "replace":
+                return _static_replace_value(
+                    function.value,
+                    expression,
+                    position,
+                    bindings,
+                    resolving,
+                )
         if function_name.lower() in {"sql", "text"} and expression.args:
             return _static_value(expression.args[0], position, bindings, resolving)
 
     return _UNRESOLVED
 
 
-def _format_placeholder(field_name: str) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9_$#]+", "_", field_name).strip("_")
-    return f"<SQL_DYNAMIC_{safe_name or 'VALUE'}>"
+def _format_placeholder() -> str:
+    """统一动态 format field 的 safe placeholder，不把 field name 拼进 SQL。"""
+
+    return _DYNAMIC_SQL_PLACEHOLDER
 
 
 def _safe_format_value(
@@ -620,10 +654,147 @@ def _format_static_string(
             value = keyword_values.get(field_name, _UNRESOLVED)
 
         rendered = _safe_format_value(value, conversion, format_spec)
-        parts.append(
-            rendered if rendered is not None else _format_placeholder(field_name)
-        )
+        parts.append(rendered if rendered is not None else _format_placeholder())
     return "".join(parts)
+
+
+def _string_literal_spans(sql_text: str) -> tuple[tuple[int, int], ...]:
+    """返回单引号 SQL string literal 的 ``[start, end)`` 区间。"""
+
+    spans: list[tuple[int, int]] = []
+    index = 0
+    length = len(sql_text)
+    while index < length:
+        if sql_text[index] != "'":
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < length:
+            char = sql_text[index]
+            if char == "\\" and index + 1 < length:
+                index += 2
+                continue
+            if char == "'":
+                if index + 1 < length and sql_text[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        spans.append((start, index))
+    return tuple(spans)
+
+
+def _placeholder_outside_string_literal(sql_text: str) -> bool:
+    """判断动态 placeholder 是否落在 identifier context。
+
+    只有完整位于单引号 string literal 内的 placeholder 才可继续进入 SQL parser；
+    双引号/反引号 identifier、注释或裸 SQL 文本中的 placeholder 一律拒绝。
+    """
+
+    spans = _string_literal_spans(sql_text)
+    cursor = 0
+    while True:
+        position = sql_text.find(_DYNAMIC_SQL_PLACEHOLDER, cursor)
+        if position == -1:
+            return False
+        end = position + len(_DYNAMIC_SQL_PLACEHOLDER)
+        if not any(start <= position and end <= stop for start, stop in spans):
+            return True
+        cursor = end
+
+
+def _replace_occurrences_within_string_literals(
+    template: str,
+    old: str,
+    count: int | None,
+) -> bool:
+    """证明 ``str.replace`` 会替换到的 occurrence 都完整落在 literal 内。"""
+
+    if not old:
+        return False
+    spans = _string_literal_spans(template)
+    index = template.find(old)
+    replaced = 0
+    while index != -1 and (count is None or replaced < count):
+        end = index + len(old)
+        if not any(start <= index and end <= stop for start, stop in spans):
+            return False
+        replaced += 1
+        # 与 ``str.replace`` 一致：匹配后从本次 occurrence 之后继续扫描。
+        index = template.find(old, end)
+    return True
+
+
+def _static_replace_value(
+    template_expression: ast.AST,
+    call: ast.Call,
+    position: tuple[int, int],
+    bindings: Mapping[str, list[_PythonBinding]],
+    resolving: set[tuple[str, int, int]],
+) -> str | object:
+    """静态恢复 ``str.replace``；动态 replacement 只允许落在 literal 内。"""
+
+    if len(call.args) < 2 or len(call.args) > 3 or call.keywords:
+        return _UNRESOLVED
+    if any(isinstance(argument, ast.Starred) for argument in call.args):
+        return _UNRESOLVED
+
+    template = _static_value(template_expression, position, bindings, resolving)
+    if not isinstance(template, str):
+        return _UNRESOLVED
+
+    old = _static_value(call.args[0], position, bindings, resolving)
+    if not isinstance(old, str) or not old:
+        return _UNRESOLVED
+
+    count: int | None = None
+    if len(call.args) == 3:
+        raw_count = _static_value(call.args[2], position, bindings, resolving)
+        if type(raw_count) is not int:
+            return _UNRESOLVED
+        count = raw_count
+
+    replacement = _static_value(call.args[1], position, bindings, resolving)
+    if isinstance(replacement, str):
+        if count is None:
+            return template.replace(old, replacement)
+        return template.replace(old, replacement, count)
+    if replacement is not _UNRESOLVED:
+        return _UNRESOLVED
+    if count is not None and count <= 0:
+        return template
+    if not _replace_occurrences_within_string_literals(template, old, count):
+        return _UNRESOLVED
+    if count is None:
+        return template.replace(old, _DYNAMIC_SQL_PLACEHOLDER)
+    return template.replace(old, _DYNAMIC_SQL_PLACEHOLDER, count)
+
+
+def _normalize_sql_expression(
+    expression: ast.AST,
+    position: tuple[int, int],
+    bindings: Mapping[str, list[_PythonBinding]],
+) -> _SQLExpressionNormalization:
+    """把 Python SQL expression 归一成安全的静态模板或明确的拒绝原因。
+
+    只做 AST 静态分析：不执行 ``eval`` / ``exec``，不调用用户函数或 property，
+    也不渲染真实运行时值。动态值统一变成 ``_DYNAMIC_SQL_PLACEHOLDER``；只有该
+    placeholder 完整落在单引号 string literal 内才视为安全 literal，否则按动态
+    identifier fail closed。
+    """
+
+    value = _static_value(expression, position, bindings, set())
+    if value is _UNRESOLVED:
+        return _SQLExpressionNormalization(_SQLExpressionKind.UNRESOLVED_DYNAMIC)
+    if not isinstance(value, str) or not value.strip():
+        return _SQLExpressionNormalization(_SQLExpressionKind.NOT_SQL_VALUE)
+    if _DYNAMIC_SQL_PLACEHOLDER not in value:
+        return _SQLExpressionNormalization(_SQLExpressionKind.STATIC_SQL, value)
+    if _placeholder_outside_string_literal(value):
+        return _SQLExpressionNormalization(_SQLExpressionKind.DYNAMIC_IDENTIFIER)
+    return _SQLExpressionNormalization(_SQLExpressionKind.SAFE_DYNAMIC_LITERAL, value)
 
 
 def _resolve_static_text(
@@ -837,20 +1008,29 @@ def _extract_python_candidates_with_reason(
             resolved_candidate = False
             unresolved = False
             for expression in expressions:
-                value = _static_value(
+                normalized = _normalize_sql_expression(
                     expression,
                     (line_number, column_number),
                     bindings,
-                    set(),
                 )
-                if value is _UNRESOLVED:
+                if normalized.kind is _SQLExpressionKind.UNRESOLVED_DYNAMIC:
                     unresolved = True
                     continue
-                if not isinstance(value, str) or not value.strip():
+                if normalized.kind is _SQLExpressionKind.DYNAMIC_IDENTIFIER:
+                    # 动态值落在 identifier context：与历史行为一致，继续拒绝。
+                    unresolved = True
+                    continue
+                if normalized.kind is _SQLExpressionKind.NOT_SQL_VALUE:
                     non_sql_argument = True
                     continue
-                if _looks_like_sql(value):
-                    candidates.append(_SQLCandidate(value, line_number, column_number))
+                if _looks_like_sql(normalized.text or ""):
+                    candidates.append(
+                        _SQLCandidate(
+                            normalized.text or "",
+                            line_number,
+                            column_number,
+                        )
+                    )
                     resolved_candidate = True
                     break
                 non_sql_argument = True
@@ -881,23 +1061,25 @@ def _extract_python_candidates_with_reason(
                 return_not_sql = True
             else:
                 line_number, column_number = _node_position(node)
-                value = _static_value(
+                normalized = _normalize_sql_expression(
                     node.value,
                     (line_number, column_number),
                     bindings,
-                    set(),
                 )
-                if value is _UNRESOLVED:
-                    return_dynamic = True
-                elif isinstance(value, str) and value.strip():
+                if normalized.kind is _SQLExpressionKind.STATIC_SQL:
+                    value = normalized.text or ""
                     if _looks_like_sql(value):
                         return_candidates.append(
                             _SQLCandidate(value, line_number, column_number)
                         )
                     else:
                         return_not_sql = True
-                else:
+                elif normalized.kind is _SQLExpressionKind.NOT_SQL_VALUE:
                     return_not_sql = True
+                else:
+                    # return path 延续历史 fail-closed 语义：带动态 placeholder 的
+                    # 模板仍按 dynamic 处理，不新增 return-side candidate。
+                    return_dynamic = True
         elif return_nodes:
             # Mutually exclusive branches cannot be selected statically.
             return_dynamic = True

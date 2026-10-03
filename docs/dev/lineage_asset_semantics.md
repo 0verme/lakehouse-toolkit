@@ -286,6 +286,29 @@ SQL active batch 发布后必须重跑 suppression
 [`lineage_audit.md`](lineage_audit.md) 和
 [`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
 
+### v15：静态 SQL 模板中的动态 literal（Issue #166）
+
+`LINEAGE_PIPELINE_VERSION` bump 为 `lineage-pipeline-v15-dynamic-literal-template`。
+Python SQL extraction 现在区分动态 literal 与动态 identifier：静态 triple-quoted SQL
+上的 `.replace()` / `.format()` 链与 f-string 允许把动态值折叠为不透明 literal
+placeholder 后继续进入现有 SQL parser；动态 schema/table identifier、无法静态证明的
+concat 或函数调用继续 `SQL_ARGUMENT_DYNAMIC`。placeholder 只在完整位于单引号 string
+literal 内时被接受，动态值本身不会写入 parser evidence 或 persisted facts。
+
+| DWS 对象 | 是否受影响 | 原因 |
+| --- | --- | --- |
+| `dwp.lineage_program_state` | 更新 version | 同 source hash 的 v14 state 会被判定为 CHANGED 并重建 |
+| `dwp.lineage_edge` / `dwp.lineage_business_edge` | **受影响** | 原先因 `SQL_ARGUMENT_DYNAMIC` 丢失的静态 source/target edge 会恢复 |
+| `dwp.lineage_issue` | **受影响** | 随完整 batch materialize；旧 issue lifecycle 由现有机制处理 |
+| `dwp.lineage_schedule_edge` | 不受影响 | Schedule parser/materialization 与 SQL Physical DAG 独立 |
+| `dwp.lineage_reconciliation_suppression` | **必须重跑** | suppression 读取 active SQL snapshots，新 SQL edge set 可能改变差异分类 |
+
+```text
+必须完整重跑 SQL lineage；不要使用 --limit
+Schedule lineage 不必重跑
+SQL active batch 发布后必须重跑 suppression
+```
+
 ## 6. 回归覆盖
 
 | 场景 | 测试 |

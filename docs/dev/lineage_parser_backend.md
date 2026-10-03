@@ -51,7 +51,7 @@ Protocol 的语义化别名，不维护第二套接口。backend 必须提供：
 ```json
 {
   "backend": "legacy",
-  "backend_version": "legacy-parser-v3-static-empty-query",
+  "backend_version": "legacy-parser-v4-dynamic-literal-template",
   "parse_status": "success",
   "confidence": "high",
   "extraction_reason": "CANDIDATE_FOUND",
@@ -125,9 +125,13 @@ reason；Audit 生成 `STATIC_EMPTY_QUERY` 时只持久化最小脱敏字段，�
 Fake backend contract test 仍验证旧 backend facade 的 SQLStep → Physical DAG → Audit →
 Materialization 链路。
 
-Legacy adapter 的 compare contract 从 `legacy-parser-v2-relation-context` bump 到
-`legacy-parser-v3-static-empty-query`。`LINEAGE_PIPELINE_VERSION` 当前为
-`lineage-pipeline-v14-unclassified-formal-boundary`。v14 将 degree 证明的 program-local
+Legacy adapter 的 compare contract 从 `legacy-parser-v3-static-empty-query` bump 到
+`legacy-parser-v4-dynamic-literal-template`。`LINEAGE_PIPELINE_VERSION` 当前为
+`lineage-pipeline-v15-dynamic-literal-template`。v15 在 Python expression extraction 中
+新增安全 SQL template normalization：静态 triple-quoted 模板上的 `.replace()` /
+`.format()` 链与 f-string 允许把动态值折叠为 literal placeholder 后继续进入现有
+SQL parser，动态 schema/table identifier 继续 `SQL_ARGUMENT_DYNAMIC`；同 source hash
+的 v14 facts 必须完整 rebuild。v14 将 degree 证明的 program-local
 未分类 formal intermediate 纳入既有 Physical DAG path collapse，并为 source/sink
 boundary 新增 blocker issue；同 source hash 的 v13 facts 必须完整 rebuild。v13 使恒假
 Query Block 的 source 不再进入已持久化

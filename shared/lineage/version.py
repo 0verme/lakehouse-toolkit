@@ -8,6 +8,9 @@
 # v14 collapses program-local UNCLASSIFIED_FORMAL intermediates that are proven
 # by Physical DAG degree (in_degree > 0 and out_degree > 0), and adds explicit
 # audit blockers for unclassified formal source/sink boundaries.
-LINEAGE_PIPELINE_VERSION = "lineage-pipeline-v14-unclassified-formal-boundary"
+# v15 keeps statically proven SQL object identifiers from ``.replace()`` /
+# ``.format()`` / f-string templates while replacing dynamic values with an
+# opaque literal placeholder; dynamic identifier contexts still fail closed.
+LINEAGE_PIPELINE_VERSION = "lineage-pipeline-v15-dynamic-literal-template"
 
 __all__ = ["LINEAGE_PIPELINE_VERSION"]
