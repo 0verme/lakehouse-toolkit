@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .physical_dag import SQLStep
 
 LEGACY_PARSER_BACKEND = "legacy"
-LEGACY_PARSER_BACKEND_VERSION = "legacy-parser-v3-static-empty-query"
+LEGACY_PARSER_BACKEND_VERSION = "legacy-parser-v4-dynamic-literal-template"
 
 
 class SqlParseStatus(str, Enum):

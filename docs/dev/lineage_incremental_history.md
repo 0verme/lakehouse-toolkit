@@ -52,9 +52,14 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v14-unclassified-formal-boundary`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v15-dynamic-literal-template`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
-bump 到新的语义版本，并在本文记录原因。v14 将同一 Physical DAG 中
+bump 到新的语义版本，并在本文记录原因。v15 在 Python SQL expression extraction 中
+区分“动态 literal”与“动态 identifier”：静态 SQL 模板上的 `.replace()` /
+`.format()` 链与 f-string 中的动态值被折叠为不透明 literal placeholder 后继续进入
+现有 SQL parser，而动态 schema/table identifier、无法静态证明的 concat 或函数调用
+继续 `SQL_ARGUMENT_DYNAMIC`；因此所有 v14 active facts 都必须由完整 SQL snapshot
+rebuild。v14 将同一 Physical DAG 中
 `in_degree > 0 and out_degree > 0` 的未分类 formal 节点作为 program-local
 intermediate 折叠，并为 `SOURCE_ONLY` / `SINK_ONLY` boundary 新增
 `UNCLASSIFIED_FORMAL_SOURCE` / `UNCLASSIFIED_FORMAL_SINK` issue；因此所有 v13

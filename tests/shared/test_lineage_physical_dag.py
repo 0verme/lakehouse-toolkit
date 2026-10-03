@@ -1214,6 +1214,178 @@ executor.do(sql)
             {("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT"))},
         )
 
+    def test_sql_expression_normalization_distinguishes_literal_from_identifier(
+        self,
+    ):
+        def normalize(source: str):
+            tree = ast.parse(source)
+            statement = tree.body[0]
+            self.assertIsInstance(statement, ast.Expr)
+            expression = cast(ast.Expr, statement).value
+            return physical_dag_module._normalize_sql_expression(
+                expression,
+                (1, 0),
+                {},
+            )
+
+        kinds = physical_dag_module._SQLExpressionKind
+        self.assertIs(
+            normalize('"select * from ODS.DEMO_A"').kind,
+            kinds.STATIC_SQL,
+        )
+        self.assertIs(
+            normalize(
+                "f\"select * from ODS.DEMO_A where dt = '{run_date}'\""
+            ).kind,
+            kinds.SAFE_DYNAMIC_LITERAL,
+        )
+        self.assertIs(
+            normalize('f"select * from {table_name}"').kind,
+            kinds.DYNAMIC_IDENTIFIER,
+        )
+        self.assertIs(
+            normalize("runtime_sql").kind,
+            kinds.UNRESOLVED_DYNAMIC,
+        )
+        self.assertIs(
+            normalize("0").kind,
+            kinds.NOT_SQL_VALUE,
+        )
+
+    def test_static_template_dynamic_literals_keep_table_lineage(self):
+        format_dag = build_program_physical_dag(
+            program(
+                '''
+                def run(runtime_vars):
+                    sql = """
+                    select * from ODS.DEMO_A where dt = '{DATE}'
+                    """.format(**runtime_vars)
+                    execute(sql)
+                ''',
+                expected_target=None,
+            )
+        )
+        self.assertEqual(format_dag.sql_candidate_count, 1)
+        self.assertEqual(
+            format_dag.sql_extraction_reason,
+            SQLExtractionReason.CANDIDATE_FOUND.value,
+        )
+        self.assertIn("ODS.DEMO_A", node_names(format_dag))
+
+        replace_format_dag = build_program_physical_dag(
+            program(
+                '''
+                def run(batchflg, runtime_vars):
+                    sqlstr = """
+                    insert into DWA.DEMO_RESULT
+                    select * from ODS.DEMO_A
+                    where dt = '{DATE}'
+                      and batch_flag = 'batchflg'
+                    """.replace('batchflg', batchflg).format(**runtime_vars)
+                    execute(sqlstr)
+                ''',
+                expected_target=None,
+            )
+        )
+        self.assertEqual(replace_format_dag.sql_candidate_count, 1)
+        self.assertEqual(
+            edge_pairs(replace_format_dag),
+            {("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT"))},
+        )
+
+        f_string_dag = build_program_physical_dag(
+            program(
+                '''
+                def run(run_date):
+                    sqlstr = f"""
+                    merge into DWA.DEMO_RESULT b
+                    using (
+                        select * from ODS.DEMO_A
+                        where dt = '{run_date}'
+                    ) a
+                    on b.id = a.id
+                    """
+                    execute(sqlstr)
+                ''',
+                expected_target=None,
+            )
+        )
+        self.assertEqual(f_string_dag.sql_candidate_count, 1)
+        self.assertEqual(
+            edge_pairs(f_string_dag),
+            {("ODS.DEMO_A", normalize_table_name("DWA.DEMO_RESULT"))},
+        )
+
+    def test_dynamic_identifiers_stay_sql_argument_dynamic(self):
+        cases = {
+            "from": 'sql = f"select * from {table_name}"',
+            "schema": 'sql = f"select * from {schema}.DEMO_A"',
+            "insert": (
+                'sql = "insert into {} select * from ODS.DEMO_A".format(target)'
+            ),
+            "update": 'sql = f"update {target} set a = 1"',
+            "merge": (
+                'sql = f"merge into {target_table} t '
+                'using (select * from ODS.DEMO_A) s on 1 = 1"'
+            ),
+            "create_table": (
+                'sql = f"create table {tmp_table} as select * from ODS.DEMO_A"'
+            ),
+            "replace": (
+                'sql = "select * from {TBL}".replace("{TBL}", runtime_table)'
+            ),
+            "concat": 'sql = "select * from " + table_name',
+            "call": 'sql = build_sql(runtime_table)',
+        }
+        for name, statement in cases.items():
+            with self.subTest(name=name):
+                dag = build_program_physical_dag(
+                    program(
+                        f"def run(runtime_table):\n"
+                        f"    {statement}\n"
+                        f"    execute(sql)\n",
+                        expected_target=None,
+                    )
+                )
+                self.assertEqual(dag.steps, ())
+                self.assertEqual(dag.edges, ())
+                self.assertEqual(
+                    dag.sql_extraction_reason,
+                    SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value,
+                )
+
+    def test_prod_shaped_dynamic_literal_fixture_keeps_table_lineage(self):
+        fixture_path = (
+            ROOT_DIR
+            / "tests"
+            / "fixtures"
+            / "lineage"
+            / "python_sql_dynamic_literals.py"
+        )
+        dag = build_program_physical_dag(
+            program(fixture_path.read_text(encoding="utf-8"), expected_target=None)
+        )
+
+        self.assertEqual(
+            dag.sql_extraction_reason,
+            SQLExtractionReason.CANDIDATE_FOUND.value,
+        )
+        self.assertEqual(dag.sql_candidate_count, 2)
+        self.assertEqual(len(dag.steps), 2)
+        self.assertEqual(
+            edge_pairs(dag),
+            {
+                (
+                    "DWS_DWUPRR.DEMO_EXPOSURE",
+                    normalize_table_name("DWS_DWUPRR.TMP_DEMO_02"),
+                ),
+                (
+                    "DWS_DWF.DEMO_SOURCE",
+                    normalize_table_name("DWS_DWUPRR.DEMO_TARGET"),
+                ),
+            },
+        )
+
     def test_non_string_returns_are_not_reported_as_dynamic(self):
         for return_value in ("0", "1", "None"):
             with self.subTest(return_value=return_value):
