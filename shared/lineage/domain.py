@@ -37,6 +37,8 @@ class IssueType(str, Enum):
     SELF_REFERENCE = "SELF_REFERENCE"
     LINEAGE_BRANCH_BROKEN = "LINEAGE_BRANCH_BROKEN"
     STATIC_EMPTY_QUERY = "STATIC_EMPTY_QUERY"
+    UNCLASSIFIED_FORMAL_SOURCE = "UNCLASSIFIED_FORMAL_SOURCE"
+    UNCLASSIFIED_FORMAL_SINK = "UNCLASSIFIED_FORMAL_SINK"
 
 
 class AuditConfidence(str, Enum):
@@ -1000,6 +1002,81 @@ class PhysicalEdge:
         _require_text(self.target, "target")
 
 
+class UnclassifiedFormalRole(str, Enum):
+    """程序 Physical DAG 中未分类 formal 节点的结构角色。
+
+    ``UNCLASSIFIED_FORMAL`` 指既不是 Business Asset、也不是 DLO/DWO technical
+    asset、且没有显式 temporary evidence 的 formal 节点。角色只由当前 Physical
+    DAG 的 in/out degree 事实决定，不由表名、schema 或命名推断。
+    """
+
+    SOURCE_ONLY = "SOURCE_ONLY"
+    INTERMEDIATE = "INTERMEDIATE"
+    SINK_ONLY = "SINK_ONLY"
+    ISOLATED = "ISOLATED"
+
+
+def unclassified_formal_node_roles(
+    nodes: Iterable[PhysicalNode],
+    edges: Iterable[PhysicalEdge],
+    *,
+    environment: str | None = None,
+) -> dict[str, UnclassifiedFormalRole]:
+    """按 Physical DAG degree 返回未分类 formal 节点的程序内角色。
+
+    只有同时满足以下条件的节点才进入结果：
+
+    - 显式或默认 formal 语义（``PhysicalNodeKind.FORMAL_ASSET``）；
+    - 不是 Business Asset（``is_business_asset``）；
+    - 不是 DLO/DWO technical asset（``is_technical_asset``）。
+
+    角色仅由当前 Physical DAG 的 in/out degree 决定：
+
+    - ``SOURCE_ONLY``：``in_degree == 0 and out_degree > 0``；
+    - ``INTERMEDIATE``：``in_degree > 0 and out_degree > 0``；
+    - ``SINK_ONLY``：``in_degree > 0 and out_degree == 0``；
+    - ``ISOLATED``：``in_degree == 0 and out_degree == 0``。
+
+    edge-only 节点使用 ``node_key`` 作为 asset name，与 ``PhysicalNode`` 的
+    neutral ``FORMAL_ASSET`` 默认语义一致。该函数只读取事实，不修改图，也不猜
+    schema、namespace 或 temporary 语义。
+    """
+
+    node_map = {node.node_key: node for node in nodes}
+    in_degree: dict[str, int] = {}
+    out_degree: dict[str, int] = {}
+    for edge in edges:
+        out_degree[edge.source] = out_degree.get(edge.source, 0) + 1
+        in_degree[edge.target] = in_degree.get(edge.target, 0) + 1
+
+    graph_nodes = set(node_map)
+    graph_nodes.update(in_degree)
+    graph_nodes.update(out_degree)
+
+    roles: dict[str, UnclassifiedFormalRole] = {}
+    for node_key in sorted(graph_nodes):
+        node = node_map.get(node_key)
+        if node is not None and node.kind is PhysicalNodeKind.TEMPORARY_ASSET:
+            continue
+        asset_name = node.asset_name if node is not None else node_key
+        if is_business_asset(asset_name, environment=environment):
+            continue
+        if is_technical_asset(asset_name, environment=environment):
+            continue
+        incoming = in_degree.get(node_key, 0)
+        outgoing = out_degree.get(node_key, 0)
+        if incoming == 0 and outgoing > 0:
+            role = UnclassifiedFormalRole.SOURCE_ONLY
+        elif incoming > 0 and outgoing > 0:
+            role = UnclassifiedFormalRole.INTERMEDIATE
+        elif incoming > 0 and outgoing == 0:
+            role = UnclassifiedFormalRole.SINK_ONLY
+        else:
+            role = UnclassifiedFormalRole.ISOLATED
+        roles[node_key] = role
+    return roles
+
+
 @dataclass(frozen=True, slots=True)
 class LineageEdge:
     """正式资产之间的直接业务血缘事实。
@@ -1194,10 +1271,12 @@ __all__ = [
     "ProgramSource",
     "ProgramState",
     "TemporaryAssetRule",
+    "UnclassifiedFormalRole",
     "is_business_asset",
     "is_formal_asset",
     "is_technical_asset",
     "is_temporary_asset",
+    "unclassified_formal_node_roles",
     "normalize_asset_name",
     "normalize_lineage_schema",
     "normalize_declared_target_from_program_name",

@@ -8,7 +8,7 @@ Golden Corpus 用于可重复地抽取 Audit fact、做人工事实标注、计�
 `ProgramLineageAuditor` 的 detection rule、severity policy、evidence 或 issue identity。
 `candidate_from_fact()` 与 `candidate_from_issue()` 都只读取 fact 部分。
 
-当前代码的 `IssueType` 枚举共有八类：
+当前代码的 `IssueType` 枚举共有十类：
 
 | 类型 | 来源 |
 | --- | --- |
@@ -19,9 +19,11 @@ Golden Corpus 用于可重复地抽取 Audit fact、做人工事实标注、计�
 | `CYCLE_DETECTED` | `ProgramLineageAuditor` |
 | `SELF_REFERENCE` | `ProgramLineageAuditor` |
 | `STATIC_EMPTY_QUERY` | `ProgramLineageAuditor` |
+| `UNCLASSIFIED_FORMAL_SOURCE` | `ProgramLineageAuditor` |
+| `UNCLASSIFIED_FORMAL_SINK` | `ProgramLineageAuditor` |
 | `LINEAGE_BRANCH_BROKEN` | 现有 evolution/history transition 派生 |
 
-因此直接 Audit replay 目前覆盖七类，history transition fixture 额外覆盖
+因此直接 Audit replay 目前覆盖九类，history transition fixture 额外覆盖
 `LINEAGE_BRANCH_BROKEN`。Golden Corpus 不会把它伪装成直接 detector output。
 
 ## Fact correctness 与 business acceptance

@@ -54,13 +54,21 @@ DLO / DWO 不能作为 Business endpoint。`TMP` / `TEMP` / `STG` / `TEST` 名�
 `lineage_business_edge` 中由既有 collapse 结果隐藏。DLO/DWO 的 boundary 规则与
 normalization 见 [`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
 
-## 临时节点/DLO/DWO Collapse 与 Business Asset 边界
+## 临时节点/DLO/DWO/UNCLASSIFIED_FORMAL Collapse 与 Business Asset 边界
 
 Collapse 从每个 Business Asset 节点的 outgoing edge 开始：遇到显式 temporary 节点、
 DLO 或 DWO 就继续沿路径走，第一次遇到下一个 Business Asset 便生成一条 `U → V` 并
 停止该路径。临时节点判定只来自 `PhysicalNodeKind.TEMPORARY_ASSET`（即显式 DDL fact）。
 DLO/DWO 不会因为 `PhysicalNodeKind.FORMAL_ASSET` 而变成 Business boundary；该算法
 也不是 transitive closure。
+
+Issue #162 起，同一个程序的 Physical DAG 中满足 `in_degree > 0 and out_degree > 0`
+的 **UNCLASSIFIED_FORMAL** 节点（既不是 Business Asset，也不是 DLO/DWO technical
+asset，且没有显式 temporary evidence）也作为 program-local intermediate 参与同一条
+path collapse。资格只来自 Physical DAG degree，不来自表名（不匹配 `TMP` / `LOCAL` /
+`_01` 等命名），也不推断 schema。`SOURCE_ONLY`（`in_degree == 0`）与 `SINK_ONLY`
+（`out_degree == 0`）不参与折叠，由 Audit 生成
+`UNCLASSIFIED_FORMAL_SOURCE` / `UNCLASSIFIED_FORMAL_SINK` blocker issue。
 
 ```text
 A(Business) → TMP1 → DLO.B → DWO.C → B(Business) → TMP3 → C(Business)
@@ -86,9 +94,14 @@ DWF.A → DWM.B
 DWM.B → DWA.C
 ```
 
-`DWM.B` 是 Business Asset 边界，不能被临时节点/DLO/DWO collapse 越过。若路径为
-`DLO.A → DWO.B → DWF.C`，Physical rows 仍保留，但不会伪造 DLO/DWO endpoint 的
-Business edge。
+`DWM.B` 是 Business Asset 边界，不能被临时节点/DLO/DWO/UNCLASSIFIED_FORMAL collapse
+越过。若路径为 `DLO.A → DWO.B → DWF.C`，Physical rows 仍保留，但不会伪造 DLO/DWO
+endpoint 的 Business edge。
+
+未分类 intermediate 存在分叉/汇聚（`in_degree > 1` 或 `out_degree > 1`）时，折叠仍沿
+真实 Physical DAG 可达路径进行：`_collapse_acyclic_dag_to_edges` 的 exact path-count
+DP 与 `_collapsed_paths` fallback 都只遍历真实 edge，不做 predecessors × successors
+笛卡尔积，也不通过“删除节点并连接邻居”生成边。
 
 一个 batch/program 内相同的
 `environment + source_profile + source_table + target_table + program_name + job_key`
@@ -108,12 +121,14 @@ accumulator 保留 canonical 最小 sample。`source`、`target`、程序身份�
 statement evidence summary 不因 sample 截断而丢失。
 
 聚合摘要也有固定边界：`physical_edge_pairs`、`collapsed_tmp_nodes`、
-`collapsed_technical_nodes` 和 `statement_indices` 默认各保留最多 `200` 个 canonical
-值，并分别用对应的 `*_truncated` 字段表示截断。SQLite 仍将 evidence 作为 JSON 文本保存，
-因此没有额外的表迁移；SQLite consumer 必须使用 runtime `path_count` 判断完整规模，
-不能用 `len(physical_paths)` 代替。DWS `lineage_edge` 接收 raw direct `PhysicalEdge`；DWS
-`lineage_business_edge` 才接收 Business direct `LineageEdge`。两个 projection 使用同
-一批次和同一 program pipeline。
+`collapsed_technical_nodes`、`collapsed_unclassified_formal_nodes` 和 `statement_indices`
+默认各保留最多 `200` 个 canonical 值，并分别用对应的 `*_truncated` 字段表示截断。
+`collapse` evidence label 为
+`technical_tmp_and_unclassified_formal_until_business_boundary`。SQLite 仍将 evidence 作为
+JSON 文本保存，因此没有额外的表迁移；SQLite consumer 必须使用 runtime `path_count`
+判断完整规模，不能用 `len(physical_paths)` 代替。DWS `lineage_edge` 接收 raw direct
+`PhysicalEdge`；DWS `lineage_business_edge` 才接收 Business direct `LineageEdge`。两个
+projection 使用同一批次和同一 program pipeline。
 
 Materialization 对无环临时节点/DLO/DWO 可折叠子图使用 deterministic DAG dynamic
 programming：Business boundary 的 exact `path_count`、能参与该 boundary 的 physical

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from heapq import heapify, heappop, heappush
 from time import perf_counter
-from typing import Any, cast
+from typing import AbstractSet, Any, cast
 from uuid import uuid4
 
 from shared.lineage.audit import (
@@ -41,8 +41,10 @@ from shared.lineage.domain import (
     PhysicalNode,
     PhysicalNodeKind,
     ProgramState,
+    UnclassifiedFormalRole,
     is_business_asset,
     is_technical_asset,
+    unclassified_formal_node_roles,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
 
@@ -51,6 +53,7 @@ MAX_PHYSICAL_PATHS = 100
 MAX_PHYSICAL_EDGE_PAIRS = 200
 MAX_COLLAPSED_TMP_NODES = 200
 MAX_COLLAPSED_TECHNICAL_NODES = 200
+MAX_COLLAPSED_UNCLASSIFIED_FORMAL_NODES = 200
 MAX_STATEMENT_INDICES = 200
 MAX_EVIDENCE_DEPTH = 64
 MAX_EVIDENCE_COLLECTION_SIZE = 10_000
@@ -362,6 +365,9 @@ class _EdgeEvidenceAccumulator:
     collapsed_technical_nodes: _BoundedValues = field(
         default_factory=lambda: _BoundedValues(MAX_COLLAPSED_TECHNICAL_NODES)
     )
+    collapsed_unclassified_formal_nodes: _BoundedValues = field(
+        default_factory=lambda: _BoundedValues(MAX_COLLAPSED_UNCLASSIFIED_FORMAL_NODES)
+    )
     statement_indices: _BoundedValues = field(
         default_factory=lambda: _BoundedValues(MAX_STATEMENT_INDICES)
     )
@@ -369,6 +375,7 @@ class _EdgeEvidenceAccumulator:
     physical_edge_pairs_truncated: bool = False
     collapsed_tmp_nodes_truncated: bool = False
     collapsed_technical_nodes_truncated: bool = False
+    collapsed_unclassified_formal_nodes_truncated: bool = False
     statement_indices_truncated: bool = False
     physical_edge_summaries: dict[int, dict[str, object]] = field(
         default_factory=dict,
@@ -381,6 +388,7 @@ class _EdgeEvidenceAccumulator:
         physical_edges: tuple[PhysicalEdge, ...],
         *,
         count: bool = True,
+        unclassified_intermediates: AbstractSet[str] = frozenset(),
     ) -> None:
         _record_metric("accumulator_add_path_calls")
         if count:
@@ -390,12 +398,21 @@ class _EdgeEvidenceAccumulator:
                 path,
                 physical_edges,
                 edge_summary_cache=self.physical_edge_summaries,
+                unclassified_intermediates=unclassified_intermediates,
             )
         )
 
-    def _add_collapsed_node(self, node: object) -> None:
+    def _add_collapsed_node(
+        self,
+        node: object,
+        unclassified_intermediates: AbstractSet[str] = frozenset(),
+    ) -> None:
         node_text = str(node)
-        if is_technical_asset(node_text):
+        if node_text in unclassified_intermediates:
+            # Program-local UNCLASSIFIED_FORMAL intermediate: collapsed only
+            # because the Physical DAG degree proves it is internal.
+            self.collapsed_unclassified_formal_nodes.add_safe(node_text)
+        elif is_technical_asset(node_text):
             self.collapsed_technical_nodes.add_safe(node_text)
         else:
             # A collapsible intermediate that is not a registered DLO/DWO
@@ -406,7 +423,9 @@ class _EdgeEvidenceAccumulator:
     def add_graph_summary(
         self,
         physical_edges: Iterable[PhysicalEdge],
-        collapsed_tmp_nodes: Iterable[str],
+        collapsed_nodes: Iterable[str],
+        *,
+        unclassified_intermediates: AbstractSet[str] = frozenset(),
     ) -> None:
         """只聚合 exact graph summaries，不为每条 path 构造 evidence。"""
 
@@ -419,8 +438,11 @@ class _EdgeEvidenceAccumulator:
             for index in _as_items(edge_record.get("statement_indices")):
                 if isinstance(index, (int, str)) and not isinstance(index, bool):
                     self.statement_indices.add_safe(index)
-        for node in collapsed_tmp_nodes:
-            self._add_collapsed_node(node)
+        for node in collapsed_nodes:
+            self._add_collapsed_node(
+                node,
+                unclassified_intermediates=unclassified_intermediates,
+            )
 
     def add_evidence(self, evidence: Mapping[str, object] | str | None) -> None:
         _record_metric("accumulator_add_evidence_calls")
@@ -474,8 +496,13 @@ class _EdgeEvidenceAccumulator:
             self._add_collapsed_node(node)
         for node in _as_items(safe_value.get("collapsed_technical_nodes")):
             self.collapsed_technical_nodes.add_safe(str(node))
+        for node in _as_items(safe_value.get("collapsed_unclassified_formal_nodes")):
+            self.collapsed_unclassified_formal_nodes.add_safe(str(node))
         self.collapsed_technical_nodes_truncated |= bool(
             safe_value.get("collapsed_technical_nodes_truncated")
+        )
+        self.collapsed_unclassified_formal_nodes_truncated |= bool(
+            safe_value.get("collapsed_unclassified_formal_nodes_truncated")
         )
         for index in _as_items(safe_value.get("statement_indices")):
             if isinstance(index, (int, str)) and not isinstance(index, bool):
@@ -511,6 +538,8 @@ class _EdgeEvidenceAccumulator:
             self._add_collapsed_node(node)
         for node in _as_items(value.get("collapsed_technical_nodes")):
             self.collapsed_technical_nodes.add_safe(str(node))
+        for node in _as_items(value.get("collapsed_unclassified_formal_nodes")):
+            self.collapsed_unclassified_formal_nodes.add_safe(str(node))
         for edge in _as_items(value.get("physical_edges")):
             if not isinstance(edge, Mapping):
                 continue
@@ -525,7 +554,7 @@ class _EdgeEvidenceAccumulator:
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
                 physical_edge_pairs.append(list(pair))
         return {
-            "collapse": "technical_and_tmp_until_business_boundary",
+            "collapse": "technical_tmp_and_unclassified_formal_until_business_boundary",
             "collapsed_tmp_nodes": self.collapsed_tmp_nodes.sorted_values(),
             "collapsed_tmp_nodes_truncated": (
                 self.collapsed_tmp_nodes_truncated or self.collapsed_tmp_nodes.truncated
@@ -534,6 +563,13 @@ class _EdgeEvidenceAccumulator:
             "collapsed_technical_nodes_truncated": (
                 self.collapsed_technical_nodes_truncated
                 or self.collapsed_technical_nodes.truncated
+            ),
+            "collapsed_unclassified_formal_nodes": (
+                self.collapsed_unclassified_formal_nodes.sorted_values()
+            ),
+            "collapsed_unclassified_formal_nodes_truncated": (
+                self.collapsed_unclassified_formal_nodes_truncated
+                or self.collapsed_unclassified_formal_nodes.truncated
             ),
             "physical_edge_pairs": physical_edge_pairs,
             "physical_edge_pairs_truncated": (
@@ -663,18 +699,46 @@ def _is_collapsible_intermediate(
     node_map: Mapping[str, PhysicalNode],
     *,
     environment: str | None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> bool:
     if _is_temporary(node_key, node_map):
         return True
-    return is_technical_asset(
+    if is_technical_asset(
         _node_asset_name(node_key, node_map),
         environment=environment,
+    ):
+        return True
+    # 只有调用方已经用 Physical DAG degree 证明是 program-local intermediate
+    # 的 UNCLASSIFIED_FORMAL 节点才在这里穿透。source-only / sink-only 节点不在
+    # 该集合中，因此不会被自动折叠或猜成 business asset。
+    return node_key in unclassified_intermediates
+
+
+def _unclassified_formal_intermediates(dag: ProgramPhysicalDAG) -> frozenset[str]:
+    """返回当前 Physical DAG 中可折叠的 program-local 未分类 formal 中间节点。
+
+    资格完全来自 ``unclassified_formal_node_roles`` 的 degree 事实：
+    ``in_degree > 0 and out_degree > 0``。该集合只用于当前程序内部的 path
+    collapse，不改变 Physical DAG，也不把节点提升为 business asset。
+    """
+
+    roles = unclassified_formal_node_roles(
+        dag.nodes,
+        dag.edges,
+        environment=dag.program_source.environment,
+    )
+    return frozenset(
+        node
+        for node, role in roles.items()
+        if role is UnclassifiedFormalRole.INTERMEDIATE
     )
 
 
 def _build_adjacency(
     edges: Iterable[PhysicalEdge],
     node_map: Mapping[str, PhysicalNode],
+    *,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> dict[str, tuple[PhysicalEdge, ...]]:
     adjacency: dict[str, list[PhysicalEdge]] = {}
     for edge in edges:
@@ -694,6 +758,7 @@ def _build_adjacency(
                 edge.target,
                 node_map,
                 environment=None,
+                unclassified_intermediates=unclassified_intermediates,
             ):
                 # Collapsible states are pushed onto a LIFO stack, so the last
                 # sorted duplicate was the first one to reach a later boundary.
@@ -720,10 +785,15 @@ def _collapsed_paths(
     dag: ProgramPhysicalDAG,
     included_nodes: set[str],
 ) -> Iterator[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]]]:
-    """显式遍历 TMP/DLO/DWO 路径直到下一个 Business Asset。"""
+    """显式遍历可折叠 intermediate 路径直到下一个 Business Asset。"""
 
     node_map = _node_map(dag)
-    adjacency = _build_adjacency(dag.edges, node_map)
+    unclassified_intermediates = _unclassified_formal_intermediates(dag)
+    adjacency = _build_adjacency(
+        dag.edges,
+        node_map,
+        unclassified_intermediates=unclassified_intermediates,
+    )
     environment = dag.program_source.environment
     business_starts = sorted(
         node
@@ -753,6 +823,7 @@ def _collapsed_paths(
                     next_node,
                     node_map,
                     environment=environment,
+                    unclassified_intermediates=unclassified_intermediates,
                 ):
                     if next_node in path:
                         # A cycle without a new Business Asset boundary stops
@@ -788,8 +859,9 @@ def _temporary_topological_order(
     adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
     *,
     environment: str | None = None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> tuple[str, ...] | None:
-    """Return a deterministic TMP/technical topological order, or ``None`` for a cycle."""
+    """Return a deterministic TMP/technical/unclassified topological order."""
 
     collapsible_nodes = {
         node
@@ -798,6 +870,7 @@ def _temporary_topological_order(
             node,
             node_map,
             environment=environment,
+            unclassified_intermediates=unclassified_intermediates,
         )
     }
     indegree = {node: 0 for node in collapsible_nodes}
@@ -830,8 +903,9 @@ def _reachable_temporary_nodes(
     adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
     *,
     environment: str | None = None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> set[str]:
-    """Return traversable TMP/DLO/DWO nodes reachable from a business source."""
+    """Return traversable collapsible nodes reachable from a business source."""
 
     reachable: set[str] = set()
     pending = [
@@ -842,6 +916,7 @@ def _reachable_temporary_nodes(
             edge.target,
             node_map,
             environment=environment,
+            unclassified_intermediates=unclassified_intermediates,
         )
     ]
     while pending:
@@ -857,6 +932,7 @@ def _reachable_temporary_nodes(
                 edge.target,
                 node_map,
                 environment=environment,
+                unclassified_intermediates=unclassified_intermediates,
             )
             and edge.target not in reachable
         )
@@ -870,8 +946,9 @@ def _reverse_reachable_temporary_nodes(
     reverse_adjacency: Mapping[str, tuple[PhysicalEdge, ...]],
     *,
     environment: str | None = None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> set[str]:
-    """Return traversable TMP/DLO/DWO nodes that can reach a business target."""
+    """Return traversable collapsible nodes that can reach a business target."""
 
     reachable: set[str] = set()
     pending = [
@@ -882,6 +959,7 @@ def _reverse_reachable_temporary_nodes(
             edge.source,
             node_map,
             environment=environment,
+            unclassified_intermediates=unclassified_intermediates,
         )
     ]
     while pending:
@@ -897,6 +975,7 @@ def _reverse_reachable_temporary_nodes(
                 edge.source,
                 node_map,
                 environment=environment,
+                unclassified_intermediates=unclassified_intermediates,
             )
             and edge.source not in reachable
         )
@@ -911,6 +990,7 @@ def _acyclic_path_counts(
     topological_order: tuple[str, ...],
     *,
     environment: str | None = None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> dict[tuple[str, str], int]:
     counts: dict[tuple[str, str], int] = {}
     for start in formal_starts:
@@ -922,6 +1002,7 @@ def _acyclic_path_counts(
                 edge.target,
                 node_map,
                 environment=environment,
+                unclassified_intermediates=unclassified_intermediates,
             ):
                 temporary_counts[edge.target] = temporary_counts.get(edge.target, 0) + 1
                 continue
@@ -944,6 +1025,7 @@ def _acyclic_path_counts(
                     edge.target,
                     node_map,
                     environment=environment,
+                    unclassified_intermediates=unclassified_intermediates,
                 ):
                     temporary_counts[edge.target] = (
                         temporary_counts.get(edge.target, 0) + current_count
@@ -969,6 +1051,7 @@ def _sample_acyclic_paths(
     max_paths: int,
     *,
     environment: str | None = None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> Iterator[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]]]:
     """Yield a deterministic bounded sample without traversing every path."""
 
@@ -986,6 +1069,7 @@ def _sample_acyclic_paths(
                 next_node,
                 node_map,
                 environment=environment,
+                unclassified_intermediates=unclassified_intermediates,
             ):
                 if next_node not in relevant_temporary_nodes or next_node in path:
                     continue
@@ -1032,13 +1116,19 @@ def _collapse_acyclic_dag_to_edges(
     """
 
     node_map = _node_map(dag)
-    adjacency = _build_adjacency(dag.edges, node_map)
+    unclassified_intermediates = _unclassified_formal_intermediates(dag)
+    adjacency = _build_adjacency(
+        dag.edges,
+        node_map,
+        unclassified_intermediates=unclassified_intermediates,
+    )
     environment = dag.program_source.environment
     topological_order = _temporary_topological_order(
         included_nodes,
         node_map,
         adjacency,
         environment=environment,
+        unclassified_intermediates=unclassified_intermediates,
     )
     if topological_order is None:
         return None
@@ -1055,6 +1145,7 @@ def _collapse_acyclic_dag_to_edges(
         adjacency,
         topological_order,
         environment=environment,
+        unclassified_intermediates=unclassified_intermediates,
     )
     if not path_counts:
         return ()
@@ -1096,6 +1187,7 @@ def _collapse_acyclic_dag_to_edges(
                 node_map,
                 adjacency,
                 environment=environment,
+                unclassified_intermediates=unclassified_intermediates,
             )
             forward_cache[source_table] = forward_nodes
         backward_nodes = backward_cache.get(target_table)
@@ -1106,6 +1198,7 @@ def _collapse_acyclic_dag_to_edges(
                 node_map,
                 reverse_adjacency,
                 environment=environment,
+                unclassified_intermediates=unclassified_intermediates,
             )
             backward_cache[target_table] = backward_nodes
         relevant_temporary_nodes = forward_nodes & backward_nodes
@@ -1121,7 +1214,11 @@ def _collapse_acyclic_dag_to_edges(
                     or edge.target in relevant_temporary_nodes
                 ):
                     relevant_edges.append(edge)
-        accumulator.add_graph_summary(relevant_edges, relevant_temporary_nodes)
+        accumulator.add_graph_summary(
+            relevant_edges,
+            relevant_temporary_nodes,
+            unclassified_intermediates=unclassified_intermediates,
+        )
 
         for path, physical_edges in _sample_acyclic_paths(
             source_table,
@@ -1132,8 +1229,14 @@ def _collapse_acyclic_dag_to_edges(
             adjacency,
             MAX_PHYSICAL_PATHS,
             environment=environment,
+            unclassified_intermediates=unclassified_intermediates,
         ):
-            accumulator.add_path(path, physical_edges, count=False)
+            accumulator.add_path(
+                path,
+                physical_edges,
+                count=False,
+                unclassified_intermediates=unclassified_intermediates,
+            )
         grouped[identity] = accumulator
 
     materialized_edges = []
@@ -1185,6 +1288,7 @@ def _path_evidence(
     physical_edges: tuple[PhysicalEdge, ...],
     *,
     edge_summary_cache: dict[int, dict[str, object]] | None = None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> dict[str, object]:
     _record_metric("path_evidence_calls")
     edge_records = []
@@ -1193,18 +1297,26 @@ def _path_evidence(
             edge_records.append(_physical_edge_summary(edge))
             continue
         edge_records.append(_cached_physical_edge_summary(edge, edge_summary_cache))
-    # Keep explicit temporary intermediates and registered DLO/DWO
-    # intermediates separate in evidence.  A path produced by this module only
-    # contains collapsible intermediates, so an intermediate that is not
-    # registered DLO/DWO carries explicit temporary evidence
-    # (CREATE TEMP/TEMPORARY TABLE); naming is never consulted.
+    # Keep explicit temporary intermediates, registered DLO/DWO technical
+    # intermediates and program-local UNCLASSIFIED_FORMAL intermediates
+    # separate in evidence.  A path produced by this module only contains
+    # collapsible intermediates; classification comes from Physical DAG facts
+    # and degree roles, never from naming.
     intermediate_nodes = set(path[1:-1])
+    unclassified_nodes = sorted(
+        node for node in intermediate_nodes if node in unclassified_intermediates
+    )
+    unclassified_node_set = set(unclassified_nodes)
     technical_nodes = sorted(
-        node for node in intermediate_nodes if is_technical_asset(node)
+        node
+        for node in intermediate_nodes
+        if node not in unclassified_node_set and is_technical_asset(node)
     )
     technical_node_set = set(technical_nodes)
     tmp_nodes = sorted(
-        node for node in intermediate_nodes if node not in technical_node_set
+        node
+        for node in intermediate_nodes
+        if node not in unclassified_node_set and node not in technical_node_set
     )
     return {
         "nodes": list(path),
@@ -1212,15 +1324,22 @@ def _path_evidence(
         "physical_edges": edge_records,
         "collapsed_tmp_nodes": tmp_nodes,
         "collapsed_technical_nodes": technical_nodes,
+        "collapsed_unclassified_formal_nodes": unclassified_nodes,
     }
 
 
 def _edge_evidence(
     paths: Iterable[tuple[tuple[str, ...], tuple[PhysicalEdge, ...]]],
+    *,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> dict[str, object]:
     accumulator = _EdgeEvidenceAccumulator()
     for path, physical_edges in paths:
-        accumulator.add_path(path, physical_edges)
+        accumulator.add_path(
+            path,
+            physical_edges,
+            unclassified_intermediates=unclassified_intermediates,
+        )
     return accumulator.finalize()
 
 
@@ -1232,6 +1351,7 @@ def _lineage_edge_from_path(
     batch_id: str,
     observed_at: datetime,
     job_key: str | None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> LineageEdge:
     source = dag.program_source
     return LineageEdge(
@@ -1247,7 +1367,10 @@ def _lineage_edge_from_path(
         observed_at=observed_at,
         updated_at=observed_at,
         is_active=True,
-        evidence=_edge_evidence(((path, physical_edges),)),
+        evidence=_edge_evidence(
+            ((path, physical_edges),),
+            unclassified_intermediates=unclassified_intermediates,
+        ),
     )
 
 
@@ -1275,6 +1398,7 @@ def _collapse_paths_to_edges(
     batch_id: str,
     observed_at: datetime,
     job_key: str | None,
+    unclassified_intermediates: AbstractSet[str] = frozenset(),
 ) -> tuple[LineageEdge, ...]:
     source = dag.program_source
     node_map = _node_map(dag)
@@ -1301,7 +1425,11 @@ def _collapse_paths_to_edges(
         if accumulator is None:
             accumulator = _EdgeEvidenceAccumulator()
             grouped[identity] = accumulator
-        accumulator.add_path(path, physical_edges)
+        accumulator.add_path(
+            path,
+            physical_edges,
+            unclassified_intermediates=unclassified_intermediates,
+        )
 
     materialized_edges = []
     for identity, accumulator in grouped.items():
@@ -1466,6 +1594,7 @@ def materialize_program(
             batch_id=resolved_batch_id,
             observed_at=resolved_observed_at,
             job_key=normalized_job_key,
+            unclassified_intermediates=_unclassified_formal_intermediates(dag),
         )
     else:
         edges = acyclic_edges

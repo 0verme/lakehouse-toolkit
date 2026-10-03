@@ -34,6 +34,12 @@ from shared.lineage.physical_dag import (
     ProgramPhysicalDAG,
     build_program_physical_dag,
 )
+from tests.fixtures.lineage.issue162_unclassified_formal_programs import (
+    MIXED_UNCLASSIFIED_INTERMEDIATE_AND_SOURCE_PROGRAM,
+    MULTI_LEVEL_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    UNCLASSIFIED_FORMAL_SINK_PROGRAM,
+    UNCLASSIFIED_FORMAL_SOURCE_PROGRAM,
+)
 from tests.fixtures.lineage.phase4_audit_programs import (  # pyright: ignore[reportMissingImports]
     CYCLE_PROGRAM,
     FORMAL_INTERMEDIATE_PROGRAM,
@@ -859,6 +865,119 @@ class LineageAuditTests(unittest.TestCase):
 
         self.assertEqual(issue_signature(from_function), issue_signature(from_facade))
         self.assertEqual(issue_signature(from_function), issue_signature(from_callable))
+
+
+class UnclassifiedFormalAuditTests(unittest.TestCase):
+    """Issue #162：unclassified formal boundary blocker 的 audit 事实。"""
+
+    def test_intermediate_does_not_create_boundary_issue(self):
+        result = audit_program_physical_dag(
+            build_dag(
+                MULTI_LEVEL_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+                expected_target="DWD.DEMO_B",
+            )
+        )
+
+        self.assertEqual(result.issues, ())
+
+    def test_source_only_boundary_reports_explicit_issue(self):
+        result = audit_program_physical_dag(
+            build_dag(
+                UNCLASSIFIED_FORMAL_SOURCE_PROGRAM,
+                expected_target="DWUPRR.DEMO_HIS",
+            )
+        )
+
+        self.assertEqual(result.issue_types, (IssueType.UNCLASSIFIED_FORMAL_SOURCE,))
+        issue = issue_of(result, IssueType.UNCLASSIFIED_FORMAL_SOURCE)
+        self.assertEqual(issue.node_key, "DEMO_LEGACY_SOURCE")
+        self.assertEqual(issue.severity, "MEDIUM")
+        self.assertEqual(issue.rule_version, AUDIT_RULE_VERSION)
+        evidence = evidence_of(issue)
+        self.assertEqual(evidence["role"], "SOURCE_ONLY")
+        self.assertEqual(evidence["boundary_side"], "source")
+        self.assertEqual(evidence["in_degree"], 0)
+        self.assertEqual(evidence["out_degree"], 1)
+        self.assertEqual(evidence["node_kind"], "formal_asset")
+
+    def test_sink_only_boundary_reports_explicit_issue(self):
+        result = audit_program_physical_dag(
+            build_dag(
+                UNCLASSIFIED_FORMAL_SINK_PROGRAM,
+                expected_target=None,
+            )
+        )
+
+        self.assertEqual(result.issue_types, (IssueType.UNCLASSIFIED_FORMAL_SINK,))
+        issue = issue_of(result, IssueType.UNCLASSIFIED_FORMAL_SINK)
+        self.assertEqual(issue.node_key, "DEMO_UNMAPPED_SINK")
+        evidence = evidence_of(issue)
+        self.assertEqual(evidence["role"], "SINK_ONLY")
+        self.assertEqual(evidence["boundary_side"], "sink")
+        self.assertEqual(evidence["in_degree"], 1)
+        self.assertEqual(evidence["out_degree"], 0)
+
+    def test_source_only_without_business_boundary_has_no_issue(self):
+        # 只有未分类节点、没有 Business Asset 时，不猜测 schema，也不报告
+        # boundary blocker；这与现有 TMP-only 审计语义一致。
+        source = ProgramSource(
+            environment="DEV",
+            source_profile="fixture",
+            program_name="DEMO_PROGRAM_UNCLASSIFIED_ONLY",
+            script_code="INSERT INTO DEMO_ONLY_SINK SELECT * FROM DEMO_ONLY_SOURCE",
+            expected_target=None,
+        )
+        result = audit_program_physical_dag(build_program_physical_dag(source))
+
+        self.assertEqual(result.issues, ())
+
+    def test_boundary_issue_stable_key_is_node_scoped(self):
+        first = compute_lineage_issue_stable_key(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            IssueType.UNCLASSIFIED_FORMAL_SOURCE,
+            node_key="DEMO_SOURCE_A",
+        )
+        second = compute_lineage_issue_stable_key(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            IssueType.UNCLASSIFIED_FORMAL_SOURCE,
+            node_key="DEMO_SOURCE_B",
+        )
+        third = compute_lineage_issue_stable_key(
+            "DEV",
+            "fixture",
+            "DEMO_PROGRAM",
+            IssueType.UNCLASSIFIED_FORMAL_SOURCE,
+            node_key="DEMO_SOURCE_A",
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, third)
+
+    def test_default_severity_policy_covers_new_boundary_types(self):
+        self.assertEqual(
+            issue_severity(IssueType.UNCLASSIFIED_FORMAL_SOURCE),
+            "MEDIUM",
+        )
+        self.assertEqual(
+            issue_severity(IssueType.UNCLASSIFIED_FORMAL_SINK),
+            "MEDIUM",
+        )
+
+    def test_mixed_program_reports_only_unprovable_boundary(self):
+        result = audit_program_physical_dag(
+            build_dag(
+                MIXED_UNCLASSIFIED_INTERMEDIATE_AND_SOURCE_PROGRAM,
+                expected_target="DWD.DEMO_B",
+            )
+        )
+
+        self.assertEqual(result.issue_types, (IssueType.UNCLASSIFIED_FORMAL_SOURCE,))
+        issue = issue_of(result, IssueType.UNCLASSIFIED_FORMAL_SOURCE)
+        self.assertEqual(issue.node_key, "DEMO_LEGACY_SOURCE")
 
 
 if __name__ == "__main__":

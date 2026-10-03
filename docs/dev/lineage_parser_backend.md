@@ -127,7 +127,10 @@ Materialization 链路。
 
 Legacy adapter 的 compare contract 从 `legacy-parser-v2-relation-context` bump 到
 `legacy-parser-v3-static-empty-query`。`LINEAGE_PIPELINE_VERSION` 当前为
-`lineage-pipeline-v13-static-empty-query`。v13 使恒假 Query Block 的 source 不再进入已持久化
+`lineage-pipeline-v14-unclassified-formal-boundary`。v14 将 degree 证明的 program-local
+未分类 formal intermediate 纳入既有 Physical DAG path collapse，并为 source/sink
+boundary 新增 blocker issue；同 source hash 的 v13 facts 必须完整 rebuild。v13 使恒假
+Query Block 的 source 不再进入已持久化
 Physical/Business lineage，同时保留现有 Audit lifecycle issue；同 source hash 的 v12 facts
 必须完整 rebuild。Issue #121 将 `TMP` / `TEMP` / `STG` /
 `TEST` 命名从 temporary classification 中移除、收口 `005` Program Inventory，并明确

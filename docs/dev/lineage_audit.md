@@ -53,7 +53,7 @@ adjacency 都是调用期间建立的内部索引，PhysicalEdge 的方向仍然
 
 ## 当前 IssueType
 
-当前 `IssueType` 枚举共有八类。`ProgramLineageAuditor` 直接生成七类；
+当前 `IssueType` 枚举共有十类。`ProgramLineageAuditor` 直接生成九类；
 `LINEAGE_BRANCH_BROKEN` 是现有 evolution/history transition 在旧分支曾到达
 expected target、当前变成 orphan 时生成的派生 issue，不是本次 Audit detector 新增的
 规则：
@@ -67,7 +67,16 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 | `CYCLE_DETECTED` | 一个多节点 strongly connected component（SCC） | `HIGH` |
 | `SELF_REFERENCE` | 存在 `A → A` 的 PhysicalEdge | `HIGH` |
 | `STATIC_EMPTY_QUERY` | SELECT Query Block 的 predicate 可被静态证明恒假；source 不计入数据血缘，最小定位证据进入 `lineage_issue` | `MEDIUM` |
+| `UNCLASSIFIED_FORMAL_SOURCE` | 未分类 formal 节点只有 outgoing edge（`in_degree == 0`、`out_degree > 0`）且能到达 Business Asset；不能猜 schema 或映射 business source | `MEDIUM` |
+| `UNCLASSIFIED_FORMAL_SINK` | 未分类 formal 节点只有 incoming edge（`in_degree > 0`、`out_degree == 0`）且从 Business Asset 可达；不能猜 schema 或映射 business target | `MEDIUM` |
 | `LINEAGE_BRANCH_BROKEN` | 既有有效 target 分支在后续 snapshot 中断裂，由 evolution/history 派生 | `HIGH` |
+
+`UNCLASSIFIED_FORMAL_SOURCE` / `UNCLASSIFIED_FORMAL_SINK` 只描述**未分类 formal
+boundary blocker**：节点既不是 Business Asset、也不是 DLO/DWO technical asset、且没有
+显式 temporary evidence。它不把无 schema 名称猜成 `DWF` / `DWD` / `ODS` / `DWUPRR`，
+也不产生伪 lineage。`in_degree > 0 and out_degree > 0` 的 program-local
+intermediate 不是 blocker：它由 materialization 沿真实 Physical DAG 路径折叠，不在
+Audit 中产生 issue。
 
 默认 severity 由兼容用的 `ISSUE_SEVERITY_POLICY` 集中定义，并通过
 `AuditPolicy` / `issue_severity()` 查询；它不是 detector fact。不同 policy 可以
