@@ -257,6 +257,35 @@ SQL active batch 发布后必须重跑 suppression
 详细 v1 判定范围、Issue lifecycle 和 DEV214 顺序见
 [`lineage_static_empty_query.md`](lineage_static_empty_query.md)。
 
+### v14：UNCLASSIFIED_FORMAL program-local intermediate 与 boundary blocker（Issue #162）
+
+`LINEAGE_PIPELINE_VERSION` bump 为 `lineage-pipeline-v14-unclassified-formal-boundary`。
+Materialization 现在会把同一 Physical DAG 中 `in_degree > 0 and out_degree > 0` 的未分类
+formal 节点作为 program-local intermediate，沿真实 Physical DAG 路径折叠并生成
+Business → Business edge；Physical DAG 本身保留这些节点，evidence 新增
+`collapsed_unclassified_formal_nodes`。`SOURCE_ONLY` / `SINK_ONLY` 的未分类 formal
+boundary 不猜 schema、不生成伪 lineage，由 Audit 新增
+`UNCLASSIFIED_FORMAL_SOURCE` / `UNCLASSIFIED_FORMAL_SINK` 记录 blocker。
+
+| DWS 对象 | 是否受影响 | 原因 |
+| --- | --- | --- |
+| `dwp.lineage_program_state` | 更新 version | 同 source hash 的 v13 state 会被判定为 CHANGED 并重建 |
+| `dwp.lineage_edge` / `dwp.lineage_business_edge` | **受影响** | 新增可折叠路径会新增 Business direct edge；Physical rows 不变 |
+| `dwp.lineage_issue` | **受影响** | 新的 boundary blocker facts 随完整 batch materialize；旧 issue lifecycle 由现有机制处理 |
+| `dwp.lineage_schedule_edge` | 不受影响 | Schedule parser/materialization 与 SQL Physical DAG 独立 |
+| `dwp.lineage_reconciliation_suppression` | **必须重跑** | suppression 读取 active SQL snapshots，新 SQL edge set 可能改变差异分类 |
+
+```text
+必须完整重跑 SQL lineage；不要使用 --limit
+Schedule lineage 不必重跑
+SQL active batch 发布后必须重跑 suppression
+```
+
+详细 collapse 安全边界、evidence contract 与 blocker issue 见
+[`lineage_materialization.md`](lineage_materialization.md)、
+[`lineage_audit.md`](lineage_audit.md) 和
+[`lineage_business_asset_boundary.md`](lineage_business_asset_boundary.md)。
+
 ## 6. 回归覆盖
 
 | 场景 | 测试 |
@@ -267,6 +296,9 @@ SQL active batch 发布后必须重跑 suppression
 | `001` / unknown prefix 被忽略 | `test_program_inventory_ignores_non_005_prefix_without_failing`、`test_non_005_inventory_prefix_does_not_block_suppression` |
 | malformed `005` fail-open | `test_program_inventory_malformed_005_target_fails_open`、`test_malformed_005_inventory_target_fails_open_with_cause` |
 | 005 + 非 005 混合 | `test_mixed_005_and_non_005_inventory_keeps_only_005_targets` |
+| UNCLASSIFIED_FORMAL intermediate 折叠 | `tests/shared/test_lineage_materialization.py::UnclassifiedFormalMaterializationTests` |
+| UNCLASSIFIED_FORMAL boundary blocker | `tests/shared/test_lineage_audit.py::UnclassifiedFormalAuditTests` |
+| NO_LINEAGE_EDGE coverage 分类 | `tests/shared/test_lineage_coverage.py::test_unclassified_intermediate_program_recovers_lineage_edge` |
 | 有/无 005 支撑的 TMP source suppression | `test_tmp_named_source_with_active_005_program_is_not_suppressed`、`test_tmp_named_source_without_005_program_follows_normal_rule` |
 | 多结果表 / program-SQL mismatch | `test_multi_result_sql_keeps_only_005_declared_program_result`、`test_program_sql_mismatch_keeps_005_authority` |
 | DLO / DWO 边界与 bypass edge | `tests/shared/test_lineage_materialization.py::test_dlo_dwo_edges_are_excluded_without_bypass_edge` |

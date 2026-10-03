@@ -85,6 +85,7 @@ from .domain import (
     ProgramSource,
     ProgramState,
     TemporaryAssetRule,
+    UnclassifiedFormalRole,
     canonicalize_dataset_name,
     canonicalize_schema,
     canonicalize_table,
@@ -104,6 +105,7 @@ from .domain import (
     normalize_program_inventory_target,
     parse_declared_primary_target,
     parse_program_name,
+    unclassified_formal_node_roles,
 )
 from .environment_scope import (
     DISABLED_LINEAGE_ENVIRONMENT,
@@ -369,6 +371,7 @@ __all__ = [
     "ProgramState",
     "SQLStep",
     "TemporaryAssetRule",
+    "UnclassifiedFormalRole",
     "canonicalize_dataset_name",
     "canonicalize_schema",
     "canonicalize_table",
@@ -391,6 +394,7 @@ __all__ = [
     "normalize_program_inventory_target",
     "parse_declared_primary_target",
     "parse_program_name",
+    "unclassified_formal_node_roles",
     "audit_program_physical_dag",
     "select_materialization_target",
     "build_physical_dag",

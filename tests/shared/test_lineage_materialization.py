@@ -37,6 +37,17 @@ from shared.lineage.physical_dag import (
     ProgramPhysicalDAG,
     build_program_physical_dag,
 )
+from tests.fixtures.lineage.issue162_unclassified_formal_programs import (
+    CYCLE_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    DISJOINT_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    FAN_IN_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    FAN_OUT_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    MIXED_UNCLASSIFIED_INTERMEDIATE_AND_SOURCE_PROGRAM,
+    MULTI_LEVEL_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    SINGLE_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    UNCLASSIFIED_FORMAL_SINK_PROGRAM,
+    UNCLASSIFIED_FORMAL_SOURCE_PROGRAM,
+)
 from tests.fixtures.lineage.pathological_materialization import (
     make_dense_pathological_dag,
     make_diamond_dag,
@@ -1703,6 +1714,238 @@ class SQLiteMaterializationTests(unittest.TestCase):
                 store.publish(invalid_batch)
             self.assertEqual(store.get_active_batch_id(), "batch-018")
             self.assertEqual(store.read_edges(batch_id="batch-019"), ())
+
+
+class UnclassifiedFormalMaterializationTests(unittest.TestCase):
+    """Issue #162：只有 degree 证明的 program-local intermediate 才可折叠。"""
+
+    def test_single_unclassified_intermediate_collapses_to_business_edge(self):
+        dag = build_dag(
+            SINGLE_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+            expected_target="DWD.DEMO_B",
+        )
+        physical_pairs = set(dag.edge_pairs)
+        result = materialize_program(
+            dag,
+            batch_id="batch-unclassified-single",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            physical_pairs,
+            {
+                ("DWF.DEMO_A", "DEMO_STAGE_ALPHA"),
+                ("DEMO_STAGE_ALPHA", "DWD.DEMO_B"),
+            },
+        )
+        self.assertEqual(set(dag.edge_pairs), physical_pairs)
+        self.assertEqual(edge_pairs(result), {("DWF.DEMO_A", "DWD.DEMO_B")})
+        self.assertEqual(result.issues, ())
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        physical_paths = evidence_items(evidence, "physical_paths")
+        self.assertEqual(
+            physical_paths[0]["nodes"],
+            ["DWF.DEMO_A", "DEMO_STAGE_ALPHA", "DWD.DEMO_B"],
+        )
+        self.assertEqual(
+            evidence["collapsed_unclassified_formal_nodes"],
+            ["DEMO_STAGE_ALPHA"],
+        )
+        self.assertEqual(evidence["collapsed_tmp_nodes"], [])
+        self.assertEqual(evidence["collapsed_technical_nodes"], [])
+        self.assertEqual(evidence["path_count"], 1)
+
+    def test_multi_level_unclassified_intermediates_keep_evidence(self):
+        result = materialize_program(
+            build_dag(
+                MULTI_LEVEL_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+                expected_target="DWD.DEMO_B",
+            ),
+            batch_id="batch-unclassified-multi",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(edge_pairs(result), {("DWF.DEMO_A", "DWD.DEMO_B")})
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        self.assertEqual(
+            evidence["collapsed_unclassified_formal_nodes"],
+            ["DEMO_STAGE_ALPHA", "DEMO_STAGE_BETA"],
+        )
+        physical_paths = evidence_items(evidence, "physical_paths")
+        self.assertEqual(
+            physical_paths[0]["nodes"],
+            [
+                "DWF.DEMO_A",
+                "DEMO_STAGE_ALPHA",
+                "DEMO_STAGE_BETA",
+                "DWD.DEMO_B",
+            ],
+        )
+
+    def test_fan_in_uses_real_paths_without_cartesian_edges(self):
+        result = materialize_program(
+            build_dag(
+                FAN_IN_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+                expected_target="DWD.DEMO_B",
+            ),
+            batch_id="batch-unclassified-fanin",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            edge_pairs(result),
+            {
+                ("DWF.DEMO_A1", "DWD.DEMO_B"),
+                ("DWF.DEMO_A2", "DWD.DEMO_B"),
+            },
+        )
+        for edge in result.edges:
+            evidence = cast(dict[str, object], edge.evidence)
+            self.assertEqual(
+                evidence["collapsed_unclassified_formal_nodes"],
+                ["DEMO_STAGE_ALPHA", "DEMO_STAGE_BETA"],
+            )
+            self.assertEqual(evidence["path_count"], 1)
+
+    def test_fan_out_uses_real_paths_without_cartesian_edges(self):
+        result = materialize_program(
+            build_dag(
+                FAN_OUT_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+                expected_target=None,
+            ),
+            batch_id="batch-unclassified-fanout",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            edge_pairs(result),
+            {
+                ("DWF.DEMO_A", "DWD.DEMO_B1"),
+                ("DWF.DEMO_A", "DWD.DEMO_B2"),
+            },
+        )
+        for edge in result.edges:
+            evidence = cast(dict[str, object], edge.evidence)
+            self.assertEqual(evidence["path_count"], 1)
+
+    def test_disjoint_intermediates_do_not_create_cross_edges(self):
+        result = materialize_program(
+            build_dag(
+                DISJOINT_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+                expected_target=None,
+            ),
+            batch_id="batch-unclassified-disjoint",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(
+            edge_pairs(result),
+            {
+                ("DWF.DEMO_A1", "DWD.DEMO_B1"),
+                ("DWF.DEMO_A2", "DWD.DEMO_B2"),
+            },
+        )
+        self.assertNotIn(("DWF.DEMO_A1", "DWD.DEMO_B2"), edge_pairs(result))
+        self.assertNotIn(("DWF.DEMO_A2", "DWD.DEMO_B1"), edge_pairs(result))
+
+    def test_source_only_unclassified_does_not_materialize_or_guess_schema(self):
+        dag = build_dag(
+            UNCLASSIFIED_FORMAL_SOURCE_PROGRAM,
+            expected_target="DWUPRR.DEMO_HIS",
+        )
+        result = materialize_program(
+            dag,
+            batch_id="batch-unclassified-source",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(result.edges, ())
+        issue = issue_of(result.issues, IssueType.UNCLASSIFIED_FORMAL_SOURCE)
+        self.assertEqual(issue.node_key, "DEMO_LEGACY_SOURCE")
+        self.assertEqual(issue.severity, "MEDIUM")
+        evidence = cast(dict[str, object], issue.evidence)
+        self.assertEqual(evidence["role"], "SOURCE_ONLY")
+        self.assertEqual(evidence["in_degree"], 0)
+        self.assertEqual(evidence["out_degree"], 1)
+        self.assertNotIn(IssueType.TARGET_NOT_FOUND, result.audit.issue_types)
+        self.assertNotIn(IssueType.TARGET_MISMATCH, result.audit.issue_types)
+
+    def test_sink_only_unclassified_is_a_blocker(self):
+        dag = build_dag(
+            UNCLASSIFIED_FORMAL_SINK_PROGRAM,
+            expected_target=None,
+        )
+        result = materialize_program(
+            dag,
+            batch_id="batch-unclassified-sink",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(result.edges, ())
+        issue = issue_of(result.issues, IssueType.UNCLASSIFIED_FORMAL_SINK)
+        self.assertEqual(issue.node_key, "DEMO_UNMAPPED_SINK")
+        evidence = cast(dict[str, object], issue.evidence)
+        self.assertEqual(evidence["role"], "SINK_ONLY")
+        self.assertEqual(evidence["in_degree"], 1)
+        self.assertEqual(evidence["out_degree"], 0)
+
+    def test_mixed_program_collapses_only_provable_intermediate(self):
+        result = materialize_program(
+            build_dag(
+                MIXED_UNCLASSIFIED_INTERMEDIATE_AND_SOURCE_PROGRAM,
+                expected_target="DWD.DEMO_B",
+            ),
+            batch_id="batch-unclassified-mixed",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(edge_pairs(result), {("DWF.DEMO_A", "DWD.DEMO_B")})
+        self.assertNotIn(
+            "DEMO_LEGACY_SOURCE",
+            {edge.source_table for edge in result.edges},
+        )
+        issue = issue_of(result.issues, IssueType.UNCLASSIFIED_FORMAL_SOURCE)
+        self.assertEqual(issue.node_key, "DEMO_LEGACY_SOURCE")
+        self.assertEqual(
+            set(result.audit.issue_types),
+            {IssueType.UNCLASSIFIED_FORMAL_SOURCE},
+        )
+
+    def test_unclassified_intermediate_cycle_keeps_existing_fallback_semantics(self):
+        result = materialize_program(
+            build_dag(
+                CYCLE_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+                expected_target="DWD.DEMO_B",
+            ),
+            batch_id="batch-unclassified-cycle",
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual(edge_pairs(result), {("DWF.DEMO_A", "DWD.DEMO_B")})
+        self.assertIn(IssueType.CYCLE_DETECTED, result.audit.issue_types)
+        evidence = cast(dict[str, object], result.edges[0].evidence)
+        self.assertEqual(
+            evidence["collapsed_unclassified_formal_nodes"],
+            ["DEMO_STAGE_ALPHA", "DEMO_STAGE_BETA"],
+        )
+
+    def test_unclassified_intermediate_evidence_is_deterministic(self):
+        dag = build_dag(
+            MULTI_LEVEL_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+            expected_target="DWD.DEMO_B",
+        )
+        first = materialize_program(
+            dag,
+            batch_id="batch-unclassified-deterministic",
+            observed_at=OBSERVED_AT,
+        )
+        second = materialize_program(
+            dag,
+            batch_id="batch-unclassified-deterministic",
+            observed_at=OBSERVED_AT,
+        )
+        self.assertEqual(first.edges, second.edges)
+        self.assertEqual(first.issues, second.issues)
 
 
 class CrontabMaterializationTests(unittest.TestCase):

@@ -23,13 +23,15 @@ from shared.lineage.domain import (
     PhysicalEdge,
     PhysicalNode,
     PhysicalNodeKind,
+    UnclassifiedFormalRole,
     is_business_asset,
     is_technical_asset,
+    unclassified_formal_node_roles,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
 
-AUDIT_RULE_VERSION = "audit-rule-v2-static-empty-query"
-AUDIT_POLICY_VERSION = "audit-policy-v2-static-empty-query"
+AUDIT_RULE_VERSION = "audit-rule-v3-unclassified-formal-boundary"
+AUDIT_POLICY_VERSION = "audit-policy-v3-unclassified-formal-boundary"
 
 ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
     {
@@ -41,6 +43,8 @@ ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
         IssueType.LINEAGE_BRANCH_BROKEN: "HIGH",
         IssueType.MULTI_SINK_CANDIDATE: "MEDIUM",
         IssueType.STATIC_EMPTY_QUERY: "MEDIUM",
+        IssueType.UNCLASSIFIED_FORMAL_SOURCE: "MEDIUM",
+        IssueType.UNCLASSIFIED_FORMAL_SINK: "MEDIUM",
     }
 )
 
@@ -828,6 +832,42 @@ def _reverse_reachable(
     return reachable
 
 
+def _reachable_from_sources(
+    starts: Iterable[str],
+    forward: Mapping[str, tuple[str, ...]],
+) -> set[str]:
+    """返回从任一 start 沿 forward edges 可达的节点集合。"""
+
+    reachable = set(starts)
+    pending = list(reachable)
+    while pending:
+        current = pending.pop()
+        for target in forward.get(current, ()):
+            if target in reachable:
+                continue
+            reachable.add(target)
+            pending.append(target)
+    return reachable
+
+
+def _can_reach_targets(
+    targets: Iterable[str],
+    reverse: Mapping[str, tuple[PhysicalEdge, ...]],
+) -> set[str]:
+    """返回能到达任一 target 的节点集合。"""
+
+    reachable = set(targets)
+    pending = list(reachable)
+    while pending:
+        current = pending.pop()
+        for edge in reverse.get(current, ()):
+            if edge.source in reachable:
+                continue
+            reachable.add(edge.source)
+            pending.append(edge.source)
+    return reachable
+
+
 def _strongly_connected_components(
     nodes: Iterable[str],
     forward: Mapping[str, tuple[str, ...]],
@@ -933,6 +973,21 @@ def _is_business_sink(
     return is_business_asset(asset_name, environment=environment)
 
 
+def _is_business_node(
+    node_key: str,
+    node_map: Mapping[str, PhysicalNode],
+    *,
+    environment: str,
+) -> bool:
+    """Business boundary 节点；显式 temporary 节点即使命名像业务表也不算。"""
+
+    node = node_map.get(node_key)
+    if node is not None and node.kind is PhysicalNodeKind.TEMPORARY_ASSET:
+        return False
+    asset_name = node.asset_name if node is not None else node_key
+    return is_business_asset(asset_name, environment=environment)
+
+
 def _is_technical_sink(
     sink: str,
     node_map: Mapping[str, PhysicalNode],
@@ -977,7 +1032,12 @@ def compute_lineage_issue_stable_key(
     ):
         identity["scope"] = "branch"
         identity["branch_sink"] = branch_sink
-    elif resolved_type in (IssueType.SELF_REFERENCE, IssueType.STATIC_EMPTY_QUERY):
+    elif resolved_type in (
+        IssueType.SELF_REFERENCE,
+        IssueType.STATIC_EMPTY_QUERY,
+        IssueType.UNCLASSIFIED_FORMAL_SOURCE,
+        IssueType.UNCLASSIFIED_FORMAL_SINK,
+    ):
         identity["scope"] = "node"
         identity["node_key"] = node_key
     elif resolved_type is IssueType.CYCLE_DETECTED:
@@ -1378,6 +1438,68 @@ class ProgramLineageAuditor:
                                 "entry_sources": list(entry_sources),
                                 "branch_roots": list(entry_sources),
                                 "branch_node_kinds": branch_node_kinds,
+                            },
+                        )
+                    )
+
+        unclassified_roles = unclassified_formal_node_roles(
+            dag.nodes,
+            edges,
+            environment=dag.program_source.environment,
+        )
+        if unclassified_roles:
+            business_nodes = tuple(
+                sorted(
+                    node
+                    for node in graph_nodes
+                    if _is_business_node(
+                        node,
+                        node_map,
+                        environment=dag.program_source.environment,
+                    )
+                )
+            )
+            if business_nodes:
+                upstream_business_reachable = _can_reach_targets(
+                    business_nodes,
+                    reverse,
+                )
+                downstream_business_reachable = _reachable_from_sources(
+                    business_nodes,
+                    forward,
+                )
+                for node_key in sorted(unclassified_roles):
+                    role = unclassified_roles[node_key]
+                    if role is UnclassifiedFormalRole.SOURCE_ONLY:
+                        if node_key not in upstream_business_reachable:
+                            continue
+                        issue_type = IssueType.UNCLASSIFIED_FORMAL_SOURCE
+                        boundary_side = "source"
+                    elif role is UnclassifiedFormalRole.SINK_ONLY:
+                        if node_key not in downstream_business_reachable:
+                            continue
+                        issue_type = IssueType.UNCLASSIFIED_FORMAL_SINK
+                        boundary_side = "sink"
+                    else:
+                        continue
+                    facts.append(
+                        _make_fact(
+                            dag,
+                            issue_type,
+                            node_key=node_key,
+                            message=(
+                                f"Program {dag.program_source.program_name} has an "
+                                f"unclassified formal {boundary_side} {node_key} "
+                                "that cannot be mapped to a Business Asset; its "
+                                "path is excluded from business lineage."
+                            ),
+                            evidence={
+                                "node": node_key,
+                                "role": role.value,
+                                "boundary_side": boundary_side,
+                                "in_degree": len(reverse.get(node_key, ())),
+                                "out_degree": len(forward.get(node_key, ())),
+                                "node_kind": _node_kind_value(node_key, node_map),
                             },
                         )
                     )

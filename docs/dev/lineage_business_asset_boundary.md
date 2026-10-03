@@ -63,6 +63,24 @@ sink，则不生成面向 Business Lineage 的 `MULTI_SINK_CANDIDATE`，但 audi
 `SELF_REFERENCE` 仍由 Physical DAG audit 产生，self edge 的 Business Asset 语义和
 原有 evidence 不变。DLO/DWO self-reference 也不会被提升为 Business edge。
 
+### UNCLASSIFIED_FORMAL boundary（Issue #162）
+
+未限定（无法解析为 `schema.table`）或不在 schema registry 中的 formal 节点既不是
+Business Asset，也不是 DLO/DWO technical asset。系统不根据名称猜 schema，也不根据
+`TMP` / `LOCAL` / 序号后缀猜测 temporary 或 business 语义。只按 Physical DAG degree
+区分：
+
+| degree | 处理 |
+| --- | --- |
+| `in_degree > 0 and out_degree > 0` | program-local intermediate；沿真实 Physical DAG 路径 collapse，生成 Business → Business edge，节点保留在 Physical DAG 与 `collapsed_unclassified_formal_nodes` evidence |
+| `in_degree == 0 and out_degree > 0` | source boundary；不猜 schema、不生成伪 lineage，生成 `UNCLASSIFIED_FORMAL_SOURCE` |
+| `in_degree > 0 and out_degree == 0` | sink boundary；不猜 schema、不生成伪 lineage，生成 `UNCLASSIFIED_FORMAL_SINK` |
+| `in_degree == 0 and out_degree == 0` | isolated；不参与 edge，也不生成 boundary blocker |
+
+分叉/汇聚 intermediate 的折叠只基于真实可达路径，不做 predecessors × successors
+笛卡尔积。只有未分类节点、没有 Business Asset 的程序不生成 boundary blocker，也不因此
+被误归类为 `BUSINESS_BOUNDARY_ONLY`。
+
 ## Coverage interpretation
 
 Coverage 同时报告 Physical 和 Business 两条 funnel：

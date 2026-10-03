@@ -18,6 +18,10 @@ from shared.lineage.domain import ProgramSource
 from shared.lineage.evolution import SnapshotScope
 from shared.lineage.materialization import materialize_program
 from shared.lineage.physical_dag import build_program_physical_dag
+from tests.fixtures.lineage.issue162_unclassified_formal_programs import (
+    SINGLE_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+    UNCLASSIFIED_FORMAL_SOURCE_PROGRAM,
+)
 from tests.fixtures.lineage.phase5_materialization_programs import (
     TECHNICAL_TO_DWF_PROGRAM,
 )
@@ -151,6 +155,66 @@ class LineageCoverageTests(unittest.TestCase):
         coverage.observe_materialization(result)
 
         profile = coverage.report(generated_at="2026-01-05T10:11:12+00:00").profiles[0]
+        self.assertEqual(profile.programs_with_business_boundary_only, 0)
+        self.assertEqual(
+            profile.lineage_failure_reasons[CoverageReason.NO_LINEAGE_EDGE.value],
+            1,
+        )
+
+    def test_unclassified_intermediate_program_recovers_lineage_edge(self):
+        source = ProgramSource(
+            environment="ENV_SYNTHETIC",
+            source_profile="profile_unclassified_intermediate",
+            program_name="DEMO_UNCLASSIFIED_INTERMEDIATE",
+            script_code=SINGLE_UNCLASSIFIED_INTERMEDIATE_PROGRAM,
+            expected_target="DWD.DEMO_B",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            audit_program_physical_dag(dag, observed_at=OBSERVED_AT),
+            batch_id="coverage-unclassified-intermediate",
+            observed_at=OBSERVED_AT,
+        )
+        coverage = LineageCoverageAccumulator()
+        coverage.observe_sources([source])
+        coverage.observe_dag(dag, count_program=False)
+        coverage.observe_materialization(result)
+
+        profile = coverage.report(generated_at="2026-01-05T10:11:12+00:00").profiles[0]
+        self.assertEqual(profile.physical_edge_count, 2)
+        self.assertEqual(profile.lineage_edge_count, 1)
+        self.assertEqual(profile.programs_with_lineage_edges, 1)
+        self.assertEqual(profile.programs_with_business_boundary_only, 0)
+        self.assertEqual(
+            profile.lineage_failure_reasons[CoverageReason.NO_LINEAGE_EDGE.value],
+            0,
+        )
+
+    def test_unclassified_source_boundary_stays_a_lineage_failure_with_issue(self):
+        source = ProgramSource(
+            environment="ENV_SYNTHETIC",
+            source_profile="profile_unclassified_source",
+            program_name="DEMO_UNCLASSIFIED_SOURCE",
+            script_code=UNCLASSIFIED_FORMAL_SOURCE_PROGRAM,
+            expected_target="DWUPRR.DEMO_HIS",
+        )
+        dag = build_program_physical_dag(source)
+        result = materialize_program(
+            dag,
+            audit_program_physical_dag(dag, observed_at=OBSERVED_AT),
+            batch_id="coverage-unclassified-source",
+            observed_at=OBSERVED_AT,
+        )
+        self.assertEqual(result.edges, ())
+        self.assertTrue(result.issues)
+        coverage = LineageCoverageAccumulator()
+        coverage.observe_sources([source])
+        coverage.observe_dag(dag, count_program=False)
+        coverage.observe_materialization(result)
+
+        profile = coverage.report(generated_at="2026-01-05T10:11:12+00:00").profiles[0]
+        self.assertEqual(profile.lineage_edge_count, 0)
         self.assertEqual(profile.programs_with_business_boundary_only, 0)
         self.assertEqual(
             profile.lineage_failure_reasons[CoverageReason.NO_LINEAGE_EDGE.value],

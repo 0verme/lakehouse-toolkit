@@ -16,6 +16,7 @@ from shared.lineage.domain import (
     PhysicalNodeKind,
     ProgramNameDiagnostic,
     ProgramSource,
+    UnclassifiedFormalRole,
     expected_processing_order,
     extract_program_declared_target_token,
     extract_program_target_hint,
@@ -28,6 +29,7 @@ from shared.lineage.domain import (
     normalize_declared_target_from_program_name,
     normalize_legacy_program_namespace,
     normalize_program_inventory_target,
+    unclassified_formal_node_roles,
     parse_declared_primary_target,
     parse_program_name,
 )
@@ -609,8 +611,47 @@ class LineageDomainTests(unittest.TestCase):
                 "SELF_REFERENCE",
                 "LINEAGE_BRANCH_BROKEN",
                 "STATIC_EMPTY_QUERY",
+                "UNCLASSIFIED_FORMAL_SOURCE",
+                "UNCLASSIFIED_FORMAL_SINK",
             },
         )
+
+    def test_unclassified_formal_roles_are_degree_based(self):
+        nodes = (
+            PhysicalNode("DEMO_INTERMEDIATE", "DEMO_INTERMEDIATE"),
+            PhysicalNode("DEMO_SOURCE_ONLY", "DEMO_SOURCE_ONLY"),
+            PhysicalNode("DEMO_SINK_ONLY", "DEMO_SINK_ONLY"),
+            PhysicalNode("DEMO_ISOLATED", "DEMO_ISOLATED"),
+            PhysicalNode("DWF.DEMO_BUSINESS", "DWF.DEMO_BUSINESS"),
+            PhysicalNode("DLO.DEMO_TECHNICAL", "DLO.DEMO_TECHNICAL"),
+            PhysicalNode(
+                "DEMO_TEMP",
+                "DEMO_TEMP",
+                PhysicalNodeKind.TEMPORARY_ASSET,
+            ),
+        )
+        edges = (
+            PhysicalEdge("DWF.DEMO_BUSINESS", "DEMO_INTERMEDIATE"),
+            PhysicalEdge("DEMO_SOURCE_ONLY", "DEMO_INTERMEDIATE"),
+            PhysicalEdge("DEMO_INTERMEDIATE", "DEMO_SINK_ONLY"),
+            PhysicalEdge("DLO.DEMO_TECHNICAL", "DEMO_TEMP"),
+        )
+
+        roles = unclassified_formal_node_roles(nodes, edges, environment="DEV")
+
+        self.assertEqual(
+            roles,
+            {
+                "DEMO_INTERMEDIATE": UnclassifiedFormalRole.INTERMEDIATE,
+                "DEMO_ISOLATED": UnclassifiedFormalRole.ISOLATED,
+                "DEMO_SINK_ONLY": UnclassifiedFormalRole.SINK_ONLY,
+                "DEMO_SOURCE_ONLY": UnclassifiedFormalRole.SOURCE_ONLY,
+            },
+        )
+        # business / technical / explicit temporary 节点不会进入结果。
+        self.assertNotIn("DWF.DEMO_BUSINESS", roles)
+        self.assertNotIn("DLO.DEMO_TECHNICAL", roles)
+        self.assertNotIn("DEMO_TEMP", roles)
 
     def test_lineage_issue_preserves_branch_and_lifecycle_fields(self):
         issue = LineageIssue(

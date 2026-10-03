@@ -52,9 +52,13 @@ identity boundary 只 trim surrounding whitespace，保留现有字段大小写�
 
 Parser、Physical DAG、primary target 和 audit 规则的语义版本由代码中的
 `shared.lineage.version.LINEAGE_PIPELINE_VERSION` 显式维护，当前值为
-`lineage-pipeline-v13-static-empty-query`。它不是 Git commit SHA。凡是会改变
+`lineage-pipeline-v14-unclassified-formal-boundary`。它不是 Git commit SHA。凡是会改变
 parser/DAG/audit/materialization 结果的规则升级，都必须在同一变更中把这个 constant
-bump 到新的语义版本，并在本文记录原因。v12 在 v11 上新增 authoritative unqualified
+bump 到新的语义版本，并在本文记录原因。v14 将同一 Physical DAG 中
+`in_degree > 0 and out_degree > 0` 的未分类 formal 节点作为 program-local
+intermediate 折叠，并为 `SOURCE_ONLY` / `SINK_ONLY` boundary 新增
+`UNCLASSIFIED_FORMAL_SOURCE` / `UNCLASSIFIED_FORMAL_SINK` issue；因此所有 v13
+active facts 都必须由完整 SQL snapshot rebuild。v12 在 v11 上新增 authoritative unqualified
 write-target binding：qualified `ProgramSource.resolved_target` 与 unqualified SQL write
 target 只有在 canonical basename 精确一致时才绑定。相同 `source_hash` 在 v11 下可能
 persist 为 `M_YQDKX`、在 v12 下变为 `DWM.M_YQDKX`，所以所有 v11 active facts 都必须经

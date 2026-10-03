@@ -50,7 +50,8 @@ Audit 不修改 Physical DAG，不折叠 TMP，也不决定 `LineageEdge` 是否
 当前 `compute_lineage_issue_stable_key()` 的 identity contract 为：
 
 - program-level：`environment + source_profile + program_name + issue_type`；
-- `SELF_REFERENCE` / `STATIC_EMPTY_QUERY`：再加 `node_key`（恒空查询使用 statement/query-block locator）；
+- `SELF_REFERENCE` / `STATIC_EMPTY_QUERY` / `UNCLASSIFIED_FORMAL_SOURCE` /
+  `UNCLASSIFIED_FORMAL_SINK`：再加 `node_key`（恒空查询使用 statement/query-block locator）；
 - `ORPHAN_BRANCH` / `LINEAGE_BRANCH_BROKEN`：再加 `branch_sink`；
 - `CYCLE_DETECTED`：再加 canonical sorted SCC node set。
 
@@ -136,6 +137,23 @@ statement/query-block index、statement type、target/source identifier、normal
 与 `CONSTANT_FALSE` evaluation，不保存完整 SQL 或 predicate literal。默认置信度为 `HIGH`、
 severity 为 `MEDIUM`、disposition 为 `OPEN`；人工可按现有流程接受/标记，后续完整 snapshot
 不再发现该 block 时沿既有生命周期标记 `RESOLVED`。
+
+## UNCLASSIFIED_FORMAL boundary blocker
+
+`UNCLASSIFIED_FORMAL_SOURCE` / `UNCLASSIFIED_FORMAL_SINK` 是 detector 对**未分类 formal
+boundary** 的只读事实：节点没有显式 temporary evidence，也不在 Business /
+DLO-DWO schema registry 中，因此既不能作为 Business endpoint，也不能被猜成某个
+schema。Detector 只在它参与真实 Business boundary 关系时报告：
+
+- `SOURCE_ONLY`（`in_degree == 0 and out_degree > 0`）且能到达至少一个 Business Asset；
+- `SINK_ONLY`（`in_degree > 0 and out_degree == 0`）且从至少一个 Business Asset 可达。
+
+`in_degree > 0 and out_degree > 0` 的 program-local intermediate 不是 blocker；它由
+materialization 的既有 Physical DAG path collapse 处理。只有未分类节点、没有 Business
+Asset 的程序不报告该 issue，也不猜 schema。Evidence 只包含 `node`、`role`、
+`boundary_side`、`in_degree`、`out_degree` 和 `node_kind`，不包含源码或完整路径。
+`rule_version` / `policy_version` 随 detector 规则 bump 为 v3；stable identity 使用
+`node_key` scope。
 
 ## Golden Corpus boundary
 
