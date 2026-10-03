@@ -39,9 +39,27 @@ DWF matching normalizes history names only for comparison:
 - `DWF.DWF_<LOGICAL>` → `<LOGICAL>`
 - source project/table `DWF_<LOGICAL>` → `<LOGICAL>`
 
-DAP's final `targetTable` uses the canonical source-code form `DWF_<LOGICAL>`; history `F_*` names are never emitted as targets. Program evidence is an exact normalized `ods_job_name` ↔ Python filename match (numeric program prefix, `JOB_`, duplicated leading `DWS_`, and `_DAY`/`_NIGHT` suffix normalized). Logical target is the next evidence; the physical DWO schema match is then verified against `p_schema_config.db_schema`. Any evidence disagreement or unresolved multiplicity is reported as unresolved/conflict, never selected by row order.
+DAP's final `targetTable` uses the canonical source-code form `DWF_<LOGICAL>`; history `F_*` names are never emitted as targets.
 
-DWO table parsing uses the authoritative `db_schema` dictionary and longest exact prefix. For example, `DWO.DWO_DEMO_SCHEMA_A_DEMO_SOURCE_TABLE` plus schema `DEMO_SCHEMA_A` produces `sourceTable=DEMO_SOURCE_TABLE`; `physicalSourceTable` remains in audit output. `sourceTable` never contains the DWO technical prefix. Multiple source systems may legitimately feed one DWF target.
+### DWO upstream identity: recv namespace, not db_schema
+
+The logical DWF target selects the candidate rows from `p_recv_dwf`. For each candidate, the DWO landing namespace is derived from the **complete** `recv_plan` + **complete** `data_source` pair:
+
+```
+recv_plan = PLAN_SA_RECV_<recv_namespace>_<data_source>[_<suffix>...]
+```
+
+The `data_source` must occur as a whole underscore-delimited token sequence inside `recv_plan`; the tokens before it form the namespace. The suffix is not interpreted, so `DAY`, `NIGHT`, `PRO` (and future suffixes) are all accepted without a suffix whitelist. If no split or more than one distinct split is possible, resolution fails closed with `recv_namespace_unresolved`; it never guesses.
+
+The physical relation `DWO.DWO_<recv_namespace>_<source_table>` is matched with token-boundary semantics: `encoded == namespace` or `encoded.startswith(namespace + "_")`. A namespace such as `CBS` therefore never matches `CBSX` or `CBS2`, and multi-token namespaces such as `NUPS_DATA` are stripped as a whole. `sourceTable` never contains the DWO technical prefix, and `physicalSourceTable` remains in audit output.
+
+Identity is grouped by `(recv_plan, data_source)`. Exactly one matching identity resolves; multiple distinct identities produce `multiple_recv_namespace_conflict`; zero matches produce `no_recv_namespace_match`. Multiple metadata rows with the same `(recv_plan, data_source)` are equivalent evidence and do not conflict. Multiple source systems may legitimately feed one DWF target when their namespaces are distinct.
+
+`p_schema_config.db_schema` is source-database schema metadata only. It does not split the DWO name, select upstream identity, provide a fallback, or break ties. The audit `dbSchema` field is populated from the selected `data_source`'s `p_schema_config` when exactly one schema is configured, and is empty when that metadata is absent or ambiguous.
+
+Program filename / `ods_job_name` normalization remains exact (numeric program prefix, `JOB_`, duplicated leading `DWS_`, and `_DAY`/`_NIGHT` suffix normalized), but program evidence is auxiliary only: it can add `ods_job_name` evidence to a resolved row, yet it can never block resolution when the recv namespace identity is unique. No step-sequence fuzzy normalization is applied.
+
+The final `sourceSystemIdentity` is still the complete `recv_plan`, resolved to the current DAP `upstreamSystemId` by exact `recv_plan` ↔ upstream `id` match.
 
 ## SQL extraction and safe projection
 
@@ -101,4 +119,4 @@ Production service-token/M2M authentication and Linux production cutover are TOD
 
 ## Audit summary
 
-`summary.json` records actual scan counts (`project_count`, `python_file_count`, `dwo_physical_table_count`), metadata row counts, DAP upstream count, resolved project/table/field mapping counts, unresolved reasons (`no_program`, `no_final_target`, `no_recv_dwf`, `no_schema_config`, `no_dwo_source`, `unknown_upstream_system`, `unsupported_sql`, `multi_source_field_unsupported`), conflict reasons (`program_metadata_conflict`, `multiple_recv_plan_conflict`, `multiple_data_source_conflict`, `schema_match_conflict`), and failed requests/items. Unresolved, conflict, unsupported, and contract-invalid records never enter import batches.
+`summary.json` records actual scan counts (`project_count`, `python_file_count`, `dwo_physical_table_count`), metadata row counts, DAP upstream count, resolved project/table/field mapping counts, unresolved reasons (`no_program`, `no_final_target`, `no_recv_dwf`, `recv_namespace_unresolved`, `no_recv_namespace_match`, `no_dwo_source`, `unknown_upstream_system`, `unsupported_sql`, `multi_source_field_unsupported`), conflict reasons (`multiple_recv_namespace_conflict`, `multiple_recv_plan_conflict`, `upstream_system_conflict`, `field_mapping_conflict`), and failed requests/items. Unresolved, conflict, unsupported, and contract-invalid records never enter import batches.

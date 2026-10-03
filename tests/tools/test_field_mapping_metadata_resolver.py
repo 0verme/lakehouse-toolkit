@@ -6,496 +6,661 @@ import io
 import json
 import tempfile
 import unittest
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
 from jobs.crontab import sync_ods_dwf_field_mappings as entry
 from tools.field_mapping import benchmark_resolver, metadata_resolver
 from tools.field_mapping.collector import collect_workspace
-from tools.field_mapping.metadata_resolver import MetadataResolver
+from tools.field_mapping.metadata_resolver import (
+    MetadataResolver,
+    derive_recv_namespace,
+    match_dwo_source,
+)
 from tools.field_mapping.models import RecvDwfRecord, SchemaConfigRecord
-
-
-class ReferenceMetadataResolver:
-    """Test-only copy of the pre-index resolver algorithm for equivalence checks."""
-
-    def __init__(self, recv_dwf, schema_configs, upstream_payload):
-        self.recv_dwf = tuple(recv_dwf)
-        self.schema_configs = tuple(schema_configs)
-        self.upstream_systems, self.upstream_system_count = (
-            metadata_resolver.load_upstream_systems(upstream_payload)
-        )
-        self.schemas_by_key = defaultdict(set)
-        for config in self.schema_configs:
-            self.schemas_by_key[config.schema_key.casefold()].add(
-                config.db_schema.upper()
-            )
-        self.systems_by_identity = defaultdict(set)
-        for system in self.upstream_systems:
-            self.systems_by_identity[system.identity.casefold()].add(
-                system.upstream_system_id
-            )
-
-    def resolve(self, *, target, program_names, physical_source):
-        logical_target = metadata_resolver.normalize_logical_target(target)
-        target_rows = [
-            row
-            for row in self.recv_dwf
-            if metadata_resolver.normalize_logical_target(row.table_name)
-            == logical_target
-        ]
-        if not target_rows:
-            return metadata_resolver.Resolution(
-                status="UNRESOLVED", reason="no_recv_dwf"
-            )
-
-        program_keys = {
-            metadata_resolver.normalize_program_name(name) for name in program_names
-        }
-        program_rows = [
-            row
-            for row in self.recv_dwf
-            if metadata_resolver.normalize_program_name(row.ods_job_name)
-            and metadata_resolver.normalize_program_name(row.ods_job_name)
-            in program_keys
-        ]
-        target_program_rows = [
-            row
-            for row in program_rows
-            if metadata_resolver.normalize_logical_target(row.table_name)
-            == logical_target
-        ]
-        if program_rows and not target_program_rows:
-            return metadata_resolver.Resolution(
-                status="CONFLICT", reason="program_metadata_conflict"
-            )
-        if target_program_rows:
-            target_identities = {
-                (row.recv_plan.casefold(), row.data_source.casefold())
-                for row in target_rows
-            }
-            matched_identities = {
-                (row.recv_plan.casefold(), row.data_source.casefold())
-                for row in target_program_rows
-            }
-            if not target_identities.intersection(matched_identities):
-                return metadata_resolver.Resolution(
-                    status="CONFLICT", reason="program_metadata_conflict"
-                )
-            candidates = target_program_rows
-            evidence = ["ods_job_name", "table_name"]
-        else:
-            candidates = target_rows
-            evidence = ["table_name"]
-
-        source, source_error = metadata_resolver.parse_dwo_physical_table(
-            physical_source, self.schema_configs
-        )
-        if source_error:
-            return metadata_resolver.Resolution(
-                status="UNRESOLVED", reason=source_error, evidence=tuple(evidence)
-            )
-
-        schema_compatible = []
-        missing_schema = []
-        for row in candidates:
-            configured = self.schemas_by_key.get(row.data_source.casefold(), set())
-            if not configured:
-                missing_schema.append(row)
-            elif source and source.db_schema.casefold() in {
-                schema.casefold() for schema in configured
-            }:
-                schema_compatible.append(row)
-        if not schema_compatible:
-            if missing_schema:
-                return metadata_resolver.Resolution(
-                    status="UNRESOLVED",
-                    reason="no_schema_config",
-                    source=source,
-                    evidence=tuple(evidence),
-                )
-            return metadata_resolver.Resolution(
-                status="CONFLICT",
-                reason="schema_match_conflict",
-                source=source,
-                evidence=tuple(evidence + ["db_schema"]),
-            )
-        candidates = schema_compatible
-        evidence.append("db_schema")
-
-        identities = {
-            (row.recv_plan.casefold(), row.data_source.casefold())
-            for row in candidates
-        }
-        recv_plans = {identity[0] for identity in identities}
-        data_sources = {identity[1] for identity in identities}
-        if len(recv_plans) > 1:
-            return metadata_resolver.Resolution(
-                status="CONFLICT",
-                reason="multiple_recv_plan_conflict",
-                source=source,
-                evidence=tuple(evidence),
-            )
-        if len(data_sources) > 1:
-            return metadata_resolver.Resolution(
-                status="CONFLICT",
-                reason="multiple_data_source_conflict",
-                source=source,
-                evidence=tuple(evidence),
-            )
-
-        record = min(
-            candidates,
-            key=lambda row: (
-                row.recv_plan.casefold(),
-                row.data_source.casefold(),
-                metadata_resolver.normalize_program_name(row.ods_job_name),
-                row.ods_job_name.casefold(),
-            ),
-        )
-        matching_systems = self.systems_by_identity.get(
-            record.recv_plan.casefold(), set()
-        )
-        if not matching_systems:
-            return metadata_resolver.Resolution(
-                status="UNRESOLVED",
-                reason="unknown_upstream_system",
-                record=record,
-                source=source,
-                evidence=tuple(evidence),
-            )
-        if len(matching_systems) != 1:
-            return metadata_resolver.Resolution(
-                status="CONFLICT",
-                reason="upstream_system_conflict",
-                record=record,
-                source=source,
-                evidence=tuple(evidence),
-            )
-        return metadata_resolver.Resolution(
-            status="RESOLVED",
-            record=record,
-            source=source,
-            upstream_system_id=next(iter(matching_systems)),
-            evidence=tuple(evidence + ["dap_upstream_system"]),
-        )
-
-
-def _signature(result):
-    return (
-        result.status,
-        result.reason,
-        result.record,
-        result.source,
-        result.upstream_system_id,
-        result.evidence,
-    )
 
 
 def _systems(*items):
     return {"items": [{"id": name, "upstreamSystemId": value} for name, value in items]}
 
 
-class MetadataResolverEquivalenceTests(unittest.TestCase):
-    def test_reference_and_indexed_resolver_match_all_resolution_fields(self):
-        cases = [
-            (
-                "table_name_only",
-                [RecvDwfRecord("PLAN", "DWF.DWF_TARGET", "SRC", ods_job_name="OTHER")],
-                [SchemaConfigRecord("SRC", "MY_SCHEMA")],
-                _systems(("PLAN", 10)),
-                "DWF.F_TARGET",
-                ("UNMATCHED.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("RESOLVED", None),
-            ),
-            (
-                "program_and_table_name",
-                [RecvDwfRecord("PLAN", "DWF.DWF_TARGET", "SRC", ods_job_name="JOB_DEMO_DAY")],
-                [SchemaConfigRecord("SRC", "MY_SCHEMA")],
-                _systems(("PLAN", 10)),
-                "DWF.F_TARGET",
-                ("005_DEMO.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("RESOLVED", None),
-            ),
-            (
-                "program_metadata_conflict",
-                [
-                    RecvDwfRecord("P1", "DWF.F_TARGET", "S1", ods_job_name="OTHER"),
-                    RecvDwfRecord("P2", "DWF.F_OTHER", "S2", ods_job_name="JOB_DEMO_DAY"),
-                ],
-                [SchemaConfigRecord("S1", "MY_SCHEMA"), SchemaConfigRecord("S2", "MY_SCHEMA")],
-                _systems(("P1", 10), ("P2", 20)),
-                "DWF.DWF_TARGET",
-                ("005_DEMO.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("CONFLICT", "program_metadata_conflict"),
-            ),
-            (
-                "db_schema_hit_with_underscores",
-                [RecvDwfRecord("PLAN", "DWF.F_TARGET", "SRC", ods_job_name="")],
-                [SchemaConfigRecord("SRC", "MY_SCHEMA_A_B")],
-                _systems(("PLAN", 10)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_A_B_SOURCE",
-                ("RESOLVED", None),
-            ),
-            (
-                "no_schema_config",
-                [RecvDwfRecord("PLAN", "DWF.F_TARGET", "MISSING", ods_job_name="")],
-                [SchemaConfigRecord("PARSER_ONLY", "MY_SCHEMA")],
-                _systems(("PLAN", 10)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("UNRESOLVED", "no_schema_config"),
-            ),
-            (
-                "schema_match_conflict",
-                [RecvDwfRecord("PLAN", "DWF.F_TARGET", "SRC", ods_job_name="")],
-                [SchemaConfigRecord("SRC", "OTHER_SCHEMA"), SchemaConfigRecord("PARSER", "MY_SCHEMA")],
-                _systems(("PLAN", 10)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("CONFLICT", "schema_match_conflict"),
-            ),
-            (
-                "multiple_recv_plan_conflict",
-                [
-                    RecvDwfRecord("P1", "DWF.F_TARGET", "S1", ods_job_name=""),
-                    RecvDwfRecord("P2", "DWF.DWF_TARGET", "S2", ods_job_name=""),
-                ],
-                [SchemaConfigRecord("S1", "MY_SCHEMA"), SchemaConfigRecord("S2", "MY_SCHEMA")],
-                _systems(("P1", 10), ("P2", 20)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("CONFLICT", "multiple_recv_plan_conflict"),
-            ),
-            (
-                "multiple_data_source_conflict",
-                [
-                    RecvDwfRecord("P1", "DWF.F_TARGET", "S1", ods_job_name=""),
-                    RecvDwfRecord("P1", "DWF.DWF_TARGET", "S2", ods_job_name=""),
-                ],
-                [SchemaConfigRecord("S1", "MY_SCHEMA"), SchemaConfigRecord("S2", "MY_SCHEMA")],
-                _systems(("P1", 10)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("CONFLICT", "multiple_data_source_conflict"),
-            ),
-            (
-                "unknown_upstream_system",
-                [RecvDwfRecord("UNKNOWN", "DWF.F_TARGET", "SRC", ods_job_name="")],
-                [SchemaConfigRecord("SRC", "MY_SCHEMA")],
-                _systems(),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("UNRESOLVED", "unknown_upstream_system"),
-            ),
-            (
-                "upstream_system_conflict",
-                [RecvDwfRecord("PLAN", "DWF.F_TARGET", "SRC", ods_job_name="")],
-                [SchemaConfigRecord("SRC", "MY_SCHEMA")],
-                _systems(("PLAN", 10), ("plan", 11)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("CONFLICT", "upstream_system_conflict"),
-            ),
-            (
-                "equivalent_duplicate_metadata",
-                [
-                    RecvDwfRecord("PLAN", "DWF.F_TARGET", "SRC", ods_job_name="JOB_Z_DAY"),
-                    RecvDwfRecord("plan", "DWF.DWF_TARGET", "src", ods_job_name="JOB_A_DAY"),
-                ],
-                [SchemaConfigRecord("SRC", "MY_SCHEMA")],
-                _systems(("PLAN", 10)),
-                "DWF.F_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("RESOLVED", None),
-            ),
-            (
-                "same_target_multiple_source_systems",
-                [
-                    RecvDwfRecord("PLAN_A", "DWF.F_TARGET", "SRC_A", ods_job_name=""),
-                    RecvDwfRecord("PLAN_B", "DWF.DWF_TARGET", "SRC_B", ods_job_name=""),
-                ],
-                [SchemaConfigRecord("SRC_A", "MY_SCHEMA"), SchemaConfigRecord("SRC_B", "OTHER_SCHEMA"), SchemaConfigRecord("PARSER", "MY_SCHEMA")],
-                _systems(("PLAN_A", 10), ("PLAN_B", 20)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("RESOLVED", None),
-            ),
-            (
-                "no_recv_dwf",
-                [RecvDwfRecord("PLAN", "DWF.F_OTHER", "SRC", ods_job_name="")],
-                [SchemaConfigRecord("SRC", "MY_SCHEMA")],
-                _systems(("PLAN", 10)),
-                "DWF.DWF_TARGET",
-                ("NO_MATCH.py",),
-                "DWO.DWO_MY_SCHEMA_SOURCE",
-                ("UNRESOLVED", "no_recv_dwf"),
-            ),
+def _resolver(recv, schemas=(), systems=()):
+    return MetadataResolver(recv, schemas, _systems(*systems))
+
+
+class RecvNamespaceDerivationTests(unittest.TestCase):
+    REAL_INTERNAL_CASES = (
+        ("PLAN_SA_RECV_ABS5_CBS_ABS5_DAY", "CBS_ABS5", "ABS5"),
+        ("PLAN_SA_RECV_CBS_CBS_KUANYE_DAY", "CBS_KUANYE", "CBS"),
+        ("PLAN_SA_RECV_KUANYE_KUANYENEW_DAY", "KUANYENEW", "KUANYE"),
+        ("PLAN_SA_RECV_KUANYET15_KUANYENEWT15_DAY", "KUANYENEWT15", "KUANYET15"),
+        ("PLAN_SA_RECV_CBS_CBS_CBSRUN_PRO", "CBS_CBSRUN", "CBS"),
+        ("PLAN_SA_RECV_WD_DEFENSOR_WD_DEFENSOR_DAY", "WD_DEFENSOR", "WD_DEFENSOR"),
+        (
+            "PLAN_SA_RECV_NUPS_DATA_NUPS_DATA_SOURCE_DAY",
+            "NUPS_DATA_SOURCE",
+            "NUPS_DATA",
+        ),
+    )
+
+    def test_real_internal_cases_use_full_plan_and_full_data_source(self):
+        for recv_plan, data_source, expected in self.REAL_INTERNAL_CASES:
+            with self.subTest(recv_plan=recv_plan):
+                self.assertEqual(
+                    expected, derive_recv_namespace(recv_plan, data_source)
+                )
+
+    def test_suffix_is_not_hardcoded_to_day_or_night(self):
+        for suffix in ("DAY", "NIGHT", "PRO", "WEEKLY", ""):
+            plan = (
+                f"PLAN_SA_RECV_CBS_CBS_CBSRUN_{suffix}"
+                if suffix
+                else "PLAN_SA_RECV_CBS_CBS_CBSRUN"
+            )
+            with self.subTest(suffix=suffix):
+                self.assertEqual("CBS", derive_recv_namespace(plan, "CBS_CBSRUN"))
+
+    def test_fails_closed_when_namespace_cannot_be_derived(self):
+        self.assertIsNone(derive_recv_namespace("DEMO_SYSTEM_A", "DEMO_SYSTEM_A"))
+        self.assertIsNone(
+            derive_recv_namespace("PLAN_SA_RECV_CBS_OTHER_DAY", "CBS_KUANYE")
+        )
+        self.assertIsNone(derive_recv_namespace("PLAN_SA_RECV_ABS5_CBS_ABS5_DAY", ""))
+        self.assertIsNone(
+            derive_recv_namespace("PLAN_SA_RECV__CBS_ABS5_DAY", "CBS_ABS5")
+        )
+
+    def test_multiple_legal_splits_fail_closed(self):
+        self.assertIsNone(derive_recv_namespace("PLAN_SA_RECV_A_B_A_B_DAY", "B"))
+        self.assertIsNone(derive_recv_namespace("PLAN_SA_RECV_A_DS_DS", "DS"))
+
+
+class MatchDwoSourceTests(unittest.TestCase):
+    def test_namespace_boundary_match_and_multi_token_namespace(self):
+        source = match_dwo_source("DWO.DWO_CBS_BTH_MCHT_AUTO_CHANGE", "CBS")
+        self.assertEqual("CBS", source.recv_namespace)
+        self.assertEqual("BTH_MCHT_AUTO_CHANGE", source.source_table)
+        self.assertEqual("DWO.DWO_CBS_BTH_MCHT_AUTO_CHANGE", source.physical_table)
+        self.assertIsNone(source.db_schema)
+
+        multi = match_dwo_source("DWO.DWO_NUPS_DATA_PISA_A_B", "NUPS_DATA")
+        self.assertEqual("NUPS_DATA", multi.recv_namespace)
+        self.assertEqual("PISA_A_B", multi.source_table)
+
+    def test_naive_prefix_is_rejected(self):
+        for physical in ("DWO.DWO_CBSX_TABLE", "DWO.DWO_CBS2_TABLE", "DWO.DWO_CB_TABLE"):
+            with self.subTest(physical=physical):
+                self.assertIsNone(match_dwo_source(physical, "CBS"))
+
+    def test_empty_source_table_and_non_dwo_relation_are_rejected(self):
+        self.assertIsNone(match_dwo_source("DWO.DWO_CBS", "CBS"))
+        self.assertIsNone(match_dwo_source("SCHEMA.DWO_CBS_X", "CBS"))
+        self.assertIsNone(match_dwo_source("DWO.DWO_CBS_X", ""))
+
+
+def _resolve(
+    *,
+    target: str,
+    recv_plan: str,
+    data_source: str,
+    physical: str,
+    db_schema: str | None = None,
+    ods_job_name: str = "",
+    program_names=(),
+    systems=None,
+    upstream: int = 101,
+):
+    recv = [RecvDwfRecord(recv_plan, target, data_source, ods_job_name=ods_job_name)]
+    schemas = [SchemaConfigRecord(data_source, db_schema)] if db_schema else []
+    upstreams = (
+        [{"id": recv_plan, "upstreamSystemId": upstream}]
+        if systems is None
+        else [
+            item
+            if isinstance(item, dict)
+            else {"id": item[0], "upstreamSystemId": item[1]}
+            for item in systems
         ]
+    )
+    return MetadataResolver(recv, schemas, {"items": upstreams}).resolve(
+        target=target, program_names=program_names, physical_source=physical
+    )
 
-        for name, recv, schemas, systems, target, programs, physical_source, wanted in cases:
-            with self.subTest(case=name):
-                indexed = MetadataResolver(recv, schemas, systems)
-                reference = ReferenceMetadataResolver(recv, schemas, systems)
-                args = {
-                    "target": target,
-                    "program_names": programs,
-                    "physical_source": physical_source,
-                }
-                actual = indexed.resolve(**args)
-                expected = reference.resolve(**args)
-                self.assertEqual(wanted, (actual.status, actual.reason))
-                self.assertEqual(_signature(expected), _signature(actual))
 
-    def test_cache_key_normalizes_and_deduplicates_inputs_without_cross_merging(self):
+class MetadataResolverModelTests(unittest.TestCase):
+    def test_case_a_traditional_alignment(self):
+        result = _resolve(
+            target="DWF.DWF_AB_ACCT_IMAGE_DOSSIER",
+            recv_plan="PLAN_SA_RECV_ABS5_CBS_ABS5_DAY",
+            data_source="CBS_ABS5",
+            db_schema="ABS5",
+            physical="DWO.DWO_ABS5_AB_ACCT_IMAGE_DOSSIER",
+        )
+        self.assertEqual(("RESOLVED", None), (result.status, result.reason))
+        self.assertEqual("ABS5", result.source.recv_namespace)
+        self.assertEqual("AB_ACCT_IMAGE_DOSSIER", result.source.source_table)
+        self.assertEqual("ABS5", result.source.db_schema)
+        self.assertEqual(101, result.upstream_system_id)
+        self.assertEqual("PLAN_SA_RECV_ABS5_CBS_ABS5_DAY", result.record.recv_plan)
+        self.assertIn("recv_namespace", result.evidence)
+
+    def test_case_b_legacy_kuanye_recv_namespace_differs_from_db_schema(self):
+        result = _resolve(
+            target="DWF.DWF_BTH_MCHT_AUTO_CHANGE",
+            recv_plan="PLAN_SA_RECV_CBS_CBS_KUANYE_DAY",
+            data_source="CBS_KUANYE",
+            db_schema="KUANYE",
+            physical="DWO.DWO_CBS_BTH_MCHT_AUTO_CHANGE",
+        )
+        self.assertEqual(("RESOLVED", None), (result.status, result.reason))
+        self.assertEqual("CBS", result.source.recv_namespace)
+        self.assertEqual("BTH_MCHT_AUTO_CHANGE", result.source.source_table)
+        self.assertEqual("KUANYE", result.source.db_schema)
+
+    def test_case_c_new_kuanye_recv_namespace_differs_from_db_schema(self):
+        result = _resolve(
+            target="DWF.DWF_D_DEVICE_OPERATE_LOG",
+            recv_plan="PLAN_SA_RECV_KUANYE_KUANYENEW_DAY",
+            data_source="KUANYENEW",
+            db_schema="BMP",
+            physical="DWO.DWO_KUANYE_D_DEVICE_OPERATE_LOG",
+        )
+        self.assertEqual(("RESOLVED", None), (result.status, result.reason))
+        self.assertEqual("KUANYE", result.source.recv_namespace)
+        self.assertEqual("D_DEVICE_OPERATE_LOG", result.source.source_table)
+        self.assertEqual("BMP", result.source.db_schema)
+
+    def test_case_d_pro_suffix_is_supported(self):
+        result = _resolve(
+            target="DWF.DWF_COMC_PROFESSION_NEWCODE",
+            recv_plan="PLAN_SA_RECV_CBS_CBS_CBSRUN_PRO",
+            data_source="CBS_CBSRUN",
+            physical="DWO.DWO_CBS_COMC_PROFESSION_NEWCODE",
+        )
+        self.assertEqual(("RESOLVED", None), (result.status, result.reason))
+        self.assertEqual("CBS", result.source.recv_namespace)
+        self.assertEqual("COMC_PROFESSION_NEWCODE", result.source.source_table)
+
+    def test_case_e_program_mismatch_does_not_block_unique_recv_namespace(self):
         recv = [
-            RecvDwfRecord("PLAN_A", "DWF.F_TARGET", "SRC_A", ods_job_name="JOB_DEMO_DAY"),
-            RecvDwfRecord("PLAN_B", "DWF.DWF_OTHER", "SRC_B", ods_job_name="JOB_OTHER_DAY"),
+            RecvDwfRecord(
+                "PLAN_SA_RECV_ACS_ACS_CBSRUN_DAY",
+                "DWF.DWF_EVT_ACCD_ACCOUNT_LIST",
+                "ACS_CBSRUN",
+                ods_job_name="JOB_DWS_DWS_DWF_F_EVT_ACCD_ACCOUNT_LIST_00_DAY",
+            ),
+            RecvDwfRecord(
+                "PLAN_SA_RECV_CBS_CBS_CBSRUN_DAY",
+                "DWF.DWF_EVT_ACCD_ACCOUNT_LIST",
+                "CBS_CBSRUN",
+                ods_job_name="JOB_DWS_DWS_DWF_F_EVT_ACCD_ACCOUNT_LIST_00_DAY",
+            ),
         ]
-        resolver = MetadataResolver(
+        resolver = _resolver(
             recv,
+            (),
+            (
+                ("PLAN_SA_RECV_ACS_ACS_CBSRUN_DAY", 11),
+                ("PLAN_SA_RECV_CBS_CBS_CBSRUN_DAY", 22),
+            ),
+        )
+        program = ("005_DWS_DWF_F_EVT_ACCD_ACCOUNT_LIST_1_00.py",)
+        args = {"target": "DWF.DWF_EVT_ACCD_ACCOUNT_LIST", "program_names": program}
+        acs = resolver.resolve(
+            **args, physical_source="DWO.DWO_ACS_ACCD_ACCOUNT_LIST"
+        )
+        cbs = resolver.resolve(
+            **args, physical_source="DWO.DWO_CBS_ACCD_ACCOUNT_LIST"
+        )
+        self.assertEqual(
+            ("RESOLVED", "ACS_CBSRUN", 11, "ACS"),
+            (
+                acs.status,
+                acs.record.data_source,
+                acs.upstream_system_id,
+                acs.source.recv_namespace,
+            ),
+        )
+        self.assertEqual(
+            ("RESOLVED", "CBS_CBSRUN", 22, "CBS"),
+            (
+                cbs.status,
+                cbs.record.data_source,
+                cbs.upstream_system_id,
+                cbs.source.recv_namespace,
+            ),
+        )
+        self.assertNotIn("ods_job_name", acs.evidence)
+
+    def test_case_f_equivalent_duplicate_rows_do_not_conflict(self):
+        recv = [
+            RecvDwfRecord(
+                "PLAN_SA_RECV_CBS_CBS_KUANYE_DAY",
+                "DWF.DWF_BTH_MCHT_AUTO_CHANGE",
+                "CBS_KUANYE",
+                ods_job_name="JOB_Z_DAY",
+            ),
+            RecvDwfRecord(
+                "plan_sa_recv_cbs_cbs_kuanye_day",
+                "DWF.DWF_BTH_MCHT_AUTO_CHANGE",
+                "cbs_kuanye",
+                ods_job_name="JOB_A_DAY",
+            ),
+        ]
+        result = _resolver(
+            recv, (), (("PLAN_SA_RECV_CBS_CBS_KUANYE_DAY", 7),)
+        ).resolve(
+            target="DWF.DWF_BTH_MCHT_AUTO_CHANGE",
+            program_names=(),
+            physical_source="DWO.DWO_CBS_BTH_MCHT_AUTO_CHANGE",
+        )
+        self.assertEqual(("RESOLVED", None), (result.status, result.reason))
+        self.assertEqual("cbs_kuanye", result.record.data_source)
+
+    def test_case_g_multiple_recv_namespace_identities_conflict(self):
+        recv = [
+            RecvDwfRecord(
+                "PLAN_SA_RECV_DTSELL_DTSELL_CZCB_BC_DAY",
+                "DWF.DWF_PUB_OPER_LOG",
+                "DTSELL_CZCB_BC",
+            ),
+            RecvDwfRecord(
+                "PLAN_SA_RECV_DTSELL_DTSELL_CZCB_MB_DAY",
+                "DWF.DWF_PUB_OPER_LOG",
+                "DTSELL_CZCB_MB",
+            ),
+        ]
+        result = _resolver(
+            recv,
+            (),
+            (
+                ("PLAN_SA_RECV_DTSELL_DTSELL_CZCB_BC_DAY", 1),
+                ("PLAN_SA_RECV_DTSELL_DTSELL_CZCB_MB_DAY", 2),
+            ),
+        ).resolve(
+            target="DWF.DWF_PUB_OPER_LOG",
+            program_names=(),
+            physical_source="DWO.DWO_DTSELL_PUB_OPER_LOG",
+        )
+        self.assertEqual(
+            ("CONFLICT", "multiple_recv_namespace_conflict"),
+            (result.status, result.reason),
+        )
+
+    def test_case_h_unresolved_tfs_is_not_guessed_by_first_token(self):
+        result = _resolve(
+            target="DWF.DWF_BOP_N",
+            recv_plan="PLAN_SA_RECV_TFS_RCPMIS_KF_TFS_RCPMIS_KF_ODS_DAY",
+            data_source="TFS_RCPMIS_KF_ODS",
+            physical="DWO.DWO_TFS_DL_BOP_N",
+        )
+        self.assertEqual(
+            ("UNRESOLVED", "no_recv_namespace_match"), (result.status, result.reason)
+        )
+
+    def test_case_i_wd_defensor_db_schema_only_match_stays_diagnostic(self):
+        result = _resolve(
+            target="DWF.DWF_REPORT_REQUEST",
+            recv_plan="PLAN_SA_RECV_WD_DEFENSOR_WD_DEFENSOR_DAY",
+            data_source="WD_DEFENSOR",
+            db_schema="DEFENSOR",
+            physical="DWO.DWO_DEFENSOR_REPORT_REQUEST",
+        )
+        self.assertEqual(
+            ("UNRESOLVED", "no_recv_namespace_match"), (result.status, result.reason)
+        )
+
+    def test_case_j_missing_schema_config_still_resolves_with_honest_null_db_schema(
+        self,
+    ):
+        result = _resolve(
+            target="DWF.DWF_AB_ACCT_IMAGE_DOSSIER",
+            recv_plan="PLAN_SA_RECV_ABS5_CBS_ABS5_DAY",
+            data_source="CBS_ABS5",
+            db_schema=None,
+            physical="DWO.DWO_ABS5_AB_ACCT_IMAGE_DOSSIER",
+        )
+        self.assertEqual(("RESOLVED", None), (result.status, result.reason))
+        self.assertIsNone(result.source.db_schema)
+
+    def test_multiple_db_schema_rows_for_one_data_source_never_pick_one(self):
+        recv = [
+            RecvDwfRecord(
+                "PLAN_SA_RECV_ABS5_CBS_ABS5_DAY",
+                "DWF.DWF_AB_ACCT_IMAGE_DOSSIER",
+                "CBS_ABS5",
+            )
+        ]
+        resolver = _resolver(
+            recv,
+            (
+                SchemaConfigRecord("CBS_ABS5", "ABS5"),
+                SchemaConfigRecord("CBS_ABS5", "ABS5_OTHER"),
+            ),
+            (("PLAN_SA_RECV_ABS5_CBS_ABS5_DAY", 5),),
+        )
+        result = resolver.resolve(
+            target="DWF.DWF_AB_ACCT_IMAGE_DOSSIER",
+            program_names=(),
+            physical_source="DWO.DWO_ABS5_AB_ACCT_IMAGE_DOSSIER",
+        )
+        self.assertEqual("RESOLVED", result.status)
+        self.assertIsNone(result.source.db_schema)
+
+    def test_no_recv_dwf(self):
+        result = _resolver(
             [
-                SchemaConfigRecord("SRC_A", "SCHEMA_A"),
-                SchemaConfigRecord("SRC_B", "SCHEMA_B"),
+                RecvDwfRecord(
+                    "PLAN_SA_RECV_ABS5_CBS_ABS5_DAY",
+                    "DWF.DWF_OTHER_TARGET",
+                    "CBS_ABS5",
+                )
             ],
-            _systems(("PLAN_A", 10), ("PLAN_B", 20)),
+            (),
+            (),
+        ).resolve(
+            target="DWF.DWF_TARGET",
+            program_names=(),
+            physical_source="DWO.DWO_ABS5_AB_ACCT_IMAGE_DOSSIER",
+        )
+        self.assertEqual(
+            ("UNRESOLVED", "no_recv_dwf"), (result.status, result.reason)
+        )
+
+    def test_recv_namespace_unresolved_when_no_candidate_follows_the_anchor_shape(
+        self,
+    ):
+        result = _resolve(
+            target="DWF.DWF_TARGET",
+            recv_plan="DEMO_SYSTEM_A",
+            data_source="DEMO_SYSTEM_A",
+            physical="DWO.DWO_DEMO_SCHEMA_A_SOURCE",
+        )
+        self.assertEqual(
+            ("UNRESOLVED", "recv_namespace_unresolved"),
+            (result.status, result.reason),
+        )
+
+    def test_no_recv_namespace_match_when_some_candidates_are_underivable(self):
+        recv = [
+            RecvDwfRecord("DEMO_SYSTEM_A", "DWF.DWF_TARGET", "DEMO_SYSTEM_A"),
+            RecvDwfRecord(
+                "PLAN_SA_RECV_DEMO_SCHEMA_B_OTHER_SYSTEM_DAY",
+                "DWF.DWF_TARGET",
+                "OTHER_SYSTEM",
+            ),
+        ]
+        result = _resolver(recv, (), ()).resolve(
+            target="DWF.DWF_TARGET",
+            program_names=(),
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_SOURCE",
+        )
+        self.assertEqual(
+            ("UNRESOLVED", "no_recv_namespace_match"), (result.status, result.reason)
+        )
+
+    def test_no_dwo_source_for_non_dwo_physical_relation(self):
+        result = _resolve(
+            target="DWF.DWF_TARGET",
+            recv_plan="PLAN_SA_RECV_ABS5_CBS_ABS5_DAY",
+            data_source="CBS_ABS5",
+            physical="DWF.DWF_TARGET",
+        )
+        self.assertEqual(
+            ("UNRESOLVED", "no_dwo_source"), (result.status, result.reason)
+        )
+
+    def test_unknown_upstream_system_and_upstream_system_conflict(self):
+        args = {
+            "target": "DWF.DWF_BTH_MCHT_AUTO_CHANGE",
+            "recv_plan": "PLAN_SA_RECV_CBS_CBS_KUANYE_DAY",
+            "data_source": "CBS_KUANYE",
+            "physical": "DWO.DWO_CBS_BTH_MCHT_AUTO_CHANGE",
+        }
+        unknown = _resolve(**args, systems=[])
+        self.assertEqual(
+            ("UNRESOLVED", "unknown_upstream_system"),
+            (unknown.status, unknown.reason),
+        )
+        self.assertEqual("CBS", unknown.source.recv_namespace)
+        conflicted = _resolve(
+            **args,
+            systems=(
+                ("PLAN_SA_RECV_CBS_CBS_KUANYE_DAY", 7),
+                ("plan_sa_recv_cbs_cbs_kuanye_day", 8),
+            ),
+        )
+        self.assertEqual(
+            ("CONFLICT", "upstream_system_conflict"),
+            (conflicted.status, conflicted.reason),
+        )
+
+    def test_cache_returns_identical_resolution_and_keeps_inputs_separate(self):
+        recv = [
+            RecvDwfRecord(
+                "PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY",
+                "DWF.DWF_DEMO_TARGET",
+                "DEMO_SYSTEM_A",
+                ods_job_name="JOB_DEMO_DAY",
+            ),
+            RecvDwfRecord(
+                "PLAN_SA_RECV_DEMO_SCHEMA_B_DEMO_SYSTEM_B_DAY",
+                "DWF.DWF_DEMO_OTHER",
+                "DEMO_SYSTEM_B",
+                ods_job_name="JOB_OTHER_DAY",
+            ),
+        ]
+        resolver = _resolver(
+            recv,
+            (),
+            (
+                ("PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY", 10),
+                ("PLAN_SA_RECV_DEMO_SCHEMA_B_DEMO_SYSTEM_B_DAY", 20),
+            ),
         )
         first = resolver.resolve(
-            target="DWF.F_TARGET",
+            target="DWF.F_DEMO_TARGET",
             program_names=("005_DEMO.py", "JOB_DEMO_DAY", "005_DEMO.py"),
-            physical_source='"DWO"."DWO_SCHEMA_A_SOURCE"',
+            physical_source='"DWO"."DWO_DEMO_SCHEMA_A_SOURCE"',
         )
         equivalent = resolver.resolve(
-            target="DWF.DWF_TARGET",
+            target="DWF.DWF_DEMO_TARGET",
             program_names=("JOB_DEMO_DAY", "005_DEMO.py"),
-            physical_source="DWO.DWO_SCHEMA_A_SOURCE",
+            physical_source="DWO.DWO_DEMO_SCHEMA_A_SOURCE",
         )
-        table_only = resolver.resolve(
-            target="DWF.DWF_TARGET",
-            program_names=("NO_MATCH.py",),
-            physical_source="DWO.DWO_SCHEMA_A_SOURCE",
-        )
-        other_program = resolver.resolve(
-            target="DWF.DWF_TARGET",
+        other_target = resolver.resolve(
+            target="DWF.DWF_DEMO_OTHER",
             program_names=("JOB_OTHER_DAY",),
-            physical_source="DWO.DWO_SCHEMA_A_SOURCE",
+            physical_source="DWO.DWO_DEMO_SCHEMA_B_SOURCE",
         )
-        other_source = resolver.resolve(
-            target="DWF.DWF_TARGET",
-            program_names=("005_DEMO.py",),
-            physical_source="DWO.DWO_SCHEMA_B_SOURCE",
+        self.assertEqual(
+            ("RESOLVED", None),
+            (first.status, first.reason),
         )
-
-        self.assertEqual(_signature(first), _signature(equivalent))
         self.assertIs(first, equivalent)
-        self.assertEqual(("RESOLVED", None), (table_only.status, table_only.reason))
-        self.assertEqual(
-            ("CONFLICT", "program_metadata_conflict"),
-            (other_program.status, other_program.reason),
-        )
-        self.assertEqual(
-            ("CONFLICT", "schema_match_conflict"),
-            (other_source.status, other_source.reason),
-        )
-        self.assertEqual(4, len(resolver._resolution_cache))
+        self.assertEqual(("RESOLVED", None), (other_target.status, other_target.reason))
+        self.assertEqual(2, len(resolver._resolution_cache))
+        self.assertIn("ods_job_name", first.evidence)
 
-    def test_collector_audit_result_matches_reference_with_repeated_field_resolves(self):
+
+class CollectorModelTests(unittest.TestCase):
+    @staticmethod
+    def _write_project(root: Path, name: str, target: str, physical: str) -> None:
+        project = root / name
+        project.mkdir()
+        (project / "mapping.sql").write_text(
+            f"INSERT INTO {target} (ID) SELECT s.ID FROM {physical} s",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _collect(root: Path, resolver: MetadataResolver):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return collect_workspace(root, resolver)
+
+    def test_collector_audits_recv_namespace_and_configured_db_schema(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            project = root / "DWS_DWF.DWF_DEMO_TARGET"
+            self._write_project(
+                root,
+                "DWS_DWF.DWF_DEMO_TARGET",
+                "DWF.DWF_DEMO_TARGET",
+                "DWO.DWO_DEMO_SCHEMA_A_SOURCE",
+            )
+            resolver = _resolver(
+                [
+                    RecvDwfRecord(
+                        "PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY",
+                        "DWF.DWF_DEMO_TARGET",
+                        "DEMO_SYSTEM_A",
+                    )
+                ],
+                (SchemaConfigRecord("DEMO_SYSTEM_A", "DEMO_SCHEMA_A"),),
+                (("PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY", 101),),
+            )
+            audit = self._collect(root, resolver)
+
+        self.assertEqual(1, audit.summary["resolution"]["resolved_field_mappings"])
+        self.assertEqual("DEMO_SCHEMA_A", audit.resolved[0]["dbSchema"])
+        self.assertEqual(
+            "table_name;recv_namespace;dap_upstream_system",
+            audit.resolved[0]["evidence"],
+        )
+
+    def test_collector_keeps_db_schema_honest_without_schema_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_project(
+                root,
+                "DWS_DWF.DWF_DEMO_TARGET",
+                "DWF.DWF_DEMO_TARGET",
+                "DWO.DWO_DEMO_SCHEMA_A_SOURCE",
+            )
+            resolver = _resolver(
+                [
+                    RecvDwfRecord(
+                        "PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY",
+                        "DWF.DWF_DEMO_TARGET",
+                        "DEMO_SYSTEM_A",
+                    )
+                ],
+                (),
+                (("PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY", 101),),
+            )
+            audit = self._collect(root, resolver)
+
+        self.assertEqual(1, audit.summary["resolution"]["resolved_field_mappings"])
+        self.assertIsNone(audit.resolved[0]["dbSchema"])
+
+    def test_collector_summary_uses_recv_namespace_reason_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_project(
+                root, "p-no-match", "DWF.DWF_BOP_N", "DWO.DWO_TFS_DL_BOP_N"
+            )
+            self._write_project(
+                root,
+                "p-unresolved-ns",
+                "DWF.DWF_OTHER_TARGET",
+                "DWO.DWO_WHATEVER_X",
+            )
+            self._write_project(
+                root,
+                "p-conflict",
+                "DWF.DWF_PUB_OPER_LOG",
+                "DWO.DWO_DTSELL_PUB_OPER_LOG",
+            )
+            self._write_project(
+                root,
+                "p-no-recv",
+                "DWF.DWF_NOT_IN_METADATA",
+                "DWO.DWO_DEMO_SCHEMA_A_SOURCE",
+            )
+            self._write_project(
+                root,
+                "p-unknown-system",
+                "DWF.DWF_UNKNOWN_SYSTEM",
+                "DWO.DWO_DEMO_SCHEMA_A_SOURCE",
+            )
+            recv = [
+                RecvDwfRecord(
+                    "PLAN_SA_RECV_TFS_RCPMIS_KF_TFS_RCPMIS_KF_ODS_DAY",
+                    "DWF.F_BOP_N",
+                    "TFS_RCPMIS_KF_ODS",
+                ),
+                RecvDwfRecord("DEMO_SYSTEM_A", "DWF.F_OTHER_TARGET", "DEMO_SYSTEM_A"),
+                RecvDwfRecord(
+                    "PLAN_SA_RECV_DTSELL_DTSELL_CZCB_BC_DAY",
+                    "DWF.F_PUB_OPER_LOG",
+                    "DTSELL_CZCB_BC",
+                ),
+                RecvDwfRecord(
+                    "PLAN_SA_RECV_DTSELL_DTSELL_CZCB_MB_DAY",
+                    "DWF.F_PUB_OPER_LOG",
+                    "DTSELL_CZCB_MB",
+                ),
+                RecvDwfRecord(
+                    "PLAN_SA_RECV_DEMO_SCHEMA_A_MISSING_SYSTEM_DAY",
+                    "DWF.F_UNKNOWN_SYSTEM",
+                    "MISSING_SYSTEM",
+                ),
+            ]
+            resolver = _resolver(
+                recv, (), (("PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY", 1),)
+            )
+            audit = self._collect(root, resolver)
+
+        summary = audit.summary
+        self.assertEqual(1, summary["unresolved"]["no_recv_namespace_match"])
+        self.assertEqual(1, summary["unresolved"]["recv_namespace_unresolved"])
+        self.assertEqual(1, summary["unresolved"]["no_recv_dwf"])
+        self.assertEqual(1, summary["unresolved"]["unknown_upstream_system"])
+        self.assertEqual(1, summary["conflict"]["multiple_recv_namespace_conflict"])
+        self.assertNotIn("no_schema_config", summary["unresolved"])
+        self.assertNotIn("schema_match_conflict", summary["conflict"])
+
+    def test_collector_resolves_when_program_metadata_does_not_match(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "DWS_DWF.DWF_EVT_ACCD_ACCOUNT_LIST"
             project.mkdir()
-            (project / "JOB_DEMO_DAY.sql").write_text(
-                "INSERT INTO DWF.F_DEMO_TARGET (ID, NAME, CODE) "
-                "SELECT s.ID, s.NAME, s.CODE "
-                "FROM DWO.DWO_DEMO_SCHEMA_A_B_SOURCE s",
+            (project / "005_DWS_DWF_F_EVT_ACCD_ACCOUNT_LIST_1_00.py").write_text(
+                "def run(execute):\n"
+                '    execute("INSERT INTO DWF.DWF_EVT_ACCD_ACCOUNT_LIST (ID) "\n'
+                '            "SELECT s.ID FROM DWO.DWO_ACS_ACCD_ACCOUNT_LIST s")\n',
                 encoding="utf-8",
             )
             recv = [
                 RecvDwfRecord(
-                    "PLAN", "DWF.DWF_DEMO_TARGET", "SRC", ods_job_name="JOB_DEMO_DAY"
-                )
+                    "PLAN_SA_RECV_ACS_ACS_CBSRUN_DAY",
+                    "DWF.DWF_EVT_ACCD_ACCOUNT_LIST",
+                    "ACS_CBSRUN",
+                    ods_job_name="JOB_DWS_DWS_DWF_F_EVT_ACCD_ACCOUNT_LIST_00_DAY",
+                ),
+                RecvDwfRecord(
+                    "PLAN_SA_RECV_CBS_CBS_CBSRUN_DAY",
+                    "DWF.DWF_EVT_ACCD_ACCOUNT_LIST",
+                    "CBS_CBSRUN",
+                    ods_job_name="JOB_DWS_DWS_DWF_F_EVT_ACCD_ACCOUNT_LIST_00_DAY",
+                ),
             ]
-            schemas = [SchemaConfigRecord("SRC", "DEMO_SCHEMA_A_B")]
-            systems = _systems(("PLAN", 101))
-            indexed = MetadataResolver(recv, schemas, systems)
-            reference = ReferenceMetadataResolver(recv, schemas, systems)
-            # The collector consumes the resolver's precomputed logical-target set;
-            # share only this lookup view, not the reference resolve implementation.
-            reference.recv_by_logical_target = indexed.recv_by_logical_target
+            resolver = _resolver(
+                recv,
+                (),
+                (
+                    ("PLAN_SA_RECV_ACS_ACS_CBSRUN_DAY", 11),
+                    ("PLAN_SA_RECV_CBS_CBS_CBSRUN_DAY", 22),
+                ),
+            )
+            audit = self._collect(root, resolver)
 
-            with contextlib.redirect_stderr(io.StringIO()):
-                actual = collect_workspace(root, indexed)
-                expected = collect_workspace(root, reference)
-
-        self.assertEqual(expected, actual)
-        self.assertEqual(3, actual.summary["resolution"]["resolved_field_mappings"])
-        self.assertEqual(1, len(indexed._resolution_cache))
-
-    def test_collector_audit_result_matches_reference_for_unresolved_baselines(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "project-no-program").mkdir()
-            no_final = root / "project-no-final"
-            no_final.mkdir()
-            (no_final / "select.sql").write_text("SELECT 1", encoding="utf-8")
-
-            def add_mapping(project_name, target):
-                project = root / project_name
-                project.mkdir()
-                (project / "mapping.sql").write_text(
-                    f"INSERT INTO {target} (ID) SELECT s.ID "
-                    "FROM DWO.DWO_DEMO_SCHEMA_A_B_SOURCE s",
-                    encoding="utf-8",
-                )
-
-            add_mapping("project-no-recv", "DWF.DWF_NOT_IN_METADATA")
-            add_mapping("project-no-schema", "DWF.DWF_NO_SCHEMA")
-            add_mapping("project-schema-conflict", "DWF.DWF_SCHEMA_CONFLICT")
-            add_mapping("project-unknown-system", "DWF.DWF_UNKNOWN_SYSTEM")
-            add_mapping("project-resolved", "DWF.DWF_DEMO_TARGET")
-
-            recv = [
-                RecvDwfRecord("PLAN", "DWF.F_DEMO_TARGET", "SRC"),
-                RecvDwfRecord("PLAN", "DWF.F_NO_SCHEMA", "MISSING"),
-                RecvDwfRecord("PLAN", "DWF.F_SCHEMA_CONFLICT", "SRC_BAD"),
-                RecvDwfRecord("UNKNOWN", "DWF.F_UNKNOWN_SYSTEM", "SRC_UNKNOWN"),
-            ]
-            schemas = [
-                SchemaConfigRecord("SRC", "DEMO_SCHEMA_A_B"),
-                SchemaConfigRecord("PARSER", "DEMO_SCHEMA_A_B"),
-                SchemaConfigRecord("SRC_BAD", "OTHER_SCHEMA"),
-                SchemaConfigRecord("SRC_UNKNOWN", "DEMO_SCHEMA_A_B"),
-            ]
-            systems = _systems(("PLAN", 101))
-            indexed = MetadataResolver(recv, schemas, systems)
-            reference = ReferenceMetadataResolver(recv, schemas, systems)
-            reference.recv_by_logical_target = indexed.recv_by_logical_target
-
-            with contextlib.redirect_stderr(io.StringIO()):
-                actual = collect_workspace(root, indexed)
-                expected = collect_workspace(root, reference)
-
-        self.assertEqual(expected, actual)
-        self.assertEqual(1, actual.summary["unresolved"]["no_program"])
-        self.assertEqual(1, actual.summary["unresolved"]["no_final_target"])
-        self.assertEqual(1, actual.summary["unresolved"]["no_recv_dwf"])
-        self.assertEqual(1, actual.summary["unresolved"]["no_schema_config"])
-        self.assertEqual(1, actual.summary["unresolved"]["unknown_upstream_system"])
-        self.assertEqual(1, actual.summary["conflict"]["schema_match_conflict"])
+        self.assertEqual(1, len(audit.items))
+        self.assertEqual(
+            "PLAN_SA_RECV_ACS_ACS_CBSRUN_DAY",
+            audit.items[0].source_system_identity,
+        )
+        self.assertEqual("ACCD_ACCOUNT_LIST", audit.items[0].source_table)
 
 
 class MetadataResolverComplexityTests(unittest.TestCase):
@@ -504,9 +669,13 @@ class MetadataResolverComplexityTests(unittest.TestCase):
         resolve_calls = 1000
         recv = [
             RecvDwfRecord(
-                "PLAN_0" if index == 0 else f"PLAN_{index}",
+                (
+                    "PLAN_SA_RECV_DEMO_SCHEMA_A_SOURCE_0_DAY"
+                    if index == 0
+                    else f"PLAN_SA_RECV_NS_{index}_SOURCE_{index}_DAY"
+                ),
                 "DWF.F_TARGET" if index == 0 else f"DWF.DWF_TARGET_{index}",
-                f"SOURCE_{index}",
+                "SOURCE_0" if index == 0 else f"SOURCE_{index}",
                 ods_job_name=(
                     "JOB_DEMO_DAY" if index == 0 else f"JOB_OTHER_{index}_DAY"
                 ),
@@ -514,15 +683,16 @@ class MetadataResolverComplexityTests(unittest.TestCase):
             for index in range(metadata_rows)
         ]
         schemas = [SchemaConfigRecord("SOURCE_0", "DEMO_SCHEMA_A")]
-        systems = _systems(("PLAN_0", 123))
+        systems = _systems(("PLAN_SA_RECV_DEMO_SCHEMA_A_SOURCE_0_DAY", 123))
         args = {
             "target": "DWF.DWF_TARGET",
             "program_names": ("005_DEMO.py", "JOB_DEMO_DAY"),
-            "physical_source": "DWO.DWO_DEMO_SCHEMA_A_SOURCE",
+            "physical_source": "DWO.DWO_DEMO_SCHEMA_A_SOURCE_0",
         }
 
         original_program_normalizer = metadata_resolver.normalize_program_name
         original_target_normalizer = metadata_resolver.normalize_logical_target
+        original_namespace_resolver = metadata_resolver.derive_recv_namespace
         program_results = {
             value: original_program_normalizer(value)
             for value in [*(row.ods_job_name for row in recv), *args["program_names"]]
@@ -530,6 +700,12 @@ class MetadataResolverComplexityTests(unittest.TestCase):
         target_results = {
             value: original_target_normalizer(value)
             for value in [*(row.table_name for row in recv), args["target"]]
+        }
+        namespace_results = {
+            (row.recv_plan, row.data_source): original_namespace_resolver(
+                row.recv_plan, row.data_source
+            )
+            for row in recv
         }
         counts = Counter()
 
@@ -541,18 +717,24 @@ class MetadataResolverComplexityTests(unittest.TestCase):
             counts["normalize_logical_target"] += 1
             return target_results[value]
 
-        legacy = ReferenceMetadataResolver(recv, schemas, systems)
-        with (
-            patch.object(metadata_resolver, "normalize_program_name", counted_program_name),
-            patch.object(metadata_resolver, "normalize_logical_target", counted_logical_target),
-        ):
-            expected = None
-            for _ in range(resolve_calls):
-                expected = legacy.resolve(**args)
-            before = counts.copy()
+        def counted_recv_namespace(recv_plan, data_source):
+            counts["derive_recv_namespace"] += 1
+            return namespace_results[(recv_plan, data_source)]
 
+        with (
+            patch.object(
+                metadata_resolver, "normalize_program_name", counted_program_name
+            ),
+            patch.object(
+                metadata_resolver, "normalize_logical_target", counted_logical_target
+            ),
+            patch.object(
+                metadata_resolver, "derive_recv_namespace", counted_recv_namespace
+            ),
+        ):
             counts.clear()
             indexed = MetadataResolver(recv, schemas, systems)
+            init_counts = counts.copy()
             with patch.object(
                 indexed, "_resolve_indexed", wraps=indexed._resolve_indexed
             ) as indexed_resolve:
@@ -561,11 +743,11 @@ class MetadataResolverComplexityTests(unittest.TestCase):
                     actual = indexed.resolve(**args)
             after = counts.copy()
 
-        self.assertEqual(_signature(expected), _signature(actual))
+        self.assertEqual(("RESOLVED", None), (actual.status, actual.reason))
         self.assertEqual(1, indexed_resolve.call_count)
         self.assertEqual(1, len(indexed._resolution_cache))
-        self.assertEqual(7_527_000, before["normalize_program_name"])
-        self.assertEqual(3_764_000, before["normalize_logical_target"])
+        self.assertEqual(metadata_rows, init_counts["derive_recv_namespace"])
+        self.assertEqual(metadata_rows, after["derive_recv_namespace"])
         self.assertEqual(5_762, after["normalize_program_name"])
         self.assertEqual(4_762, after["normalize_logical_target"])
         self.assertLess(after["normalize_program_name"], metadata_rows * 2)
@@ -627,19 +809,21 @@ class FieldMappingCliCompatibilityAndProgressTests(unittest.TestCase):
             project.mkdir()
             (project / "mapping.sql").write_text(
                 "INSERT INTO DWF.F_DEMO_TARGET (ID) "
-                "SELECT s.ID FROM DWO.DWO_SCHEMA_A_SOURCE s",
+                "SELECT s.ID FROM DWO.DWO_DEMO_SCHEMA_A_SOURCE s",
                 encoding="utf-8",
             )
             metadata_path = root / "metadata.json"
             metadata_path.write_text(
-                '{"recv_dwf":[{"recv_plan":"PLAN","table_name":"DWF.DWF_DEMO_TARGET",'
-                '"data_source":"SRC","ods_job_name":""}],'
-                '"schema_config":[{"schema_key":"SRC","db_schema":"SCHEMA_A"}]}',
+                '{"recv_dwf":[{"recv_plan":"PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY",'
+                '"table_name":"DWF.DWF_DEMO_TARGET",'
+                '"data_source":"DEMO_SYSTEM_A","ods_job_name":""}],'
+                '"schema_config":[{"schema_key":"DEMO_SYSTEM_A","db_schema":"DEMO_SCHEMA_A"}]}',
                 encoding="utf-8",
             )
             upstreams_path = root / "upstreams.json"
             upstreams_path.write_text(
-                '{"items":[{"id":"PLAN","upstreamSystemId":101}]}',
+                '{"items":[{"id":"PLAN_SA_RECV_DEMO_SCHEMA_A_DEMO_SYSTEM_A_DAY",'
+                '"upstreamSystemId":101}]}',
                 encoding="utf-8",
             )
             stdout = io.StringIO()
@@ -664,7 +848,10 @@ class FieldMappingCliCompatibilityAndProgressTests(unittest.TestCase):
         result = json.loads(stdout.getvalue())
         self.assertEqual(0, code)
         self.assertEqual(1, result["resolve_calls"])
-        self.assertEqual(1, result["audit_summary"]["resolution"]["resolved_field_mappings"])
+        self.assertEqual(
+            1, result["audit_summary"]["resolution"]["resolved_field_mappings"]
+        )
+        self.assertEqual(1, result["derive_recv_namespace_calls"])
         self.assertEqual(64, len(result["audit_result_sha256"]))
         self.assertIn("[collector] projects=1/1", stderr.getvalue())
 

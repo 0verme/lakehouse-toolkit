@@ -58,10 +58,12 @@ def main(argv: list[str] | None = None) -> int:
         "resolve_seconds": 0.0,
         "normalize_program_name_calls": 0,
         "normalize_logical_target_calls": 0,
+        "derive_recv_namespace_calls": 0,
     }
 
     original_program_normalizer = resolver_module.normalize_program_name
     original_target_normalizer = resolver_module.normalize_logical_target
+    original_recv_namespace_resolver = resolver_module.derive_recv_namespace
     original_collector_target_normalizer = collector_module.normalize_logical_target
 
     def count_program_name(value: str) -> str:
@@ -72,8 +74,13 @@ def main(argv: list[str] | None = None) -> int:
         counters["normalize_logical_target_calls"] += 1
         return original_target_normalizer(value)
 
+    def count_recv_namespace(recv_plan: str, data_source: str) -> str | None:
+        counters["derive_recv_namespace_calls"] += 1
+        return original_recv_namespace_resolver(recv_plan, data_source)
+
     resolver_module.normalize_program_name = count_program_name
     resolver_module.normalize_logical_target = count_logical_target
+    resolver_module.derive_recv_namespace = count_recv_namespace
     collector_module.normalize_logical_target = count_logical_target
     started_at = time.perf_counter()
     try:
@@ -111,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         resolver_module.normalize_program_name = original_program_normalizer
         resolver_module.normalize_logical_target = original_target_normalizer
+        resolver_module.derive_recv_namespace = original_recv_namespace_resolver
         collector_module.normalize_logical_target = original_collector_target_normalizer
 
     serialized_audit = json.dumps(

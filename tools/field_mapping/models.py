@@ -27,9 +27,19 @@ class DapUpstreamSystem:
 
 @dataclass(frozen=True, slots=True)
 class DwoSource:
+    """Resolved DWO physical relation.
+
+    ``recv_namespace`` is the DWO landing namespace derived from the full
+    ``recv_plan`` + ``data_source`` pair. ``db_schema`` is source-database schema
+    metadata taken from ``p_schema_config`` for the selected ``data_source`` and
+    is ``None`` when that metadata is absent or ambiguous. It never carries the
+    DWO namespace prefix and never participates in upstream identity.
+    """
+
     physical_table: str
-    db_schema: str
+    recv_namespace: str
     source_table: str
+    db_schema: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +49,7 @@ class MappingField:
     mapping_rule: str
     field_order: int
     physical_source_table: str
-    db_schema: str
+    db_schema: str | None
     program: str
     evidence: tuple[str, ...] = ()
 

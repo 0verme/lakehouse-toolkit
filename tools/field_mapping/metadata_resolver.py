@@ -4,6 +4,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ from .models import (
     Resolution,
     SchemaConfigRecord,
 )
+
+RECV_PLAN_PREFIX = "PLAN_SA_RECV_"
 
 
 class MetadataInputError(ValueError):
@@ -145,35 +148,75 @@ def _identifier_parts(physical_table: str) -> tuple[str, ...]:
     )
 
 
-def parse_dwo_physical_table(
-    physical_table: str,
-    schema_configs: Iterable[SchemaConfigRecord],
-) -> tuple[DwoSource | None, str | None]:
-    """Split DWO_<db_schema>_<source_table> using longest exact schema prefix."""
+def derive_recv_namespace(recv_plan: str, data_source: str) -> str | None:
+    """Derive the DWO landing namespace from the full ``recv_plan`` + ``data_source``.
+
+    The receiving plan is modeled as::
+
+        recv_plan = PLAN_SA_RECV_<recv_namespace>_<data_source>[_<suffix>...]
+
+    Both the complete ``recv_plan`` and the complete ``data_source`` are used as
+    anchors: ``data_source`` must occur as a whole underscore-delimited token
+    sequence inside ``recv_plan`` and the tokens before it form the namespace.
+    The trailing suffix is deliberately not interpreted, so ``DAY``, ``NIGHT``,
+    ``PRO`` and future suffixes are all allowed.
+
+    The function fails closed (returns ``None``) when the plan does not follow
+    the anchor shape, when the namespace would be empty, or when more than one
+    legal split exists. Callers must never fall back to a guessed namespace.
+    """
+
+    plan = _text(recv_plan).upper()
+    source = _text(data_source).upper()
+    if not plan.startswith(RECV_PLAN_PREFIX) or not source:
+        return None
+    remainder = plan[len(RECV_PLAN_PREFIX) :]
+    plan_tokens = tuple(remainder.split("_"))
+    source_tokens = tuple(source.split("_"))
+    if not remainder or any(not token for token in plan_tokens):
+        return None
+    if any(not token for token in source_tokens):
+        return None
+    width = len(source_tokens)
+    namespaces: set[str] = set()
+    for index in range(len(plan_tokens) - width + 1):
+        if plan_tokens[index : index + width] != source_tokens:
+            continue
+        namespace = "_".join(plan_tokens[:index])
+        if namespace:
+            namespaces.add(namespace)
+    if len(namespaces) != 1:
+        return None
+    return namespaces.pop()
+
+
+def match_dwo_source(physical_table: str, recv_namespace: str) -> DwoSource | None:
+    """Split ``DWO_<recv_namespace>_<source_table>`` with namespace boundary matching.
+
+    Only ``encoded == namespace`` or ``encoded.startswith(namespace + "_")`` is
+    accepted, so a namespace such as ``CBS`` never matches ``CBSX`` or ``CBS2``.
+    Multi-token namespaces (for example ``NUPS_DATA``) are stripped as a whole.
+    """
 
     parts = _identifier_parts(physical_table)
     if len(parts) < 2 or parts[-2] != "DWO" or not parts[-1].startswith("DWO_"):
-        return None, "no_dwo_source"
+        return None
     encoded = parts[-1][4:]
-    candidates = {
-        config.db_schema.strip().upper()
-        for config in schema_configs
-        if config.db_schema.strip()
-        and encoded.casefold().startswith((config.db_schema.strip() + "_").casefold())
-    }
-    if not candidates:
-        return None, "no_schema_config"
-    longest = max(len(schema) for schema in candidates)
-    best = sorted(schema for schema in candidates if len(schema) == longest)
-    if len(best) != 1:
-        return None, "schema_match_conflict"
-    db_schema = best[0]
-    source_table = encoded[len(db_schema) + 1 :]
+    namespace = _text(recv_namespace).upper()
+    if not namespace:
+        return None
+    if encoded == namespace:
+        return None
+    if not encoded.startswith(namespace + "_"):
+        return None
+    source_table = encoded[len(namespace) + 1 :]
     if not source_table:
-        return None, "no_dwo_source"
+        return None
     return DwoSource(
-        physical_table=".".join(parts), db_schema=db_schema, source_table=source_table
-    ), None
+        physical_table=".".join(parts),
+        recv_namespace=namespace,
+        source_table=source_table,
+    )
 
 
 def _upstream_rows(payload: Any) -> list[dict[str, Any]]:
@@ -224,6 +267,15 @@ def load_upstream_systems(payload: Any) -> tuple[list[DapUpstreamSystem], int | 
 
 
 class MetadataResolver:
+    """Resolve DWO physical fields to DWF targets using recv namespace identity.
+
+    Candidate selection starts from the logical DWF target, derives each
+    candidate's DWO landing namespace from the full ``recv_plan`` +
+    ``data_source`` pair, and then boundary-matches the physical DWO relation.
+    Program names and ``p_schema_config.db_schema`` are auxiliary evidence only;
+    neither one can decide upstream identity.
+    """
+
     def __init__(
         self,
         recv_dwf: Iterable[RecvDwfRecord],
@@ -247,36 +299,21 @@ class MetadataResolver:
             )
 
         recv_by_logical_target: dict[str, list[RecvDwfRecord]] = defaultdict(list)
-        recv_by_program: dict[str, list[RecvDwfRecord]] = defaultdict(list)
-        recv_by_target_program: dict[
-            tuple[str, str], list[tuple[int, RecvDwfRecord]]
-        ] = defaultdict(list)
-        recv_identities_by_target: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        recv_namespace_by_record: dict[RecvDwfRecord, str | None] = {}
         normalized_program_name_by_record: dict[RecvDwfRecord, str] = {}
-        for index, row in enumerate(self.recv_dwf):
+        for row in self.recv_dwf:
             logical_target = normalize_logical_target(row.table_name)
-            program_name = normalize_program_name(row.ods_job_name)
             recv_by_logical_target[logical_target].append(row)
-            recv_identities_by_target[logical_target].add(
-                (row.recv_plan.casefold(), row.data_source.casefold())
+            recv_namespace_by_record[row] = derive_recv_namespace(
+                row.recv_plan, row.data_source
             )
-            normalized_program_name_by_record[row] = program_name
-            if program_name:
-                recv_by_program[program_name].append(row)
-                recv_by_target_program[(logical_target, program_name)].append(
-                    (index, row)
-                )
+            normalized_program_name_by_record[row] = normalize_program_name(
+                row.ods_job_name
+            )
         self.recv_by_logical_target = {
             key: tuple(rows) for key, rows in recv_by_logical_target.items()
         }
-        self.recv_by_program = {key: tuple(rows) for key, rows in recv_by_program.items()}
-        self.recv_by_target_program = {
-            key: tuple(rows) for key, rows in recv_by_target_program.items()
-        }
-        self._recv_identities_by_target = {
-            key: frozenset(identities)
-            for key, identities in recv_identities_by_target.items()
-        }
+        self.recv_namespace_by_record = recv_namespace_by_record
         self._normalized_program_name_by_record = normalized_program_name_by_record
         self._resolution_cache: dict[
             tuple[str, tuple[str, ...], tuple[str, ...]], Resolution
@@ -303,7 +340,6 @@ class MetadataResolver:
         if cached is not None:
             return cached
         resolution = self._resolve_indexed(
-            logical_target=logical_target,
             target_rows=target_rows,
             program_keys=frozenset(normalized_program_names),
             physical_source=physical_source,
@@ -311,105 +347,64 @@ class MetadataResolver:
         self._resolution_cache[cache_key] = resolution
         return resolution
 
+    def _schema_db_schema(self, data_source: str) -> str | None:
+        """Return p_schema_config.db_schema for one data_source, never an arbitrary pick."""
+
+        configured = self.schemas_by_key.get(data_source.casefold())
+        if not configured or len(configured) != 1:
+            return None
+        return next(iter(configured))
+
     def _resolve_indexed(
         self,
         *,
-        logical_target: str,
         target_rows: tuple[RecvDwfRecord, ...],
         program_keys: frozenset[str],
         physical_source: str,
     ) -> Resolution:
-        matched_program_entries = [
-            entry
-            for program_key in program_keys
-            for entry in self.recv_by_target_program.get(
-                (logical_target, program_key), ()
-            )
-        ]
-        target_program_rows = [
-            row
-            for _, row in sorted(matched_program_entries, key=lambda entry: entry[0])
-        ]
-        has_program_rows = any(self.recv_by_program.get(key) for key in program_keys)
-        if has_program_rows and not target_program_rows:
-            return Resolution(status="CONFLICT", reason="program_metadata_conflict")
-        if target_program_rows:
-            target_identities = self._recv_identities_by_target[logical_target]
-            matched_identities = {
-                (row.recv_plan.casefold(), row.data_source.casefold())
-                for row in target_program_rows
-            }
-            if not target_identities.intersection(matched_identities):
-                return Resolution(status="CONFLICT", reason="program_metadata_conflict")
-            candidates = target_program_rows
-            evidence = ["ods_job_name", "table_name"]
-        else:
-            candidates = target_rows
-            evidence = ["table_name"]
+        parts = _identifier_parts(physical_source)
+        if len(parts) < 2 or parts[-2] != "DWO" or not parts[-1].startswith("DWO_"):
+            return Resolution(status="UNRESOLVED", reason="no_dwo_source")
 
-        source, source_error = parse_dwo_physical_table(
-            physical_source, self.schema_configs
-        )
-        if source_error:
-            return Resolution(
-                status="UNRESOLVED", reason=source_error, evidence=tuple(evidence)
-            )
+        matched: dict[tuple[str, str], list[RecvDwfRecord]] = defaultdict(list)
+        matched_sources: dict[tuple[str, str], DwoSource] = {}
+        namespace_unresolved_rows = 0
+        for row in target_rows:
+            namespace = self.recv_namespace_by_record[row]
+            if not namespace:
+                namespace_unresolved_rows += 1
+                continue
+            source = match_dwo_source(physical_source, namespace)
+            if source is None:
+                continue
+            identity = (row.recv_plan.casefold(), row.data_source.casefold())
+            matched[identity].append(row)
+            matched_sources[identity] = source
 
-        schema_compatible: list[RecvDwfRecord] = []
-        missing_schema: list[RecvDwfRecord] = []
-        for row in candidates:
-            configured = self.schemas_by_key.get(row.data_source.casefold(), set())
-            if not configured:
-                missing_schema.append(row)
-            elif source and source.db_schema.casefold() in {
-                schema.casefold() for schema in configured
-            }:
-                schema_compatible.append(row)
-        if not schema_compatible:
-            if missing_schema:
+        if not matched:
+            if namespace_unresolved_rows == len(target_rows):
                 return Resolution(
                     status="UNRESOLVED",
-                    reason="no_schema_config",
-                    source=source,
-                    evidence=tuple(evidence),
+                    reason="recv_namespace_unresolved",
+                    evidence=("table_name", "recv_namespace"),
                 )
             return Resolution(
-                status="CONFLICT",
-                reason="schema_match_conflict",
-                source=source,
-                evidence=tuple(evidence + ["db_schema"]),
+                status="UNRESOLVED",
+                reason="no_recv_namespace_match",
+                evidence=("table_name", "recv_namespace"),
             )
-        candidates = schema_compatible
-        evidence.append("db_schema")
-
-        identities = {
-            (row.recv_plan.casefold(), row.data_source.casefold()) for row in candidates
-        }
-        recv_plans = {identity[0] for identity in identities}
-        data_sources = {identity[1] for identity in identities}
-        if len(recv_plans) > 1:
+        if len(matched) > 1:
             return Resolution(
                 status="CONFLICT",
-                reason="multiple_recv_plan_conflict",
-                source=source,
-                evidence=tuple(evidence),
-            )
-        if len(data_sources) > 1:
-            return Resolution(
-                status="CONFLICT",
-                reason="multiple_data_source_conflict",
-                source=source,
-                evidence=tuple(evidence),
+                reason="multiple_recv_namespace_conflict",
+                evidence=("table_name", "recv_namespace"),
             )
 
-        # Identical candidates are equivalent metadata evidence; no conflicting row is
-        # selected by order because recv_plan/data_source/table identity is now unique.
-        # Multiple metadata rows with the same recv_plan/data_source are acceptable
-        # only after table, program (when matched), and db_schema evidence have been
-        # evaluated. Their remaining row-level differences do not change the business
-        # identity consumed by the collector.
+        identity, identity_rows = next(iter(matched.items()))
+        # Multiple metadata rows with the same (recv_plan, data_source) are
+        # equivalent evidence; choose a deterministic representative row only.
         record = min(
-            candidates,
+            identity_rows,
             key=lambda row: (
                 row.recv_plan.casefold(),
                 row.data_source.casefold(),
@@ -417,6 +412,18 @@ class MetadataResolver:
                 row.ods_job_name.casefold(),
             ),
         )
+        source = replace(
+            matched_sources[identity],
+            db_schema=self._schema_db_schema(record.data_source),
+        )
+
+        evidence = ["table_name", "recv_namespace"]
+        if any(
+            self._normalized_program_name_by_record[row] in program_keys
+            for row in identity_rows
+        ):
+            evidence.append("ods_job_name")
+
         matching_systems = self.systems_by_identity.get(
             record.recv_plan.casefold(), set()
         )
@@ -448,11 +455,13 @@ class MetadataResolver:
 __all__ = [
     "MetadataInputError",
     "MetadataResolver",
+    "RECV_PLAN_PREFIX",
     "canonical_dwf_target",
+    "derive_recv_namespace",
     "load_metadata_snapshot",
     "load_upstream_snapshot",
     "load_upstream_systems",
+    "match_dwo_source",
     "normalize_logical_target",
     "normalize_program_name",
-    "parse_dwo_physical_table",
 ]
