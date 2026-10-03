@@ -1,39 +1,86 @@
 # Field Mapping Resolver Windows UAT
 
-This probe compares an unmodified checkout (`before`, normally the current main at PR base) with the candidate checkout using the same fixed 100-project source sample, metadata snapshots, Python executable, and benchmark helper. It is offline: `--upstreams-json` avoids DAP calls and no API writes are made.
+This UAT validates the recv-namespace upstream identity model after the resolver
+refactor. It is offline: `--upstreams-json` avoids DAP calls and no API writes are
+made. Metadata snapshots stay outside Git and must never include credentials or
+SQL text in committed files.
 
-The helper accepts `--repository-root` separately from its own script path so a copy from the candidate checkout can run against both code revisions. Point the variables below to the existing fixed probe sample and the same local, approved metadata snapshots; do not put credentials or SQL text in the command/output.
+## Full 4020-project local dry-run
+
+Run the normal collector entry point against the complete DWF source root. This
+compares the candidate checkout against the previous main checkout; use one
+`--report-root` per run so the audit bundles stay separate.
 
 ```powershell
 $python = 'C:\Users\czcb.CZCB-20220214FO\pywebio\Scripts\python.exe'
 $before = 'D:\PycharmProjects\lakehouse-toolkit-main-before'
 $after = 'D:\PycharmProjects\lakehouse-toolkit-pr'
-$probe = 'D:\PycharmProjects\lakehouse-toolkit\uat\field-mapping-probe-100'
-$metadata = 'D:\PycharmProjects\lakehouse-toolkit\uat\metadata.json'
-$upstreams = 'D:\PycharmProjects\lakehouse-toolkit\uat\upstreams.json'
-$script = Join-Path $after 'tools\field_mapping\benchmark_resolver.py'
+$source = '<path-to-DWS_DWF>'
+$metadata = '<secure-local-path>\field-mapping-metadata.json'
+$upstreams = '<secure-local-path>\upstreams.json'
 
-foreach ($repo in @($before, $after)) {
-    Write-Host "=== Field Mapping probe: $repo ==="
-    & $python $script `
-        --repository-root $repo `
-        --directory $probe `
-        --metadata-json $metadata `
-        --upstreams-json $upstreams `
-        --progress-every 100
-    if ($LASTEXITCODE -ne 0) { throw "Probe failed for $repo" }
-}
+& $python (Join-Path $after 'jobs\crontab\sync_ods_dwf_field_mappings.py') `
+    --directory $source `
+    --metadata-json $metadata `
+    --upstreams-json $upstreams `
+    --mode local-dry-run `
+    --report-root (Join-Path $after 'runtime\field_mapping_sync_uat') `
+    --progress-every 100
 ```
 
-Compare `audit_result_sha256` (must be identical), the full `audit_summary`, `elapsed_seconds`, `resolve_calls`, `resolve_seconds`, `resolver_percent`, `normalize_program_name_calls`, and `avg_resolve_ms`. The script emits summary/counters only, not SQL or metadata row contents.
+Inspect the generated `summary.json`, `resolved.csv`, `unresolved.csv`, and
+`conflicts.csv` and compare against the previous checkout run.
 
-The fixed 100-project baseline to preserve is:
+## Expected classification change
 
-- 100 projects, 104 Python files
-- 96.99 seconds total; 1457 resolves; 93.89 seconds in resolver (96.8%)
-- 10,966,199 `normalize_program_name` calls
-- resolved: 24 projects, 25 table mappings, 781 field mappings
-- unresolved: no_program=2, no_final_target=37, no_recv_dwf=11, no_schema_config=633, no_dwo_source=0, unknown_upstream_system=0, unsupported_sql=25, multi_source_field_unsupported=0
-- conflicts: program_metadata_conflict=0, multiple_recv_plan_conflict=0, multiple_data_source_conflict=0, schema_match_conflict=7, upstream_system_conflict=0, field_mapping_conflict=0
+The old model split `DWO_<db_schema>_<source_table>` from
+`p_schema_config.db_schema`, so `no_schema_config` and `schema_match_conflict`
+dominated the schema-related diagnostics. The new model uses
+`recv_plan + full data_source -> recv namespace -> DWO_<recv_namespace>_<source_table>`
+and reports:
 
-Expect a large reduction in resolver time and normalization calls without any digest, summary, or audit-evidence change. The preferred `<20s` total is a target, not a CI wall-clock gate. After merge, run this fixed 100-project A/B probe in the Windows UAT environment; do not proceed directly to the 4020-project full local dry-run, server-dry-run, or real-sync.
+- unresolved: `recv_namespace_unresolved`, `no_recv_namespace_match`
+- conflict: `multiple_recv_namespace_conflict`
+
+`program_metadata_conflict`, `multiple_data_source_conflict`, and
+`schema_match_conflict` are no longer produced by the resolver identity chain.
+`program_metadata_conflict` intentionally remains absent; `ods_job_name` stays
+auxiliary evidence only.
+
+The probe baseline from the internal full 4020 walk was:
+
+- about 1996 unique schema-related mappings; about 1929 (96.6%) are explainable by
+  the new model with a unique recv namespace identity;
+- remaining boundaries: 66 `NONE` (`no_recv_namespace_match`) and 1 `MULTIPLE`
+  (`multiple_recv_namespace_conflict`, the `DWO_DTSELL_PUB_OPER_LOG` case);
+- about 626 / 627 existing resolved mappings are explainable by the new model;
+- the only known regression is `PLAN_SA_RECV_WD_DEFENSOR_WD_DEFENSOR_DAY` with
+  physical `DWO_DEFENSOR_REPORT_REQUEST`, which is allowed to degrade to
+  `UNRESOLVED` / diagnostic because `db_schema` no longer provides a fallback.
+
+Do not hardcode these counts into CI. Use them only as an order-of-magnitude check
+after the Windows UAT; the authoritative result is the rerun on the real metadata
+snapshot.
+
+## Performance
+
+The resolver precomputes the logical-target index, per-record recv namespace, and
+normalized program evidence once in `MetadataResolver.__init__`; `resolve()` only
+walks the candidates of the requested logical target and caches results. For the
+offline benchmark helper use:
+
+```powershell
+& $python (Join-Path $after 'tools\field_mapping\benchmark_resolver.py') `
+    --repository-root $after `
+    --directory $source `
+    --metadata-json $metadata `
+    --upstreams-json $upstreams `
+    --progress-every 100
+```
+
+Compare `elapsed_seconds`, `resolve_calls`, `resolve_seconds`,
+`resolver_percent`, `normalize_program_name_calls`,
+`normalize_logical_target_calls`, `derive_recv_namespace_calls`, and
+`avg_resolve_ms` with the previous main baseline. The audit digest is expected to
+change because the resolver model changed; only the performance counters and the
+reason distribution should be compared across revisions.

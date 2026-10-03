@@ -631,7 +631,8 @@ def collect_workspace(
         issue["reason"] == "no_final_target" for issue in unresolved
     )
     no_recv_count = 0
-    no_schema_count = 0
+    recv_namespace_unresolved_count = 0
+    no_recv_namespace_match_count = 0
     no_dwo_count = 0
     unknown_upstream_count = 0
     conflict_counts: dict[str, int] = defaultdict(int)
@@ -776,8 +777,10 @@ def collect_workspace(
                         if resolution.status == "CONFLICT":
                             conflict_counts[reason] += 1
                         else:
-                            if reason == "no_schema_config":
-                                no_schema_count += 1
+                            if reason == "recv_namespace_unresolved":
+                                recv_namespace_unresolved_count += 1
+                            elif reason == "no_recv_namespace_match":
+                                no_recv_namespace_match_count += 1
                             elif reason == "no_dwo_source":
                                 no_dwo_count += 1
                             elif reason == "unknown_upstream_system":
@@ -837,7 +840,7 @@ def collect_workspace(
                         or previous.field_order != field.field_order
                         or previous.physical_source_table.casefold()
                         != field.physical_source_table.casefold()
-                        or previous.db_schema.casefold() != field.db_schema.casefold()
+                        or previous.db_schema != field.db_schema
                     ):
                         conflict_counts["field_mapping_conflict"] += 1
                         builder["conflicting"] = True
@@ -852,10 +855,10 @@ def collect_workspace(
                                 f"sourceField={field.source_field} "
                                 f"targetField={field.target_field}; "
                                 f"previous={previous.physical_source_table}"
-                                f"/{previous.db_schema}/{previous.field_order}/"
+                                f"/{previous.db_schema or ''}/{previous.field_order}/"
                                 f"{previous.mapping_rule}; "
                                 f"current={field.physical_source_table}"
-                                f"/{field.db_schema}/{field.field_order}/"
+                                f"/{field.db_schema or ''}/{field.field_order}/"
                                 f"{field.mapping_rule}"
                             ),
                         )
@@ -900,7 +903,7 @@ def collect_workspace(
                         for name in (
                             "ods_job_name",
                             "table_name",
-                            "db_schema",
+                            "recv_namespace",
                             "dap_upstream_system",
                         )
                         if name
@@ -977,7 +980,8 @@ def collect_workspace(
             "no_program": projects_without_program,
             "no_final_target": no_final_target_count,
             "no_recv_dwf": no_recv_count,
-            "no_schema_config": no_schema_count,
+            "recv_namespace_unresolved": recv_namespace_unresolved_count,
+            "no_recv_namespace_match": no_recv_namespace_match_count,
             "no_dwo_source": no_dwo_count,
             "unknown_upstream_system": unknown_upstream_count,
             "unsupported_sql": unsupported_count,
@@ -986,10 +990,8 @@ def collect_workspace(
         "conflict": {
             reason: conflict_counts.get(reason, 0)
             for reason in (
-                "program_metadata_conflict",
+                "multiple_recv_namespace_conflict",
                 "multiple_recv_plan_conflict",
-                "multiple_data_source_conflict",
-                "schema_match_conflict",
                 "upstream_system_conflict",
                 "field_mapping_conflict",
             )
