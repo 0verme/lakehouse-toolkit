@@ -35,8 +35,11 @@ Protocol 的语义化别名，不维护第二套接口。backend 必须提供：
 
 `SqlAnalysis` 的最小字段为：
 
-- `steps`：现有 `SQLStep` tuple；因此 `statement_type`、`sources`、`target`、
-  raw token、位置和 edge evidence 继续沿用当前 parser 输出，并新增轻量 `query_blocks` facts；
+- `steps`：仅包含 target/source 可用于 lineage 的现有 `SQLStep` tuple；因此
+  `statement_type`、`sources`、`target`、raw token、位置和 edge evidence 继续沿用当前 parser
+  输出，并新增轻量 `query_blocks` facts；
+- `unresolved_write_targets`：目标动态且不完整的写入 statement 的安全诊断 tuple，只含
+  statement index/type 与 `SQL_ARGUMENT_DYNAMIC` reason，不含 SQL 或动态值；
 - `ctes`：与 `steps` 一一对应的 CTE 名称 tuple。CTE 仅是 parser evidence，
   不创建 Physical 节点或边；
 - `candidate_count`：保持现有 coverage 语义，不等同于 step 数量；
@@ -51,11 +54,12 @@ Protocol 的语义化别名，不维护第二套接口。backend 必须提供：
 ```json
 {
   "backend": "legacy",
-  "backend_version": "legacy-parser-v4-dynamic-literal-template",
+  "backend_version": "legacy-parser-v5-dynamic-write-target",
   "parse_status": "success",
   "confidence": "high",
   "extraction_reason": "CANDIDATE_FOUND",
   "candidate_count": 1,
+  "unresolved_write_targets": [],
   "steps": [
     {
       "statement_index": 0,
@@ -83,8 +87,9 @@ edge count、issue count 和差异分类。
 
 1. `ProgramSource.script_code` 进入 `ParserBackend.analyze`；
 2. backend 返回不可变的 `SqlAnalysis`；
-3. Physical DAG 只消费 `analysis.steps`、`candidate_count` 和
-   `extraction_reason`，继续使用原有 `SQLStep` / graph logic；
+3. Physical DAG 消费 `analysis.steps`、`unresolved_write_targets`、`candidate_count` 和
+   `extraction_reason`；未解析 target 不会成为 SQLStep/graph node/edge，其余 step 继续使用
+   原有 graph logic；
 4. Audit、Materialization 和持久化层不读取 backend metadata。
 
 Legacy parser 的状态映射：
@@ -96,9 +101,11 @@ Legacy parser 的状态映射：
 | `PYTHON_PARSE_FAILED` | `failed` | `none` |
 | empty、dynamic、unknown wrapper、non-SQL 等无安全 candidate 情况 | `unresolved` | `none` |
 
-`unresolved` 和 `failed` 都返回空 `steps`，不会用 `expected_target`、程序名或 sink
-反推关系。backend 预期的解析失败必须显式返回 `SqlAnalysis`；unexpected
-exception 不做静默 fallback，避免把错误误报成“无血缘”。
+一般 `unresolved` 和 `failed` extraction 不返回 SQL steps，不会用 `expected_target`、
+程序名或 sink 反推关系。若 SQL parser 已识别出动态写入目标，`analysis.steps` 不包含该
+statement；`unresolved_write_targets` 单独保留安全 locator。backend 预期的解析失败必须
+显式返回 `SqlAnalysis`；unexpected exception 不做静默 fallback，避免
+把错误误报成“无血缘”。
 
 ## Legacy adapter 与 production default
 
@@ -125,13 +132,16 @@ reason；Audit 生成 `STATIC_EMPTY_QUERY` 时只持久化最小脱敏字段，�
 Fake backend contract test 仍验证旧 backend facade 的 SQLStep → Physical DAG → Audit →
 Materialization 链路。
 
-Legacy adapter 的 compare contract 从 `legacy-parser-v3-static-empty-query` bump 到
-`legacy-parser-v4-dynamic-literal-template`。`LINEAGE_PIPELINE_VERSION` 当前为
-`lineage-pipeline-v15-dynamic-literal-template`。v15 在 Python expression extraction 中
-新增安全 SQL template normalization：静态 triple-quoted 模板上的 `.replace()` /
-`.format()` 链与 f-string 允许把动态值折叠为 literal placeholder 后继续进入现有
-SQL parser，动态 schema/table identifier 继续 `SQL_ARGUMENT_DYNAMIC`；同 source hash
-的 v14 facts 必须完整 rebuild。v14 将 degree 证明的 program-local
+Legacy adapter 的 compare contract 从 `legacy-parser-v4-dynamic-literal-template` bump 到
+`legacy-parser-v5-dynamic-write-target`。`LINEAGE_PIPELINE_VERSION` 当前为
+`lineage-pipeline-v16-dynamic-write-target`。v16 对 `.format()` / f-string 等抽取出的 SQL
+placeholder 按实际写入目标位置判断：不完整动态 target 不再截断成 schema 名；对应
+statement 不生成 edge，同程序其它静态步骤保留，并通过 `DYNAMIC_WRITE_TARGET_UNRESOLVED`
+持久化最小定位 AuditFact。非 target 的动态 SELECT expression 不再使静态表级 lineage
+整体丢失。所有 v15 active SQL facts 必须完整 rebuild，partial replay 由 migration preflight
+阻止，随后需重跑 suppression。v15 在 Python expression extraction 中新增安全 SQL template
+normalization：静态 triple-quoted 模板上的 `.replace()` / `.format()` 链与 f-string 把动态值
+折叠为不透明 placeholder；所有 v14 facts 必须完整 rebuild。v14 将 degree 证明的 program-local
 未分类 formal intermediate 纳入既有 Physical DAG path collapse，并为 source/sink
 boundary 新增 blocker issue；同 source hash 的 v13 facts 必须完整 rebuild。v13 使恒假
 Query Block 的 source 不再进入已持久化

@@ -10,7 +10,9 @@
 # audit blockers for unclassified formal source/sink boundaries.
 # v15 keeps statically proven SQL object identifiers from ``.replace()`` /
 # ``.format()`` / f-string templates while replacing dynamic values with an
-# opaque literal placeholder; dynamic identifier contexts still fail closed.
-LINEAGE_PIPELINE_VERSION = "lineage-pipeline-v15-dynamic-literal-template"
+# opaque literal placeholder.
+# v16 rejects incomplete dynamic write targets per statement, preserves unrelated
+# static table lineage, and records a sanitized unresolved-target AuditFact.
+LINEAGE_PIPELINE_VERSION = "lineage-pipeline-v16-dynamic-write-target"
 
 __all__ = ["LINEAGE_PIPELINE_VERSION"]

@@ -87,6 +87,46 @@ _UPDATE_TARGET_PATTERN = re.compile(
     rf"\bUPDATE\s+(?:ONLY\s+)?(?P<target>{_QUALIFIED_IDENTIFIER})",
     re.IGNORECASE,
 )
+_DYNAMIC_SQL_PLACEHOLDER = "__LINEAGE_DYNAMIC_LITERAL__"
+_DYNAMIC_IDENTIFIER_FRAGMENT_RE = re.compile(
+    rf"\{{[^{{}}]*\}}|{re.escape(_DYNAMIC_SQL_PLACEHOLDER)}"
+)
+_DYNAMIC_WRITE_TARGET_PREFIXES = (
+    (
+        "create_foreign_table",
+        re.compile(
+            r"\bCREATE\s+(?:(?:OR\s+REPLACE|GLOBAL|LOCAL)\s+)*"
+            r"FOREIGN\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "insert",
+        re.compile(
+            r"\bINSERT\s+(?:OVERWRITE|INTO)\s+"
+            r"(?:(?:INTO|LOCAL|TABLE)\s+)*(?:IF\s+NOT\s+EXISTS\s+)?",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "create_table",
+        re.compile(
+            r"\bCREATE\s+(?:(?:OR\s+REPLACE|GLOBAL|LOCAL|UNLOGGED|"
+            r"TEMPORARY|TEMP)\s+)*TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "create_view",
+        re.compile(
+            r"\bCREATE\s+(?:(?:OR\s+REPLACE|GLOBAL|LOCAL|MATERIALIZED|"
+            r"TEMPORARY|TEMP)\s+)*VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?",
+            re.IGNORECASE,
+        ),
+    ),
+    ("merge", re.compile(r"\bMERGE\s+INTO\s+", re.IGNORECASE)),
+    ("update", re.compile(r"\bUPDATE\s+(?:ONLY\s+)?", re.IGNORECASE)),
+)
 _WRITE_STATEMENT_TYPES = frozenset(
     {"insert", "update", "merge", "create_table", "create_view"}
 )
@@ -285,7 +325,8 @@ class ProgramPhysicalDAG:
     """一个程序的 Physical 图及后续审计所需的事实。
 
     ``sql_candidate_count`` 与 ``sql_extraction_reason`` 来自同一次 parser
-    extraction，供 coverage funnel 使用，不保存候选 SQL 文本。
+    extraction，供 coverage funnel 使用，不保存候选 SQL 文本。动态写入目标诊断只
+    保存 statement 定位和固定 reason，不保存 SQL 或运行时变量值。
     """
 
     program_source: ProgramSource
@@ -296,6 +337,7 @@ class ProgramPhysicalDAG:
     expected_target: str | None
     sql_candidate_count: int = 0
     sql_extraction_reason: str = SQLExtractionReason.NO_SQL_CANDIDATE.value
+    unresolved_write_targets: tuple[UnresolvedWriteTarget, ...] = ()
 
     @property
     def node_map(self) -> dict[str, PhysicalNode]:
@@ -306,6 +348,34 @@ class ProgramPhysicalDAG:
     @property
     def edge_pairs(self) -> frozenset[tuple[str, str]]:
         return frozenset((edge.source, edge.target) for edge in self.edges)
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedWriteTarget:
+    """动态写入目标的最小安全诊断，不包含 SQL token 或运行时值。"""
+
+    statement_index: int
+    statement_type: str
+    reason: str = SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.statement_index, int)
+            or isinstance(self.statement_index, bool)
+            or self.statement_index < 0
+        ):
+            raise ValueError("statement_index must be a non-negative integer")
+        if not isinstance(self.statement_type, str) or self.statement_type not in {
+            "insert",
+            "create_table",
+            "create_foreign_table",
+            "create_view",
+            "merge",
+            "update",
+        }:
+            raise ValueError("statement_type is not a supported write operation")
+        if self.reason != SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value:
+            raise ValueError("reason must use the safe SQL_ARGUMENT_DYNAMIC code")
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,10 +539,7 @@ _UNRESOLVED = object()
 _FORMATTER = Formatter()
 _FORMAT_FIELD_ROOT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_FORMAT_TYPES = (str, int, float, bool, type(None))
-# 动态值在 Python 层只统一渲染为同一个 safe placeholder。它既满足 identifier 字符集，
-# 也能安全地位于单引号 literal 内；是否允许继续进入 SQL parser 由
-# ``_normalize_sql_expression`` 按 SQL 上下文判定。
-_DYNAMIC_SQL_PLACEHOLDER = "__LINEAGE_DYNAMIC_LITERAL__"
+# 动态值使用内部 placeholder；它不会作为 dataset 名称或 SQL text 持久化。
 
 
 def _static_value(
@@ -780,9 +847,9 @@ def _normalize_sql_expression(
     """把 Python SQL expression 归一成安全的静态模板或明确的拒绝原因。
 
     只做 AST 静态分析：不执行 ``eval`` / ``exec``，不调用用户函数或 property，
-    也不渲染真实运行时值。动态值统一变成 ``_DYNAMIC_SQL_PLACEHOLDER``；只有该
-    placeholder 完整落在单引号 string literal 内才视为安全 literal，否则按动态
-    identifier fail closed。
+    也不渲染真实运行时值。动态值统一变成 ``_DYNAMIC_SQL_PLACEHOLDER``；本函数只
+    分类 literal 与裸 SQL placeholder，是否使整条语句不可用由后续 SQL 目标位置检查
+    决定，避免 SELECT expression 中的动态字段抹除静态表级关系。
     """
 
     value = _static_value(expression, position, bindings, set())
@@ -793,7 +860,7 @@ def _normalize_sql_expression(
     if _DYNAMIC_SQL_PLACEHOLDER not in value:
         return _SQLExpressionNormalization(_SQLExpressionKind.STATIC_SQL, value)
     if _placeholder_outside_string_literal(value):
-        return _SQLExpressionNormalization(_SQLExpressionKind.DYNAMIC_IDENTIFIER)
+        return _SQLExpressionNormalization(_SQLExpressionKind.DYNAMIC_IDENTIFIER, value)
     return _SQLExpressionNormalization(_SQLExpressionKind.SAFE_DYNAMIC_LITERAL, value)
 
 
@@ -1017,7 +1084,17 @@ def _extract_python_candidates_with_reason(
                     unresolved = True
                     continue
                 if normalized.kind is _SQLExpressionKind.DYNAMIC_IDENTIFIER:
-                    # 动态值落在 identifier context：与历史行为一致，继续拒绝。
+                    text = normalized.text or ""
+                    if _looks_like_sql(text) and _has_static_or_dynamic_write_target(
+                        text
+                    ):
+                        # 只有 SQL 写入目标位置才能让动态 identifier 影响
+                        # statement 是否可信；target 的完整性由 SQL parser 再校验。
+                        candidates.append(
+                            _SQLCandidate(text, line_number, column_number)
+                        )
+                        resolved_candidate = True
+                        break
                     unresolved = True
                     continue
                 if normalized.kind is _SQLExpressionKind.NOT_SQL_VALUE:
@@ -1112,6 +1189,8 @@ def _extract_python_candidates(script_code: str) -> tuple[_SQLCandidate, ...]:
 
 
 def _normalize_asset(raw_name: str | None) -> str | None:
+    if _DYNAMIC_SQL_PLACEHOLDER in (raw_name or ""):
+        return None
     normalized = normalize_table_name(raw_name or "")
     if not normalized or not _ASSET_NAME_RE.fullmatch(normalized):
         return None
@@ -1236,8 +1315,9 @@ def _find_sources(
     seen: set[str] = set()
     for match in _SOURCE_PATTERN.finditer(sanitized_sql):
         following_text = sanitized_sql[match.end() :].lstrip()
-        if following_text.startswith("(") or _is_expression_level_source(
-            sanitized_sql, match
+        if (
+            following_text.startswith(("(", ".", "{", _DYNAMIC_SQL_PLACEHOLDER))
+            or _is_expression_level_source(sanitized_sql, match)
         ):
             continue
         normalized = _normalize_asset(match.group("table"))
@@ -1522,8 +1602,9 @@ def _query_blocks_for_statement(
     tokens_by_start = {token.start: token for token in _sql_tokens(sanitized_sql)}
     for match in _SOURCE_PATTERN.finditer(sanitized_sql):
         following_text = sanitized_sql[match.end() :].lstrip()
-        if following_text.startswith("(") or _is_expression_level_source(
-            sanitized_sql, match
+        if (
+            following_text.startswith(("(", ".", "{", _DYNAMIC_SQL_PLACEHOLDER))
+            or _is_expression_level_source(sanitized_sql, match)
         ):
             continue
         normalized = _normalize_asset(match.group("table"))
@@ -1589,6 +1670,47 @@ def _matched_target(
     )
 
 
+def _unresolved_dynamic_write_target(sanitized_sql: str) -> str | None:
+    """返回目标位置含模板占位符的操作类型；不保留目标 token。"""
+
+    for statement_type, prefix_pattern in _DYNAMIC_WRITE_TARGET_PREFIXES:
+        prefix = prefix_pattern.search(sanitized_sql)
+        if prefix is None:
+            continue
+        tail = sanitized_sql[prefix.end() :].lstrip()
+        target_match = re.match(r"[^\s,();]+", tail)
+        if target_match is None:
+            continue
+        target_fragment = target_match.group(0)
+        if _DYNAMIC_IDENTIFIER_FRAGMENT_RE.search(target_fragment):
+            return statement_type
+
+        # Also recognize whitespace around the qualifier dot, e.g. DLO . {0}.
+        remainder = tail[target_match.end() :]
+        dotted_part = re.match(r"\s*\.\s*(?P<part>[^\s,();]+)", remainder)
+        if dotted_part is not None and _DYNAMIC_IDENTIFIER_FRAGMENT_RE.search(
+            dotted_part.group("part")
+        ):
+            return statement_type
+    return None
+
+
+def _has_static_or_dynamic_write_target(sql_text: str) -> bool:
+    """决定是否可将含动态 SQL expression 的模板交给 statement parser。"""
+
+    for statement in split_sql_statements(strip_sql_comments(sql_text)):
+        sanitized = _mask_sql_string_literals(statement)
+        if _unresolved_dynamic_write_target(sanitized) is not None:
+            return True
+        target = _classify_statement(sanitized)
+        if (
+            target.statement_type in _WRITE_STATEMENT_TYPES
+            and target.target is not None
+        ):
+            return True
+    return False
+
+
 def _classify_statement(sanitized_sql: str) -> _StatementTarget:
     insert_match = _INSERT_TARGET_PATTERN.search(sanitized_sql)
     if insert_match:
@@ -1641,18 +1763,23 @@ def _parse_statement_with_ctes(
     comment_free = strip_sql_comments(statement)
     sanitized = _mask_sql_string_literals(comment_free)
     cte_names = _cte_names(sanitized)
+    dynamic_target_type = _unresolved_dynamic_write_target(sanitized)
     target_info = _classify_statement(sanitized)
+    if dynamic_target_type is not None:
+        target_info = _StatementTarget(dynamic_target_type, None, None)
     source_items = (
         _find_sources(sanitized, cte_names)
-        if target_info.statement_type
+        if dynamic_target_type is None
+        and target_info.statement_type
         in {"insert", "merge", "create_table", "create_view", "update", "select"}
         else ()
     )
     sources = tuple(item.normalized_name for item in source_items)
     raw_sources = tuple(item.raw_name for item in source_items)
-    query_blocks, non_query_sources = _query_blocks_for_statement(
-        sanitized,
-        cte_names,
+    query_blocks, non_query_sources = (
+        _query_blocks_for_statement(sanitized, cte_names)
+        if dynamic_target_type is None
+        else ((), ())
     )
     evidence: dict[str, object] = {
         "statement_index": statement_index,
@@ -1664,6 +1791,11 @@ def _parse_statement_with_ctes(
         evidence["line_number"] = line_number
     if column_number is not None:
         evidence["column_number"] = column_number
+    if dynamic_target_type is not None:
+        evidence["target_resolution"] = {
+            "status": "UNRESOLVED_DYNAMIC_IDENTIFIER",
+            "reason": SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value,
+        }
     return (
         SQLStep(
             statement_index=statement_index,
@@ -1862,6 +1994,8 @@ def build_program_physical_dag(
         _bind_authoritative_write_target(step, expected_target)
         for step in analysis.steps
     )
+    unresolved_write_targets = analysis.unresolved_write_targets
+    extraction_reason = analysis.extraction_reason
     nodes: dict[str, PhysicalNode] = {}
     edges: dict[tuple[str, str], PhysicalEdge] = {}
     written_targets: list[str] = []
@@ -1931,7 +2065,8 @@ def build_program_physical_dag(
         sinks=sinks,
         expected_target=expected_target,
         sql_candidate_count=analysis.candidate_count,
-        sql_extraction_reason=analysis.extraction_reason,
+        sql_extraction_reason=extraction_reason,
+        unresolved_write_targets=tuple(unresolved_write_targets),
     )
 
 
@@ -1975,6 +2110,7 @@ __all__ = [
     "ProgramSQLStep",
     "SQLQueryBlock",
     "SQLStep",
+    "UnresolvedWriteTarget",
     "build_physical_dag",
     "build_program_physical_dag",
     "extract_program_sql_steps",

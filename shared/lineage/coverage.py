@@ -452,6 +452,8 @@ def primary_failure_reason(dag: ProgramPhysicalDAG) -> CoverageReason:
 
     if dag.edges:
         raise ValueError("primary_failure_reason requires a DAG without physical edges")
+    if dag.unresolved_write_targets:
+        return CoverageReason.SQL_ARGUMENT_DYNAMIC
     if dag.sql_candidate_count == 0:
         try:
             return CoverageReason(dag.sql_extraction_reason)

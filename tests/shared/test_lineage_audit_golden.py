@@ -94,6 +94,7 @@ def synthetic_candidates() -> tuple[AuditCandidate, ...]:
                 "cycle_detected",
                 "static_empty_query",
                 "unclassified_formal_sink",
+                "dynamic_write_target_unresolved",
             }
             else EXPECTED_TARGET
         )
@@ -160,6 +161,7 @@ class AuditGoldenCorpusTests(unittest.TestCase):
                 "STATIC_EMPTY_QUERY",
                 "UNCLASSIFIED_FORMAL_SOURCE",
                 "UNCLASSIFIED_FORMAL_SINK",
+                "DYNAMIC_WRITE_TARGET_UNRESOLVED",
             },
         )
 
@@ -425,7 +427,7 @@ class AuditGoldenCorpusTests(unittest.TestCase):
             / "audit_golden_corpus.jsonl"
         )
         corpus = read_corpus(corpus_path, require_labels=True)
-        self.assertEqual(len(corpus), 11)
+        self.assertEqual(len(corpus), 12)
         self.assertEqual(
             {sample.issue_type for sample in corpus if sample.issue_type is not None},
             set(IssueType),

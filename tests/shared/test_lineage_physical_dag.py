@@ -1354,6 +1354,184 @@ executor.do(sql)
                     SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value,
                 )
 
+    def test_dynamic_write_targets_are_isolated_and_diagnosed(self):
+        cases = {
+            "insert_schema_prefix": (
+                "INSERT INTO DLO.{0} SELECT * FROM DLO.DEMO_SOURCE",
+                "insert",
+            ),
+            "insert_bare_target": (
+                "INSERT INTO {target} SELECT * FROM DLO.DEMO_SOURCE",
+                "insert",
+            ),
+            "create_table": (
+                "CREATE TABLE DLO.{0} AS SELECT * FROM DLO.DEMO_SOURCE",
+                "create_table",
+            ),
+            "foreign_table": (
+                "CREATE FOREIGN TABLE {schema}.{table} (id integer)",
+                "create_foreign_table",
+            ),
+            "merge": (
+                "MERGE INTO DWM.{0} USING DLO.DEMO_SOURCE ON 1 = 1 "
+                "WHEN MATCHED THEN UPDATE SET id = 1",
+                "merge",
+            ),
+            "update": (
+                "UPDATE {target} SET id = 1 FROM DLO.DEMO_SOURCE",
+                "update",
+            ),
+        }
+        for name, (sql, statement_type) in cases.items():
+            with self.subTest(name=name):
+                dag = build_program_physical_dag(
+                    program(f"execute({sql!r})", expected_target=None)
+                )
+                self.assertEqual(dag.edges, ())
+                self.assertEqual(dag.nodes, ())
+                self.assertEqual(dag.steps, ())
+                self.assertEqual(len(dag.unresolved_write_targets), 1)
+                diagnostic = dag.unresolved_write_targets[0]
+                self.assertEqual(diagnostic.statement_index, 0)
+                self.assertEqual(diagnostic.statement_type, statement_type)
+                self.assertEqual(diagnostic.reason, "SQL_ARGUMENT_DYNAMIC")
+
+        exact_field_edge = build_program_physical_dag(
+            program(
+                '''execute("""INSERT INTO DLO.{0}
+                PARTITION(DW_DATA_DT = '{1}') SELECT {2}
+                FROM DLO.DLO_ABS5_TE_XZH_INFO_REAL
+                WHERE DW_DATA_DT = '{1}'""")''',
+                expected_target=None,
+            )
+        )
+        self.assertNotIn(
+            ("DLO.DLO_ABS5_TE_XZH_INFO_REAL", "DLO"),
+            edge_pairs(exact_field_edge),
+        )
+        self.assertEqual(exact_field_edge.edges, ())
+        authorized_dynamic_target = build_program_physical_dag(
+            program('execute("INSERT INTO DLO.{0} SELECT * FROM DLO.DEMO_SOURCE")')
+        )
+        authorized_issues = materialize_program(authorized_dynamic_target).issues
+        self.assertEqual(
+            [issue.issue_type for issue in authorized_issues],
+            [IssueType.DYNAMIC_WRITE_TARGET_UNRESOLVED],
+        )
+
+        ddl_boundary = build_program_physical_dag(
+            program(
+                'execute("DROP TABLE IF EXISTS DLO.{0}; '
+                'TRUNCATE TABLE DLO.{0}")',
+                expected_target=None,
+            )
+        )
+        self.assertEqual(ddl_boundary.edges, ())
+        self.assertEqual(ddl_boundary.unresolved_write_targets, ())
+        self.assertEqual(
+            {step.statement_type for step in ddl_boundary.steps}, {"unknown"}
+        )
+
+    def test_dynamic_target_fixture_preserves_static_steps_and_audit_location(self):
+        fixture_path = (
+            ROOT_DIR
+            / "tests"
+            / "fixtures"
+            / "lineage"
+            / "python_sql_dynamic_target.py"
+        )
+        dag = build_program_physical_dag(
+            program(fixture_path.read_text(encoding="utf-8"), expected_target=None)
+        )
+
+        self.assertEqual(
+            edge_pairs(dag),
+            {
+                ("DLO.DEMO_SOURCE_REAL", "DWO.DEMO_STAGE"),
+                ("DWO.DEMO_STAGE", "DWM.DEMO_RESULT"),
+                ("DWF.DEMO_BUSINESS_SOURCE", "DWM.DEMO_RESULT"),
+            },
+        )
+        self.assertEqual([step.statement_index for step in dag.steps], [1, 2])
+        self.assertEqual(dag.steps[0].target, "DWO.DEMO_STAGE")
+        self.assertEqual(dag.steps[1].target, "DWM.DEMO_RESULT")
+        self.assertEqual(
+            dag.unresolved_write_targets,
+            (
+                physical_dag_module.UnresolvedWriteTarget(
+                    statement_index=0,
+                    statement_type="insert",
+                    reason="SQL_ARGUMENT_DYNAMIC",
+                ),
+            ),
+        )
+
+        materialized = materialize_program(dag)
+        self.assertEqual(
+            {(edge.source_table, edge.target_table) for edge in materialized.edges},
+            {("DWF.DEMO_BUSINESS_SOURCE", "DWM.DEMO_RESULT")},
+        )
+        self.assertEqual(
+            [issue.issue_type for issue in materialized.issues],
+            [IssueType.DYNAMIC_WRITE_TARGET_UNRESOLVED],
+        )
+        issue = materialized.issues[0]
+        self.assertEqual(issue.program_name, dag.program_source.program_name)
+        self.assertEqual(issue.node_key, "statement:0")
+        self.assertEqual(
+            issue.evidence,
+            {
+                "statement_index": 0,
+                "statement_type": "insert",
+                "reason": "SQL_ARGUMENT_DYNAMIC",
+            },
+        )
+        self.assertNotIn("DLO.DEMO_SOURCE_REAL", str(issue.evidence))
+        self.assertNotIn("runtime_table_name", str(issue.evidence))
+
+    def test_dynamic_select_expression_keeps_static_target_and_source(self):
+        dag = build_program_physical_dag(
+            program(
+                '''
+                def run(self, source_columns):
+                    sql = """
+                    INSERT INTO DLO.DEMO_TARGET
+                    PARTITION(DW_DATA_DT = '{0}')
+                    SELECT {1}
+                    FROM DLO.DEMO_SOURCE
+                    WHERE DW_DATA_DT = '{0}'
+                    """.format(self.batch_date, ",".join(source_columns))
+                    execute(sql)
+                ''',
+                expected_target=None,
+            )
+        )
+        self.assertEqual(
+            edge_pairs(dag),
+            {("DLO.DEMO_SOURCE", "DLO.DEMO_TARGET")},
+        )
+        self.assertEqual(dag.unresolved_write_targets, ())
+
+        dynamic_source = build_program_physical_dag(
+            program(
+                '''
+                def run(self, source_columns):
+                    sql = """
+                    INSERT INTO DWM.DEMO_RESULT
+                    SELECT {0} FROM DLO.{1}
+                    JOIN DWF.DEMO_SOURCE ON 1 = 1
+                    """.format(",".join(source_columns), self.source_table)
+                    execute(sql)
+                ''',
+                expected_target=None,
+            )
+        )
+        self.assertEqual(
+            edge_pairs(dynamic_source),
+            {("DWF.DEMO_SOURCE", "DWM.DEMO_RESULT")},
+        )
+        self.assertNotIn("DLO", node_names(dynamic_source))
+
     def test_prod_shaped_dynamic_literal_fixture_keeps_table_lineage(self):
         fixture_path = (
             ROOT_DIR

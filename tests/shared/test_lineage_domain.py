@@ -613,6 +613,7 @@ class LineageDomainTests(unittest.TestCase):
                 "STATIC_EMPTY_QUERY",
                 "UNCLASSIFIED_FORMAL_SOURCE",
                 "UNCLASSIFIED_FORMAL_SINK",
+                "DYNAMIC_WRITE_TARGET_UNRESOLVED",
             },
         )
 

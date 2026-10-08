@@ -20,7 +20,7 @@ from shared.lineage.incremental import SnapshotScope
 from tests.fixtures.lineage.phase7_evolution import source
 
 OBSERVED_AT = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
-STALE_PIPELINE_VERSION = "lineage-pipeline-v11-asset-naming-semantics"
+STALE_PIPELINE_VERSION = "lineage-pipeline-v15-dynamic-literal-template"
 
 
 class PipelineVersionMigrationPreflightTests(unittest.TestCase):
