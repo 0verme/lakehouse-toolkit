@@ -26,6 +26,10 @@ UNCLASSIFIED_FORMAL_SINK_PROGRAM = (
     "INSERT INTO DEMO_UNMAPPED_SINK SELECT * FROM DWF.DEMO_A"
 )
 
+DYNAMIC_WRITE_TARGET_PROGRAM = (
+    "INSERT INTO DLO.{0} SELECT * FROM DLO.DEMO_SOURCE"
+)
+
 SYNTHETIC_PROGRAMS = {
     "normal_negative_control": NORMAL_PROGRAM,
     "orphan_branch": ORPHAN_BRANCH_PROGRAM,
@@ -37,6 +41,7 @@ SYNTHETIC_PROGRAMS = {
     "static_empty_query": STATIC_EMPTY_QUERY_PROGRAM,
     "unclassified_formal_source": UNCLASSIFIED_FORMAL_SOURCE_PROGRAM,
     "unclassified_formal_sink": UNCLASSIFIED_FORMAL_SINK_PROGRAM,
+    "dynamic_write_target_unresolved": DYNAMIC_WRITE_TARGET_PROGRAM,
 }
 
 __all__ = ["SYNTHETIC_PROGRAMS"]

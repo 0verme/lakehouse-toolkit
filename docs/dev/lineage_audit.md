@@ -53,7 +53,7 @@ adjacency 都是调用期间建立的内部索引，PhysicalEdge 的方向仍然
 
 ## 当前 IssueType
 
-当前 `IssueType` 枚举共有十类。`ProgramLineageAuditor` 直接生成九类；
+当前 `IssueType` 枚举共有十一类。`ProgramLineageAuditor` 直接生成十类；
 `LINEAGE_BRANCH_BROKEN` 是现有 evolution/history transition 在旧分支曾到达
 expected target、当前变成 orphan 时生成的派生 issue，不是本次 Audit detector 新增的
 规则：
@@ -69,6 +69,7 @@ expected target、当前变成 orphan 时生成的派生 issue，不是本次 Au
 | `STATIC_EMPTY_QUERY` | SELECT Query Block 的 predicate 可被静态证明恒假；source 不计入数据血缘，最小定位证据进入 `lineage_issue` | `MEDIUM` |
 | `UNCLASSIFIED_FORMAL_SOURCE` | 未分类 formal 节点只有 outgoing edge（`in_degree == 0`、`out_degree > 0`）且能到达 Business Asset；不能猜 schema 或映射 business source | `MEDIUM` |
 | `UNCLASSIFIED_FORMAL_SINK` | 未分类 formal 节点只有 incoming edge（`in_degree > 0`、`out_degree == 0`）且从 Business Asset 可达；不能猜 schema 或映射 business target | `MEDIUM` |
+| `DYNAMIC_WRITE_TARGET_UNRESOLVED` | 写入目标含无法静态确认的动态标识符；不生成该 statement 的 Physical/Business Edge，仅持久化最小 statement 定位诊断 | `MEDIUM` |
 | `LINEAGE_BRANCH_BROKEN` | 既有有效 target 分支在后续 snapshot 中断裂，由 evolution/history 派生 | `HIGH` |
 
 `UNCLASSIFIED_FORMAL_SOURCE` / `UNCLASSIFIED_FORMAL_SINK` 只描述**未分类 formal
@@ -110,7 +111,9 @@ authority。
 
 1. `expected_target is None`：没有权威 target，不生成
    `TARGET_NOT_FOUND`、`TARGET_MISMATCH` 或 `ORPHAN_BRANCH`；仍可生成 sink、cycle
-   和 self-reference issue。
+   和 self-reference issue。存在无法确认的动态写入目标时，额外生成
+   `DYNAMIC_WRITE_TARGET_UNRESOLVED`，且不会将未写入的 expected target 误判成
+   `TARGET_NOT_FOUND` / `TARGET_MISMATCH`。
 2. expected target 是 sink：认为 target 已正确成为最终写入，不生成 target issue。
 3. expected target 已被写入但不是 sink：不生成 `TARGET_MISMATCH`。self-reference
    由 `SELF_REFERENCE` 表达；存在 downstream 或其它不能到达 expected target 的

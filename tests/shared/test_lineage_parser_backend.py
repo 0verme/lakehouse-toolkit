@@ -80,7 +80,7 @@ class ParserBackendContractTests(unittest.TestCase):
         result = analyze_sql(SCRIPT)
         self.assertEqual(result.backend, "legacy")
         self.assertEqual(
-            result.backend_version, "legacy-parser-v4-dynamic-literal-template"
+            result.backend_version, "legacy-parser-v5-dynamic-write-target"
         )
         self.assertEqual(result.parse_status, SqlParseStatus.SUCCESS)
         self.assertEqual(result.confidence, SqlParseConfidence.HIGH)
@@ -152,6 +152,45 @@ class ParserBackendContractTests(unittest.TestCase):
         )
         self.assertEqual(fake_materialization.edges, legacy_materialization.edges)
         self.assertEqual(fake_materialization.issues, legacy_materialization.issues)
+
+    def test_dynamic_write_target_is_a_separate_safe_diagnostic(self):
+        analysis = analyze_sql(
+            'execute("INSERT INTO DLO.{0} SELECT * FROM DLO.DEMO_SOURCE")'
+        )
+
+        self.assertEqual(analysis.parse_status, SqlParseStatus.UNRESOLVED)
+        self.assertEqual(analysis.extraction_reason, "SQL_ARGUMENT_DYNAMIC")
+        self.assertEqual(analysis.steps, ())
+        self.assertEqual(len(analysis.unresolved_write_targets), 1)
+        diagnostic = analysis.unresolved_write_targets[0]
+        self.assertEqual(diagnostic.statement_index, 0)
+        self.assertEqual(diagnostic.statement_type, "insert")
+        self.assertEqual(diagnostic.reason, "SQL_ARGUMENT_DYNAMIC")
+        self.assertEqual(
+            analysis.to_compare_dict()["unresolved_write_targets"],
+            (
+                {
+                    "statement_index": 0,
+                    "statement_type": "insert",
+                    "reason": "SQL_ARGUMENT_DYNAMIC",
+                },
+            ),
+        )
+
+        dag = build_program_physical_dag(
+            ProgramSource(
+                environment="DEV",
+                source_profile="fixture",
+                program_name="DEMO_DYNAMIC_TARGET",
+                script_code=(
+                    'execute("INSERT INTO DLO.{0} SELECT * FROM DLO.DEMO_SOURCE")'
+                ),
+                expected_target=None,
+            )
+        )
+        self.assertEqual(dag.steps, ())
+        self.assertEqual(dag.edges, ())
+        self.assertEqual(dag.unresolved_write_targets, analysis.unresolved_write_targets)
 
     def test_unresolved_and_failed_backend_results_are_explicit_and_isolated(self):
         for status, reason in (

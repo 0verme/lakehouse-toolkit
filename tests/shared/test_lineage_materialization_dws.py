@@ -37,6 +37,7 @@ from shared.lineage.materialization_dws import (
     _begin_transaction,
     _parse_datetime,
     _timestamp_param,
+    program_key,
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG, build_program_physical_dag
 from shared.lineage.reconciliation import ReconciliationTiming
@@ -811,6 +812,53 @@ class DWSMaterializationStoreTests(unittest.TestCase):
                 separators=(",", ":"),
             ),
         )
+
+    def test_dynamic_write_target_persists_only_sanitized_issue_not_edges(self) -> None:
+        source = ProgramSource(
+            "DEV",
+            "fixture",
+            "DEMO_DYNAMIC_TARGET",
+            'execute("INSERT INTO DLO.{0} SELECT * FROM DLO.DEMO_SOURCE")',
+            expected_target=None,
+            source_hash="sha256:dynamic-target",
+        )
+        batch, dag = self.make_batch(
+            source,
+            batch_id="batch-dws-dynamic-target",
+            observed_at=OBSERVED_AT,
+        )
+        self.store.publish(
+            batch,
+            physical_dags=(dag,),
+            complete_snapshot=True,
+            snapshot_scopes=(("DEV", "fixture"),),
+        )
+
+        self.assertEqual(
+            self.store.read_physical_edges(batch_id=batch.batch_id, active_only=True),
+            (),
+        )
+        issue = self.store.read_issues(batch_id=batch.batch_id, active_only=True)[0]
+        self.assertEqual(issue.issue_type.value, "DYNAMIC_WRITE_TARGET_UNRESOLVED")
+        self.assertEqual(issue.node_key, "statement:0")
+        self.assertEqual(
+            issue.evidence,
+            {
+                "reason": "SQL_ARGUMENT_DYNAMIC",
+                "statement_index": 0,
+                "statement_type": "insert",
+            },
+        )
+        row = self.connection.execute(
+            "SELECT program_key, issue_type, node_key, evidence_json "
+            "FROM dwp.lineage_issue WHERE batch_id = ?",
+            (batch.batch_id,),
+        ).fetchone()
+        self.assertEqual(row[0], program_key(source.identity))
+        self.assertEqual(row[1], "DYNAMIC_WRITE_TARGET_UNRESOLVED")
+        self.assertEqual(row[2], "statement:0")
+        self.assertNotIn("DLO.DEMO_SOURCE", row[3])
+        self.assertNotIn("{0}", row[3])
 
     def test_business_edge_reads_push_target_predicate_to_dws(self) -> None:
         source_a = ProgramSource(

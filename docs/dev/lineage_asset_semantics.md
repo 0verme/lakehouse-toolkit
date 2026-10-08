@@ -309,6 +309,33 @@ Schedule lineage 不必重跑
 SQL active batch 发布后必须重跑 suppression
 ```
 
+### v16：动态 SQL 写入目标不可截断为 schema（Issue #168）
+
+`LINEAGE_PIPELINE_VERSION` bump 为 `lineage-pipeline-v16-dynamic-write-target`，
+legacy parser contract bump 为 `legacy-parser-v5-dynamic-write-target`。动态标识符只在
+INSERT / CREATE / MERGE / UPDATE 等写入目标位置识别；目标不完整时仅隔离该 statement，
+不把 `DLO` / `DWM` / `DWP` 前缀当成数据集，不产生 Physical 或 Business Edge。同一程序
+内其它可信 SQLStep 保留；静态目标上的动态 SELECT expression 仍生成表级血缘。诊断复用
+`SQL_ARGUMENT_DYNAMIC` reason，并通过 `DYNAMIC_WRITE_TARGET_UNRESOLVED` AuditFact 保存
+program identity、statement index/type 和固定 reason，不保存 SQL、连接信息或动态值。
+DROP / TRUNCATE 继续不生成写入边，DLO/DWO Business Asset Boundary 不变。
+
+| DWS 对象 | 是否受影响 | 原因 |
+| --- | --- | --- |
+| `dwp.lineage_program_state` | 更新 version | 同 source hash 的 v15 state 会被判定为 CHANGED 并重建 |
+| `dwp.lineage_edge` | **受影响** | 截断产生的伪 Physical Edge 退出新 active snapshot |
+| `dwp.lineage_business_edge` | **可能受影响** | DWM 等伪目标过去可能产生 Business Edge，必须随全量 replay 重算 |
+| `dwp.lineage_issue` | **受影响** | 增加动态目标未解析的安全 AuditFact；旧事实按 batch lifecycle 退出 active |
+| `dwp.lineage_schedule_edge` | 不受影响 | Schedule parser/materialization 与 SQL Physical DAG 独立 |
+| `dwp.lineage_reconciliation_suppression` | **必须重跑** | active Business edge set 可能改变 |
+
+```text
+所有受影响 SQL profile 必须执行完整 snapshot replay；不要使用 --limit / partial replay
+不要手工 DELETE 历史行；成功发布的新完整 batch 会原子替换 active snapshot
+Schedule lineage 无需重跑
+SQL snapshot 发布后重跑 suppression
+```
+
 ## 6. 回归覆盖
 
 | 场景 | 测试 |

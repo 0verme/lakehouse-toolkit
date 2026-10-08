@@ -844,6 +844,7 @@ class LineageAuditTests(unittest.TestCase):
             IssueType.SELF_REFERENCE: "HIGH",
             IssueType.ORPHAN_BRANCH: "MEDIUM",
             IssueType.MULTI_SINK_CANDIDATE: "MEDIUM",
+            IssueType.DYNAMIC_WRITE_TARGET_UNRESOLVED: "MEDIUM",
         }
 
         for issue_type, severity in expected.items():

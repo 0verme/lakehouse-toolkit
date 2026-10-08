@@ -142,6 +142,29 @@ class LineageCoverageTests(unittest.TestCase):
             0,
         )
 
+    def test_unresolved_dynamic_write_target_uses_existing_dynamic_diagnostic(self):
+        source = ProgramSource(
+            environment="ENV_SYNTHETIC",
+            source_profile="profile_dynamic_target",
+            program_name="DEMO_DYNAMIC_WRITE_TARGET",
+            script_code=(
+                'execute("INSERT INTO DLO.{0} SELECT * FROM DLO.DEMO_SOURCE")'
+            ),
+            expected_target=None,
+        )
+        dag = build_program_physical_dag(source)
+        coverage = LineageCoverageAccumulator()
+        coverage.observe_sources([source])
+        coverage.observe_dag(dag, count_program=False)
+        profile = coverage.report(generated_at="2026-01-06T10:11:12+00:00").profiles[0]
+
+        self.assertEqual(
+            profile.failure_reasons[CoverageReason.SQL_ARGUMENT_DYNAMIC.value],
+            1,
+        )
+        self.assertEqual(profile.programs_with_physical_edges, 0)
+        self.assertEqual(dag.unresolved_write_targets[0].statement_index, 0)
+
     def test_business_boundary_only_program_is_not_a_lineage_failure(self):
         source = ProgramSource(
             environment="ENV_SYNTHETIC",

@@ -36,7 +36,7 @@ Audit 不修改 Physical DAG，不折叠 TMP，也不决定 `LineageEdge` 是否
 
 `AuditFact` 是 detector 的 canonical 输出，包含：
 
-- `issue_type`：当前八类事实类型，增加 issue 必须沿用现有 fact/policy/lifecycle contract；
+- `issue_type`：当前十一类事实类型，增加 issue 必须沿用现有 fact/policy/lifecycle contract；
 - `confidence`：`HIGH`、`MEDIUM`、`LOW`、`UNKNOWN` 的离散证据充分性判断，
   不是统计概率，也不表示经过 calibration 的 precision；
 - `rule_version`：解释 detector 规则和 fact 语义的版本；规则语义变化时保留旧
@@ -51,7 +51,8 @@ Audit 不修改 Physical DAG，不折叠 TMP，也不决定 `LineageEdge` 是否
 
 - program-level：`environment + source_profile + program_name + issue_type`；
 - `SELF_REFERENCE` / `STATIC_EMPTY_QUERY` / `UNCLASSIFIED_FORMAL_SOURCE` /
-  `UNCLASSIFIED_FORMAL_SINK`：再加 `node_key`（恒空查询使用 statement/query-block locator）；
+  `UNCLASSIFIED_FORMAL_SINK` / `DYNAMIC_WRITE_TARGET_UNRESOLVED`：再加 `node_key`
+  （恒空查询使用 statement/query-block locator；动态目标使用 statement index）；
 - `ORPHAN_BRANCH` / `LINEAGE_BRANCH_BROKEN`：再加 `branch_sink`；
 - `CYCLE_DETECTED`：再加 canonical sorted SCC node set。
 

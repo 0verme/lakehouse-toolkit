@@ -13,10 +13,10 @@ from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from .physical_dag import SQLStep
+    from .physical_dag import SQLStep, UnresolvedWriteTarget
 
 LEGACY_PARSER_BACKEND = "legacy"
-LEGACY_PARSER_BACKEND_VERSION = "legacy-parser-v4-dynamic-literal-template"
+LEGACY_PARSER_BACKEND_VERSION = "legacy-parser-v5-dynamic-write-target"
 
 
 class SqlParseStatus(str, Enum):
@@ -41,7 +41,8 @@ class SqlAnalysis:
 
     ``steps`` 继续使用现有 ``SQLStep``，因此 downstream 不需要认识具体
     backend。``ctes`` 与 ``steps`` 一一对应；CTE 只作为 parser evidence，
-    不会自动变成 Physical 节点或边。
+    不会自动变成 Physical 节点或边。未解析写入目标单独通过安全 locator 暴露，
+    不进入 ``steps``。
     """
 
     steps: tuple[SQLStep, ...]
@@ -53,10 +54,12 @@ class SqlAnalysis:
     confidence: SqlParseConfidence
     backend: str
     backend_version: str
+    unresolved_write_targets: tuple[UnresolvedWriteTarget, ...] = ()
 
     def __post_init__(self) -> None:
         steps = tuple(self.steps)
         ctes = tuple(tuple(group) for group in self.ctes)
+        unresolved_write_targets = tuple(self.unresolved_write_targets)
         if len(ctes) != len(steps):
             raise ValueError("ctes must contain one group for every SQLStep")
         if any(
@@ -92,6 +95,34 @@ class SqlAnalysis:
                 )
             ):
                 raise TypeError("steps must contain SQLStep-compatible values")
+        allowed_write_types = {
+            "insert",
+            "create_table",
+            "create_foreign_table",
+            "create_view",
+            "merge",
+            "update",
+        }
+        for diagnostic in unresolved_write_targets:
+            if not all(
+                hasattr(diagnostic, attribute)
+                for attribute in ("statement_index", "statement_type", "reason")
+            ):
+                raise TypeError(
+                    "unresolved_write_targets must contain safe diagnostics"
+                )
+            if (
+                not isinstance(diagnostic.statement_index, int)
+                or isinstance(diagnostic.statement_index, bool)
+                or diagnostic.statement_index < 0
+                or not isinstance(diagnostic.statement_type, str)
+                or diagnostic.statement_type not in allowed_write_types
+                or not isinstance(diagnostic.reason, str)
+                or diagnostic.reason != "SQL_ARGUMENT_DYNAMIC"
+            ):
+                raise ValueError(
+                    "unresolved_write_targets must use safe statement locators"
+                )
 
         object.__setattr__(self, "steps", steps)
         object.__setattr__(
@@ -102,6 +133,7 @@ class SqlAnalysis:
         object.__setattr__(self, "parse_status", SqlParseStatus(self.parse_status))
         object.__setattr__(self, "confidence", SqlParseConfidence(self.confidence))
         object.__setattr__(self, "evidence", dict(self.evidence))
+        object.__setattr__(self, "unresolved_write_targets", unresolved_write_targets)
         object.__setattr__(self, "backend", self.backend.strip())
         object.__setattr__(self, "backend_version", self.backend_version.strip())
 
@@ -140,6 +172,14 @@ class SqlAnalysis:
             "extraction_reason": self.extraction_reason,
             "candidate_count": self.candidate_count,
             "steps": tuple(steps),
+            "unresolved_write_targets": tuple(
+                {
+                    "statement_index": item.statement_index,
+                    "statement_type": item.statement_type,
+                    "reason": item.reason,
+                }
+                for item in self.unresolved_write_targets
+            ),
             "evidence": dict(self.evidence),
         }
 
@@ -178,11 +218,41 @@ class LegacyParserBackend:
         # 实际执行的 extraction/parser helper 仍是原有 production 实现。
         from . import physical_dag
 
+        dynamic_target_reason = (
+            physical_dag.SQLExtractionReason.SQL_ARGUMENT_DYNAMIC.value
+        )
+        candidate_found_reason = physical_dag.SQLExtractionReason.CANDIDATE_FOUND.value
         extraction = physical_dag._extract_python_candidates_with_reason(script_code)
-        steps, ctes = physical_dag._parse_sql_candidates_with_ctes(
+        parsed_steps, parsed_ctes = physical_dag._parse_sql_candidates_with_ctes(
             extraction.candidates
         )
+        steps: list[SQLStep] = []
+        ctes: list[tuple[str, ...]] = []
+        unresolved_write_targets: list[UnresolvedWriteTarget] = []
+        for step, statement_ctes in zip(parsed_steps, parsed_ctes, strict=True):
+            resolution = step.evidence.get("target_resolution")
+            if (
+                isinstance(resolution, Mapping)
+                and resolution.get("status") == "UNRESOLVED_DYNAMIC_IDENTIFIER"
+            ):
+                unresolved_write_targets.append(
+                    physical_dag.UnresolvedWriteTarget(
+                        statement_index=step.statement_index,
+                        statement_type=step.statement_type,
+                        reason=str(resolution.get("reason", dynamic_target_reason)),
+                    )
+                )
+                continue
+            steps.append(step)
+            ctes.append(statement_ctes)
+
         reason = extraction.reason.value
+        if (
+            unresolved_write_targets
+            and not steps
+            and reason == candidate_found_reason
+        ):
+            reason = dynamic_target_reason
         if reason in _SUCCESS_REASONS:
             status = SqlParseStatus.SUCCESS
             confidence = (
@@ -207,10 +277,12 @@ class LegacyParserBackend:
             evidence={
                 "candidate_count": candidate_count,
                 "sql_extraction_reason": reason,
+                "unresolved_write_target_count": len(unresolved_write_targets),
             },
             confidence=confidence,
             backend=self.backend,
             backend_version=self.backend_version,
+            unresolved_write_targets=tuple(unresolved_write_targets),
         )
 
 

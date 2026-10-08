@@ -30,8 +30,8 @@ from shared.lineage.domain import (
 )
 from shared.lineage.physical_dag import ProgramPhysicalDAG
 
-AUDIT_RULE_VERSION = "audit-rule-v3-unclassified-formal-boundary"
-AUDIT_POLICY_VERSION = "audit-policy-v3-unclassified-formal-boundary"
+AUDIT_RULE_VERSION = "audit-rule-v4-dynamic-write-target"
+AUDIT_POLICY_VERSION = "audit-policy-v4-dynamic-write-target"
 
 ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
     {
@@ -45,6 +45,7 @@ ISSUE_SEVERITY_POLICY: Mapping[IssueType, str] = MappingProxyType(
         IssueType.STATIC_EMPTY_QUERY: "MEDIUM",
         IssueType.UNCLASSIFIED_FORMAL_SOURCE: "MEDIUM",
         IssueType.UNCLASSIFIED_FORMAL_SINK: "MEDIUM",
+        IssueType.DYNAMIC_WRITE_TARGET_UNRESOLVED: "MEDIUM",
     }
 )
 
@@ -1037,6 +1038,7 @@ def compute_lineage_issue_stable_key(
         IssueType.STATIC_EMPTY_QUERY,
         IssueType.UNCLASSIFIED_FORMAL_SOURCE,
         IssueType.UNCLASSIFIED_FORMAL_SINK,
+        IssueType.DYNAMIC_WRITE_TARGET_UNRESOLVED,
     ):
         identity["scope"] = "node"
         identity["node_key"] = node_key
@@ -1168,6 +1170,26 @@ class ProgramLineageAuditor:
         )
 
         facts: list[AuditFact] = []
+
+        for diagnostic in dag.unresolved_write_targets:
+            node_key = f"statement:{diagnostic.statement_index}"
+            facts.append(
+                _make_fact(
+                    dag,
+                    IssueType.DYNAMIC_WRITE_TARGET_UNRESOLVED,
+                    node_key=node_key,
+                    message=(
+                        "A SQL write target contains an unresolved dynamic "
+                        "identifier; no Physical or Business edge was emitted."
+                    ),
+                    evidence={
+                        "statement_index": diagnostic.statement_index,
+                        "statement_type": diagnostic.statement_type,
+                        "reason": diagnostic.reason,
+                    },
+                    confidence=AuditConfidence.MEDIUM,
+                )
+            )
 
         for step in dag.steps:
             blocks = {block.query_block_index: block for block in step.query_blocks}
@@ -1354,6 +1376,7 @@ class ProgramLineageAuditor:
             expected_target is not None
             and not expected_target_is_sink
             and not expected_target_written
+            and not dag.unresolved_write_targets
         ):
             if actual_business_sinks:
                 facts.append(
